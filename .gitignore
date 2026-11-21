@@ -1,0 +1,35 @@
+# ── 运行时数据：绝不入库 ─────────────────────────────
+# workspace/ 是这台机器上真正在跑的那份：plugins/（本地程序与它们的数据）、
+# logs/、config.json（aaas 地址）、dev.json（开发者模式开关）、prompts/、notes/
+/workspace/
+
+# 原型目录：proto/ 是当初试探协议用的草稿 + 一个样例程序及其 data/，不是内核
+/proto/
+
+# 这台机器自己的东西
+/.tmp/
+/.openthree/
+
+# ── 构建与缓存 ───────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+/.venv/
+/venv/
+
+# pywebview / WebView2 的用户配置（.tmp 里那份就是从这里长出来的）
+*.wvprofile*/
+wv_persist.json
+
+# ── 日志与备份 ───────────────────────────────────────
+*.log
+/.backup/
+
+# ── 编辑器 / 系统 ────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

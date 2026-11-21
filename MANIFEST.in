@@ -1,0 +1,7 @@
+include LICENSE
+include README.md
+include docs/*.md
+include agentworkspace/web/*.html
+include agentworkspace/assets/*.ico
+recursive-include agentworkspace *.py
+global-exclude __pycache__ *.py[cod] *.log

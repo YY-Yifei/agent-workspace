@@ -1,0 +1,703 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent Workspace</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%235aa2ff'/%3E%3Crect x='10' y='12' width='11' height='40' rx='5' fill='%23fff'/%3E%3Crect x='26' y='17' width='28' height='11' rx='5' fill='%23fff'/%3E%3Crect x='26' y='36' width='28' height='11' rx='5' fill='%23fff'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#0e1013; --panel:#14171b; --line:#22272e; --ink:#e6eaef; --dim:#8b949e;
+    --bubble:#1c2128; --accent:#5aa2ff; --ok:#4bbd7a; --bad:#e0645b;
+  }
+  @media (prefers-color-scheme:light){
+    :root{ --bg:#f6f7f9; --panel:#fff; --line:#e5e7eb; --ink:#171a1f; --dim:#6b7280;
+           --bubble:#eef0f3; --accent:#2563eb; --ok:#1f9d55; --bad:#d13b30; }
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  #app{display:flex;height:100%}
+
+  /* 左：一条窄栏。只有图标 —— 程序的名字在悬停里，不在界面上 */
+  #rail{width:56px;flex:0 0 56px;display:flex;flex-direction:column;align-items:center;gap:4px;
+    padding:10px 0;background:var(--panel);border-right:1px solid var(--line)}
+  .rbtn{width:38px;height:38px;border:0;border-radius:10px;background:transparent;color:var(--ink);
+    font-size:19px;line-height:1;cursor:pointer;display:grid;place-items:center;
+    transition:background .12s}
+  .rbtn:hover{background:var(--bubble)}
+  .rbtn.on{background:var(--bubble);box-shadow:inset 2px 0 0 var(--accent)}
+  .grow{flex:1}
+  /* 小绿点不在栏上了：它说的是「连上没连上」，而没连上的原因就在设置页那个
+     输入框里。放在一起，点和那句话才读得懂。 */
+  .stat{display:flex;align-items:flex-start;gap:8px}
+  .stat .hint{flex:1 1 auto;min-width:0}
+  .sdot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex:0 0 8px;
+    margin-top:5px}
+  .sdot.ok{background:var(--ok)} .sdot.bad{background:var(--bad)}
+  .sdot.wait{background:var(--accent)}
+
+  /* 右：舞台。两栏 = 程序页 + 对话；只有对话的程序，对话占满 */
+  #stage{flex:1;min-width:0;display:flex;overflow:hidden}
+  .split{display:flex;flex:1;min-width:0}
+  .pane{flex:1 1 auto;min-width:240px;display:flex;flex-direction:column;overflow:hidden;
+    background:var(--panel)}
+  .pane iframe{flex:1;width:100%;border:0;background:transparent}
+  .native{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:12px;padding:28px;text-align:center;color:var(--dim)}
+  .native b{color:var(--ink);font-weight:600;font-size:15px}
+  /* 对话面板的宽度是一个变量：拖着走就是它，刷新还是它 */
+  .chat{flex:0 0 var(--chatw,380px);width:var(--chatw,380px);min-width:280px;
+    max-width:calc(100% - 240px);display:flex;flex-direction:column;background:var(--bg)}
+  .solo .chat{flex:1 1 auto;width:auto;max-width:none}
+  /* 中缝：6px 的抓手。宽度谁说了算，人自己定 —— 不是我们替他挑一个比例 */
+  .gutter{flex:0 0 6px;cursor:col-resize;background:transparent;position:relative;outline:none}
+  .gutter::before{content:"";position:absolute;inset:0 2px;background:var(--line);
+    border-radius:3px;transition:background .12s}
+  .gutter:hover::before,.gutter:focus-visible::before,.gutter.drag::before{background:var(--accent)}
+  .chat header{display:flex;align-items:baseline;gap:8px;padding:12px 16px;
+    border-bottom:1px solid var(--line);font-size:13px;color:var(--dim)}
+  .chat header b{color:var(--ink);font-weight:600;font-size:13px;white-space:nowrap;
+    flex:0 0 auto}
+  /* 标题不许折行：加了开关之后中文会被挤成一列字（真截图里踩到的）。
+     要缩的是描述，不是名字。 */
+  .chat header span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    min-width:0;flex:1 1 auto}
+  /* 开发者模式：一枚开关，不是一页设置。放不下就不解释，悬停给一句话 */
+  .dev{margin-left:auto;flex:0 0 auto;display:inline-flex;align-items:center;gap:6px;cursor:pointer;
+    font-size:12px;color:var(--dim);user-select:none;white-space:nowrap}
+  .dev input{display:none}
+  .dev i{width:26px;height:15px;border-radius:9px;background:var(--line);position:relative;
+    transition:background .15s;flex:0 0 26px}
+  .dev i::after{content:"";position:absolute;top:2px;left:2px;width:11px;height:11px;
+    border-radius:50%;background:var(--dim);transition:transform .15s,background .15s}
+  .dev.on{color:var(--accent)}
+  .dev.on i{background:var(--accent);opacity:.4}
+  .dev.on i::after{transform:translateX(11px);background:var(--accent)}
+  #thread{flex:1;overflow:auto;padding:18px 16px;display:flex;flex-direction:column;gap:14px}
+  .solo #thread{max-width:720px;margin:0 auto;width:100%}
+  .msg{width:100%;max-width:100%}
+  .msg.me{display:flex;justify-content:flex-end}
+  .msg .body{white-space:pre-wrap;word-break:break-word}
+  .msg.me .body{background:var(--bubble);padding:8px 12px;border-radius:12px;max-width:86%}
+  .msg .body.dim{color:var(--dim)}
+  /* 工具调用：默认**一行**。
+     一轮里可能有二十次调用，全摊开就是拿执行日志当聊天记录 ——
+     注意力被吃掉，人真正要读的那句话反而找不到。 */
+  .tgroup{margin-top:10px}
+  .tgh{display:flex;align-items:center;gap:6px;width:100%;border:0;background:transparent;
+    padding:2px 0;color:var(--dim);font:inherit;font-size:12px;cursor:pointer;text-align:left;
+    min-width:0}
+  .tgh:hover{color:var(--ink)}
+  .tgh .chev{flex:0 0 auto;display:inline-block;font-size:9px;opacity:.75;
+    transition:transform .15s}
+  .tgroup.open .tgh .chev{transform:rotate(90deg)}
+  .tgh .sum{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+  .tgh .st{flex:0 0 auto;margin-left:auto;font-size:11px;color:var(--dim)}
+  .tgh .st.run{color:var(--accent)}
+  .tlist{display:none;margin:4px 0 0;padding-left:10px;border-left:1px solid var(--line)}
+  .tgroup.open .tlist{display:block}
+  .tool{margin:1px 0;font-size:12px;color:var(--dim)}
+  .tool .th{display:flex;align-items:center;gap:8px;width:100%;border:0;background:transparent;
+    padding:3px 0;color:inherit;font:inherit;font-size:12px;cursor:pointer;text-align:left;
+    min-width:0}
+  .tool .th:hover{color:var(--ink)}
+  .tool .t{color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    min-width:0;flex:1 1 auto}
+  .tool .st{flex:0 0 auto;font-size:11px;color:var(--ok)}
+  .tool .st.run{color:var(--accent)} .tool .st.bad{color:var(--bad)}
+  .tool .r{display:none;margin:4px 0 8px;padding:8px 10px;border:1px solid var(--line);
+    border-radius:8px;background:var(--panel);white-space:pre-wrap;word-break:break-word;
+    max-height:160px;overflow:auto;color:var(--dim)}
+  .tool.open .r{display:block}
+  .composer{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--line);
+    align-items:flex-end}
+  .solo .composer{max-width:720px;margin:0 auto;width:100%}
+  .composer textarea{flex:1;resize:none;min-height:40px;max-height:160px;padding:10px 12px;
+    border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--ink);
+    font:inherit;outline:none}
+  .composer textarea:focus{border-color:var(--accent)}
+  .composer button{height:40px;padding:0 14px;border-radius:12px;border:1px solid var(--line);
+    background:var(--panel);color:var(--ink);font:inherit;cursor:pointer}
+  .composer button.p{background:var(--accent);border-color:var(--accent);color:#fff}
+  .composer button.stop{color:var(--bad)}
+  .empty{flex:1;display:grid;place-items:center;color:var(--dim);font-size:13px}
+
+  /* 设置入口在左下角：它管的是「整个工作区连哪个道」，不是某一个程序的事。
+     所以它不和程序挤在同一列里 —— 中间用一道分隔线分开。 */
+  #rail .sep{width:26px;height:1px;background:var(--line);margin:6px 0 2px;flex:0 0 1px}
+  /* 设置面板：整个工作区只有一页，眼下只有一项。不做「设置中心」。 */
+  #mask{position:fixed;inset:0;background:rgba(0,0,0,.42);display:none;
+    place-items:center;z-index:40}
+  #mask.on{display:grid}
+  .dlg{width:440px;max-width:calc(100% - 40px);background:var(--panel);border:1px solid var(--line);
+    border-radius:14px;padding:18px 20px 16px;display:flex;flex-direction:column;gap:12px;
+    box-shadow:0 24px 60px rgba(0,0,0,.35)}
+  .dlg h3{margin:0;font-size:15px;font-weight:600}
+  .dlg label{font-size:12px;color:var(--dim);display:flex;flex-direction:column;gap:6px}
+  .dlg input{padding:9px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);
+    color:var(--ink);font:inherit;font-size:13px;outline:none}
+  .dlg input:focus{border-color:var(--accent)}
+  .dlg .hint{font-size:12px;color:var(--dim);min-height:16px;line-height:1.4;
+    word-break:break-all}
+  .dlg .hint.bad{color:var(--bad)} .dlg .hint.ok{color:var(--ok)}
+  .dlg .acts{display:flex;justify-content:flex-end;gap:8px;margin-top:2px}
+  .dlg .acts button{height:34px;padding:0 14px;border-radius:10px;border:1px solid var(--line);
+    background:var(--bg);color:var(--ink);font:inherit;cursor:pointer}
+  .dlg .acts button.p{background:var(--accent);border-color:var(--accent);color:#fff}
+  .dlg .acts button[disabled]{opacity:.6;cursor:default}
+</style>
+</head>
+<body>
+<div id="app">
+  <nav id="rail" aria-label="程序"></nav>
+  <main id="stage"><div class="empty">正在连上…</div></main>
+</div>
+<div id="mask" aria-hidden="true">
+  <form class="dlg" id="setform">
+    <h3>设置</h3>
+    <label for="aaasurl">aaas-service 地址
+      <input id="aaasurl" spellcheck="false" autocomplete="off"
+             placeholder="ws://localhost:8888/">
+    </label>
+    <div class="stat"><i class="sdot" id="setdot" aria-hidden="true"></i>
+      <span class="hint" id="setstat"></span></div>
+    <div class="hint" id="setmsg"></div>
+    <div class="acts">
+      <button type="button" id="setcancel">取消</button>
+      <button type="submit" class="p" id="setsave">保存并重连</button>
+    </div>
+  </form>
+</div>
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g,
+  (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+/* 全部状态就这一个对象：程序清单、每个程序的对话、每个程序的连接情况。
+   没有第二份「界面状态」—— 界面是它的投影，不是它的所有者。 */
+const S = {
+  programs: [], agents: {}, native: {}, devtools: null, pid: null,
+  settings: { url: '' },
+  msgs: {},       // pid → [{role:'me'|'it', text, tools:[{label,status,text}]}]
+  cur: {},        // pid → 当前这一轮那条消息的下标
+  railSig: '', stageKey: '', busy: {},
+};
+
+const prog = (pid) => S.programs.find((p) => p.id === pid);
+const msgs = (pid) => (S.msgs[pid] || (S.msgs[pid] = []));
+
+function push(pid, m) { msgs(pid).push(m); if (pid === S.pid) paintThread(); return m; }
+function curIt(pid) {
+  let i = S.cur[pid];
+  if (i == null || !msgs(pid)[i] || msgs(pid)[i].role !== 'it') {
+    i = msgs(pid).push({ role: 'it', text: '', tools: [] }) - 1;
+    S.cur[pid] = i;
+  }
+  return msgs(pid)[i];
+}
+
+/* ------------------------------------------------------------------ 状态 */
+async function loadState() {
+  const st = await fetch('/api/state').then((r) => r.json()).catch(() => null);
+  if (!st) return null;
+  S.programs = st.programs || [];
+  S.native = st.native || {};
+  S.devtools = st.devtools || null;   // 只为工具卡写清「谁在动手」，不进左侧栏
+  S.settings = st.settings || S.settings;   // 只有一个设置项：aaas-service 地址
+  for (const [pid, a] of Object.entries(st.agents || {})) {
+    S.agents[pid] = { status: a.status, error: a.error, busy: a.busy };
+    S.busy[pid] = !!a.busy;
+    if (!S.msgs[pid]) {                      // 只补一次：之后的增量在事件里
+      S.msgs[pid] = (a.history || []).map((h) => ({
+        role: h.role === 'user' ? 'me' : 'it', text: h.text || '', tools: [],
+      }));
+    }
+  }
+  return st;
+}
+
+/* 把一个程序的智能体叫起来（幂等）：打开面板时做一次，不在开机时做几十次 */
+async function warm(pid) {
+  const a = await fetch(`/api/p/${pid}/link`, { method: 'POST' })
+    .then((r) => r.json()).catch(() => null);
+  if (a && a.status) { S.agents[pid] = { status: a.status, error: a.error, busy: a.busy }; paintConn(); }
+}
+
+/* ------------------------------------------------------------------ 左侧窄栏 */
+function paintRail() {
+  const sig = S.programs.map((p) => p.id + (p.icon || '')).join(',') + '|' + S.pid;
+  if (sig === S.railSig) return;
+  S.railSig = sig;
+  const rail = $('#rail');
+  rail.innerHTML = S.programs.map((p) =>
+    `<button class="rbtn${p.id === S.pid ? ' on' : ''}" data-pid="${p.id}"
+             title="${esc(p.title)}">${esc(p.icon || (p.title || '?').slice(0, 1))}</button>`
+  ).join('') + `<div class="grow"></div>
+    <div class="sep"></div>
+    <button class="rbtn" id="setbtn" title="设置（aaas-service 地址）"
+            aria-label="设置">⚙</button>`;
+  rail.querySelectorAll('.rbtn[data-pid]').forEach((b) => {
+    b.onclick = () => select(b.dataset.pid);
+  });
+  $('#setbtn').onclick = openSettings;
+  paintConn();
+}
+
+/* 连接状态只有一个画法：点与那句话**由同一次汇总算出**。
+   弹窗没开时没有可画的地方 —— 那就什么都不画，而不是画到看不见的地方去。 */
+function paintConn() {
+  const dot = $('#setdot'), el = $('#setstat');
+  if (!dot || !el) return;
+  let ready = 0, connecting = 0, err = '';
+  for (const a of Object.values(S.agents || {})) {
+    if (!a) continue;
+    if (a.status === 'ready') ready++;
+    else if (a.status === 'connecting') connecting++;
+    else if (a.status === 'error' && !err) err = a.error || '未知原因';
+  }
+  const st = ready ? 'ok' : (connecting ? 'wait' : (err ? 'bad' : ''));
+  dot.className = 'sdot' + (st ? ' ' + st : '');
+  dot.title = ready ? `已连上（${ready} 个程序）` : (err || '还没有程序连过');
+  el.textContent = ready ? `当前：已连上（${ready} 个程序）`
+    : connecting ? '当前：正在连接…'
+    : err ? `当前：连不上 —— ${err}`
+    : '当前：还没有程序连过（说一句话就会连）';
+  el.className = 'hint' + (ready ? ' ok' : (err ? ' bad' : ''));
+}
+
+/* ------------------------------------------------------------------ 舞台 */
+function paintStage(force) {
+  const p = prog(S.pid);
+  const nat = S.native[S.pid] || {};
+  const key = [S.pid, p && p.uiKind, p && p.title, nat.status || '', nat.title || ''].join('|');
+  if (key === S.stageKey && !force) { paintThread(); return; }
+  S.stageKey = key;
+  const stage = $('#stage');
+  if (!p) { stage.innerHTML = '<div class="empty">还没有程序。跟小助理说一句，让它造一个。</div>'; return; }
+
+  const solo = p.id === 'assistant' || p.uiKind === 'none';
+  let pane = '';
+  if (!solo) {
+    if (p.uiKind === 'web') {
+      pane = `<div class="pane"><iframe id="appframe" src="/plugin/${p.id}/"
+                     title="${esc(p.title)}"></iframe></div>`;
+    } else {
+      const running = nat.status === 'running';
+      pane = `<div class="pane"><div class="native">
+        <b>${esc(p.title)}</b>
+        <div>这个程序开自己的窗口 —— 属于桌面，不在这个面板里。</div>
+        <div>
+          <button class="rbtn" style="width:auto;padding:0 14px;height:34px;font-size:13px"
+                  id="natbtn">${running ? '关掉它的窗口' : '打开它的窗口'}</button>
+        </div>
+      </div></div>`;
+    }
+  }
+  const gutter = solo ? '' : `<div class="gutter" id="gutter" role="separator"
+      aria-orientation="vertical" tabindex="0"
+      title="拖动调整宽度（双击复位，←/→ 微调）"></div>`;
+  stage.innerHTML = `<div class="split${solo ? ' solo' : ''}">${pane}${gutter}
+    <aside class="chat">
+      <header>${esc(p.icon || '')}<b>${esc(p.title)}</b><span>${esc(p.description || '')}</span>
+        ${p.id === 'assistant' ? '' : `<label class="dev${p.dev ? ' on' : ''}" title="打开后它能读写工作区里的文件、改自己的代码（碰不到别的程序）"><input type="checkbox" id="devsw"${p.dev ? ' checked' : ''}><i></i>开发者</label>`}
+      </header>
+      <div id="thread"></div>
+      <form class="composer" id="composer">
+        <textarea id="ta" rows="1" placeholder="${esc(ph(p))}"></textarea>
+        <button class="p" id="sendb" type="submit">发送</button>
+      </form>
+    </aside></div>`;
+  wireComposer();
+  wireDev();
+  wireGutter();
+  if (p.uiKind === 'native') {
+    $('#natbtn').onclick = () => toggleNative(p.id, (S.native[p.id] || {}).status === 'running');
+  }
+  paintThread();
+  warm(p.id);
+}
+
+function wireDev() {
+  const box = $('#devsw');
+  if (!box) return;
+  box.onchange = () => toggleDev(S.pid, box.checked);
+}
+
+/* 对话面板宽度：localStorage 记住，按程序分开记。
+   为什么按 pid：一个程序的页面可能要宽（看图表），另一个只要一句提醒 —— 宽度
+   和程序一样是「他的东西」，替他统一成一个比例反而添麻烦。 */
+const CHATW_KEY = 'ws.chatw';
+
+function chatW(pid) {
+  const v = Number(localStorage.getItem(`${CHATW_KEY}.${pid}`) || localStorage.getItem(CHATW_KEY) || 0);
+  return v > 0 ? v : 380;
+}
+
+/* 夹住宽度：对话不许窄到读不了，程序页也不许被挤没。
+   纯函数 —— 拖动、键盘、窗口缩放都走它，所以只需验一次。 */
+function clampChatW(w, stageW) {
+  const lo = 300;
+  const hi = Math.max(lo, (stageW || 0) - 320);
+  return Math.round(Math.min(Math.max(w, lo), hi));
+}
+
+function wireGutter() {
+  const g = $('#gutter');
+  if (!g) return;
+  const split = g.parentElement;
+  const pid = S.pid;
+  let cur = null;
+
+  const put = (w, save) => {
+    const v = clampChatW(w, split.clientWidth);
+    split.style.setProperty('--chatw', v + 'px');
+    cur = v;
+    if (save) localStorage.setItem(`${CHATW_KEY}.${pid}`, String(v));
+    return v;
+  };
+  put(chatW(pid), false);
+
+  let drag = null;
+  g.addEventListener('pointerdown', (e) => {
+    drag = { x: e.clientX, w: cur || chatW(pid) };
+    try { g.setPointerCapture(e.pointerId); } catch (err) { /* 合成事件没有真实指针 */ }
+    g.classList.add('drag');
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+  g.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    put(drag.w - (e.clientX - drag.x), false);    // 往左拖 → 对话更宽
+  });
+  const end = () => {
+    if (!drag) return;
+    drag = null;
+    g.classList.remove('drag');
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    if (cur != null) localStorage.setItem(`${CHATW_KEY}.${pid}`, String(cur));
+  };
+  g.addEventListener('pointerup', end);
+  g.addEventListener('pointercancel', end);
+  g.addEventListener('dblclick', () => {
+    localStorage.removeItem(`${CHATW_KEY}.${pid}`);
+    localStorage.removeItem(CHATW_KEY);
+    put(380, false);
+  });
+  g.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    put((cur || chatW(pid)) + (e.key === 'ArrowLeft' ? 24 : -24), true);
+  });
+}
+
+const ph = (p) => p.id === 'assistant'
+ ? '跟小助理说点什么，比如「给我做个喝水提醒」' : `跟「${p.title}」说点什么`;
+
+function wireComposer() {
+  const ta = $('#ta'), form = $('#composer');
+  if (!ta || !form) return;
+  ta.oninput = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 160) + 'px'; };
+  ta.onkeydown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
+  };
+  form.onsubmit = (e) => {
+    e.preventDefault();
+    const text = ta.value.trim();
+    if (!text) return;
+    ta.value = ''; ta.style.height = 'auto';
+    send(S.pid, text);
+  };
+  ta.focus();
+}
+
+function paintThread() {
+  const el = $('#thread');
+  if (!el) return;
+  const list = msgs(S.pid);
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
+  let html = list.map((m, i) => { m._i = i; return msgHtml(m); }).join('');
+  const last = list[list.length - 1];
+  if (S.busy[S.pid] && (!last || last.role === 'me' || (!last.text && !(last.tools || []).length))) {
+    html += '<div class="msg"><div class="body dim">…</div></div>';
+  }
+  el.innerHTML = html;
+  // 重绘每一条事件都发生：贴着底才跟随，否则人往上翻的位置会被拽回去。
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
+/* 这一组工具现在该展开吗？——只有一个判据，三处共用。
+   用户没表过态时：正在跑就展开（看得见它在干什么），跑完就收起（回到安静）。 */
+function toolsOpen(m) {
+  if (m.gTouched) return !!m.gOpen;
+  const list = msgs(S.pid);
+  return !!S.busy[S.pid] && m === list[list.length - 1];
+}
+
+function msgHtml(m) {
+  if (m.role === 'me') {
+    return `<div class="msg me"><div class="body">${esc(m.text)}</div></div>`;
+  }
+  const body = m.text
+    ? `<div class="body${m.note ? ' dim' : ''}">${esc(m.text)}</div>` : '';
+  return `<div class="msg">${body}${toolsHtml(m)}</div>`;
+}
+
+function toolsHtml(m) {
+  const list = m.tools || [];
+  if (!list.length) return '';
+  const open = toolsOpen(m);
+  const run = list.some((t) => t.status === '运行中');
+  const lastOne = list[list.length - 1];
+  // 收起时也要有一句人话：跑着就报「正在做什么」，跑完就报「做了几次」。
+  const sum = run ? esc(lastOne.label) : `${list.length} 次工具调用`;
+  const rows = list.map((t, i) => {
+    const bad = t.status && t.status !== '运行中' && t.status !== '完成' && t.status !== 'ok';
+    const cls = t.status === '运行中' ? ' run' : (bad ? ' bad' : '');
+    return `<div class="tool${t.open ? ' open' : ''}" data-ti="${i}">
+      <button class="th" type="button"><span class="t">${esc(t.label)}</span>
+        <span class="st${cls}">${esc(t.status || '')}</span></button>
+      ${t.text ? `<div class="r">${esc(t.text)}</div>` : ''}</div>`;
+  }).join('');
+  return `<div class="tgroup${open ? ' open' : ''}" data-mi="${m._i}">
+    <button class="tgh" type="button"><span class="chev">▶</span>
+      <span class="sum">${sum}</span>
+      <span class="st${run ? ' run' : ''}">${run ? '进行中' : '完成'}</span></button>
+    <div class="tlist">${rows}</div></div>`;
+}
+
+/* 工具区的点击只有两个落点（整组 / 单项）。整段 thread 每次重绘都换掉，
+   所以用委托 —— 逐个绑会在重绘后全部失效。 */
+function onThreadClick(e) {
+  const btn = e.target.closest ? e.target.closest('.tgh,.th') : null;
+  if (!btn) return;
+  const grp = btn.closest('.tgroup');
+  if (!grp) return;
+  const m = msgs(S.pid)[Number(grp.dataset.mi)];
+  if (!m) return;
+  if (btn.classList.contains('tgh')) {
+    m.gTouched = true;                    // 表态过就不再替人自动开合
+    m.gOpen = !toolsOpen(m);
+  } else {
+    const t = (m.tools || [])[Number(btn.closest('.tool').dataset.ti)];
+    if (t) t.open = !t.open;
+  }
+  paintThread();
+}
+
+/* 开关拨动 = 这一个程序的助手借来/还回小助理的手。
+   不重画舞台 —— 页面没变，变了的是右边这个助手能做什么。 */
+async function toggleDev(pid, on) {
+  const r = await fetch(`/api/p/${pid}/dev`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ on }),
+  }).then((x) => x.json()).catch(() => null);
+  if (!r || r.status !== 'ok') {
+    const box = $('#devsw'); if (box) box.checked = !on;
+    push(pid, { role: 'it', note: true, tools: [], text: `没能切换：${(r && r.message) || '未知原因'}` });
+    return;
+  }
+  const p = prog(pid); if (p) p.dev = r.dev;
+  paintDev(pid, r.dev);
+  push(pid, { role: 'it', note: true, tools: [], text: r.dev
+    ? '🔧 开发者模式已打开 —— 它现在能读写工作区、跑命令，也能改自己的代码了。'
+    : '开发者模式已关闭 —— 它回到只能动自己这个程序的状态。' });
+}
+
+function paintDev(pid, on) {
+  const box = $('#devsw');
+  if (!box || pid !== S.pid) return;
+  box.checked = !!on;
+  const lab = box.closest('.dev');
+  if (lab) lab.classList.toggle('on', !!on);
+}
+
+async function toggleNative(pid, running) {
+  await fetch(`/api/p/${pid}/${running ? 'close' : 'open'}`, { method: 'POST' })
+    .then((r) => r.json()).catch(() => null);
+  await loadState();
+  paintStage(true);
+}
+
+/* ------------------------------------------------------------------ 说话 */
+async function send(pid, text) {
+  push(pid, { role: 'me', text, tools: [] });
+  S.cur[pid] = null;
+  const r = await fetch(`/api/p/${pid}/chat`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ text }),
+  }).then((x) => x.json()).catch((e) => ({ status: String(e) }));
+  if (r.status !== 'sent') {
+    push(pid, { role: 'it', text: `没能送出去：${r.status || '未知原因'}`, tools: [] });
+  }
+}
+
+/* ------------------------------------------------------------------ 事件 */
+function on(ev) {
+  const pid = ev.pid || 'assistant';
+  const d = ev.data || {};
+  switch (ev.type) {
+    case 'turn.started':
+      S.cur[pid] = null; S.busy[pid] = true; curIt(pid); break;
+    case 'message.delta':
+      curIt(pid).text += (d.text || ''); break;
+    case 'call.ready': {
+      const m = curIt(pid);
+      m.tools.push({ label: labelOf(pid, d.name), status: '运行中', text: '' });
+      break;
+    }
+    case 'call.result': {
+      const m = curIt(pid), t = m.tools[m.tools.length - 1];
+      if (t) { t.status = d.status || '完成'; t.text = String(d.text || '').slice(0, 600); }
+      break;
+    }
+    case 'turn.completed':
+      S.busy[pid] = false;
+      { const m = curIt(pid); if (!m.text && d.text) m.text = d.text; }
+      break;
+    case 'turn.failed':
+      S.busy[pid] = false;
+      push(pid, { role: 'it', text: `出错了：${d.error || '未知'}`, tools: [] });
+      break;
+    case 'link.status':
+      S.agents[pid] = { ...(S.agents[pid] || {}), status: d.status, error: d.error };
+      paintConn();          // 任何一个程序的状态变了，都可能是地址的问题
+      if (d.status === 'error' && pid === S.pid) {
+        push(pid, { role: 'it', text: `还没连上：${d.error || ''}`, tools: [] });
+      }
+      break;
+    case 'dev.changed': {
+      const p = prog(pid); if (p) p.dev = !!(d && d.dev);
+      paintDev(pid, !!(d && d.dev));
+      return;
+    }
+    case 'plugin.loaded':
+    case 'plugin.removed':
+      loadState().then(() => { paintRail(); paintStage(S.pid === null); });
+      return;
+    default:
+      return;
+  }
+  paintConn();
+  if (pid === S.pid) paintThread();
+}
+
+/* 谁的能力，就报谁的名字：开发者模式下，一个程序借来的手仍然是小助理的手，
+   工具卡上写「小助理 · write」比写「心情日记 · write」诚实。 */
+function labelOf(pid, wire) {
+  for (const p of (S.devtools ? [...S.programs, S.devtools] : S.programs)) {
+    const f = (p.functions || []).find((x) => x.name === wire);
+    if (f) return `${p.icon || ''} ${p.title} · ${f.fn}`.trim();
+  }
+  return wire;
+}
+
+/* 订阅建立（含断线重连）时补齐历史。
+   事件是广播 —— 页面晚加载一秒、SSE 断过一下，错过就是错过。
+   所以这里以 /api/state 里的历史为准做一次对齐，而不是指望一条都没漏。
+   正在跑的那一轮不覆盖：事件此刻还在往里写。 */
+async function syncAgents() {
+  const st = await fetch('/api/state').then((r) => r.json()).catch(() => null);
+  if (!st) return;
+  for (const [pid, a] of Object.entries(st.agents || {})) {
+    S.agents[pid] = { status: a.status, error: a.error, busy: a.busy };
+    S.busy[pid] = !!a.busy;
+    if (S.busy[pid]) continue;
+    S.msgs[pid] = (a.history || []).map((h) => ({
+      role: h.role === 'user' ? 'me' : 'it', text: h.text || '', tools: [],
+    }));
+    S.cur[pid] = null;
+  }
+  paintRail();
+  paintThread();
+  paintConn();
+}
+
+/* ------------------------------------------------------------------ 设置 */
+/* 全部设置只有一项：aaas-service 地址。它决定「这个工作区连哪个道」——
+   所以它属于整个工作区，放在左下角，不混进程序那一列。 */
+function setHint(text, cls) {
+  const el = $('#setmsg');
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = 'hint' + (cls ? ' ' + cls : '');
+}
+
+function openSettings() {
+  const m = $('#mask');
+  if (!m) return;
+  m.classList.add('on');
+  m.setAttribute('aria-hidden', 'false');
+  $('#aaasurl').value = (S.settings && S.settings.url) || '';
+  setHint('');
+  paintConn();
+  $('#aaasurl').focus();
+  $('#aaasurl').select();
+}
+
+function closeSettings() {
+  const m = $('#mask');
+  if (!m) return;
+  m.classList.remove('on');
+  m.setAttribute('aria-hidden', 'true');
+}
+
+/* 保存 = 落盘 + 立刻按新地址重连。地址错在这里就报，别让人对着一个
+   「好像连不上」的界面猜。 */
+async function saveSettings(e) {
+  if (e) e.preventDefault();
+  const btn = $('#setsave');
+  const url = $('#aaasurl').value.trim();
+  btn.disabled = true;
+  setHint('保存中…');
+  const r = await fetch('/api/settings', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ url }),
+  }).then((x) => x.json()).catch((err) => ({ status: 'bad', error: String(err) }));
+  btn.disabled = false;
+  if (!r || r.status !== 'ok') { setHint((r && r.error) || '保存失败', 'bad'); return; }
+  S.settings = { url: r.url };
+  $('#aaasurl').value = r.url;
+  const n = (r.reconnected || []).length;
+  setHint(`已保存 · ${n ? `正在用新地址重连 ${n} 个程序` : '还没有程序连过，下次说话时连'}`,
+          'ok');
+  await syncAgents();
+  paintConn();
+}
+
+$('#setcancel').onclick = closeSettings;
+$('#setform').onsubmit = saveSettings;
+$('#mask').addEventListener('click', (e) => { if (e.target.id === 'mask') closeSettings(); });
+window.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSettings(); });
+
+/* ------------------------------------------------------------------ 启动 */
+function select(pid) {
+  if (!prog(pid)) pid = (S.programs[0] || {}).id;
+  S.pid = pid;
+  location.hash = pid ? `#p/${pid}` : '';
+  paintRail();
+  paintStage(true);
+}
+
+/* 委托绑在 #stage 上：它自己不被替换，里面的 thread 换多少次都还在。 */
+$('#stage').addEventListener('click', onThreadClick);
+window.addEventListener('resize', () => {
+  const sp = $('.split');
+  if (sp) sp.style.setProperty('--chatw', clampChatW(chatW(S.pid), sp.clientWidth) + 'px');
+});
+
+(async function boot() {
+  await loadState();
+  const want = location.hash.replace(/^#\/?p\//, '') ||
+    ((S.programs.find((p) => p.id === 'assistant') || S.programs[0] || {}).id);
+  select(want);
+  const es = new EventSource('/api/events');
+  es.onopen = () => { syncAgents(); };        // 首连 + 断线重连都走这里
+  es.onmessage = (e) => { try { on(JSON.parse(e.data)); } catch (err) { /* 一条坏事件不该掀桌 */ } };
+})();
+</script>
+</body>
+</html>
