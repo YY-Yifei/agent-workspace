@@ -35,8 +35,8 @@
 ## 装
 
 ```bash
-pip install agent-workspace          # 内核 + aaas 客户端
-pip install "agent-workspace[gui]"   # 再带上桌面窗口（pywebview）
+pip install agent-workspace-desktop          # 内核 + aaas 客户端
+pip install "agent-workspace-desktop[gui]"   # 再带上桌面窗口（pywebview）
 ```
 
 需要 Python 3.10+，以及一个能连上的 `aaas-service`（地址在设置里改，默认 `ws://localhost:8888`）。
