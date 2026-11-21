@@ -97,10 +97,16 @@ class Handler(BaseHTTPRequestHandler):
             return False
         origin = self.headers.get("origin")
         if origin:
-            o = urlsplit(origin)
+            try:
+                o = urlsplit(origin)
+                port = o.port                    # 畸形值（http://[、端口越界）会抛 ValueError
+            except ValueError:
+                return False                     # 头完全由客户端控制，解析失败就当来路不明
             if (o.hostname or "").lower() not in ("127.0.0.1", "localhost", "::1"):
                 return False
-            if o.port not in (None, self.server.server_address[1]):
+            # 必须**显式**等于本机端口：o.port is None 指的是「协议默认端口」(80/443)，
+            # 那不是我们这道门听的随机端口
+            if port != self.server.server_address[1]:
                 return False
         return True
 
@@ -151,6 +157,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if not self._origin_ok():
+            # 还没读 body 就回绝：HTTP/1.1 是 keep-alive，不关连接的话这段未读的
+            # body 会被当成下一个请求行解析（请求走私的经典形态）
+            self.close_connection = True
             return self._json({"error": "只接受本机页面的请求"}, 403)
         path = unquote(urlsplit(self.path).path)
         rt, hub = App.runtime, App.hub

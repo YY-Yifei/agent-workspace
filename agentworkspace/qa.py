@@ -56,6 +56,11 @@ u = ctypes.windll.user32
 k32 = ctypes.windll.kernel32
 advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 wtsapi32 = ctypes.WinDLL("wtsapi32", use_last_error=True)
+
+# 句柄类的原型集中在模块级声明一次：find_windows() 会被 wait_window() 每 0.5 秒
+# 调一次，写在函数里等于每次请求都重设一遍
+u.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+u.GetWindowThreadProcessId.restype = wt.DWORD
 userenv = ctypes.WinDLL("userenv", use_last_error=True)
 
 WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
@@ -126,8 +131,6 @@ def find_windows(substr: str, pid: int | None = None) -> list[dict]:
     同一个程序，或上一次测试留下的窗口 —— 那既会给出假截图，也会把别人的窗口关掉。
     """
     out: list[dict] = []
-    u.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
-    u.GetWindowThreadProcessId.restype = wt.DWORD
 
     def cb(hwnd, _):
         if pid is not None:
@@ -173,6 +176,11 @@ def _enable(name: str) -> None:
     tp.Privileges[0].Luid = luid
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
     advapi32.AdjustTokenPrivileges(h, False, ctypes.byref(tp), 0, None, None)
+    # AdjustTokenPrivileges 返回 TRUE **不代表**特权到手：没被授予时它靠
+    # GetLastError() == ERROR_NOT_ALL_ASSIGNED(1300) 表示，照样返回 TRUE。
+    # 不看这一条，_enable() 还是「看起来做了、其实没做」。
+    if k32.GetLastError() == 1300:
+        return
 
 
 def relaunch_in_active_session(argv: list[str]) -> int | None:
@@ -407,12 +415,14 @@ def qa_native() -> dict:
                                   "「独立的真 OS 窗口」这件事本轮没有验到", "ok": False,
                           "skip": True}]
         return res
-    before = len(find_windows("便签"))
+    # 原生窗口是**另一个进程**，按 pid 认不了（那是宿主的 pid），
+    # 所以改按「打开之前就在的句柄」做差集：只认新出现的那个
+    before = {w["hwnd"] for w in find_windows("便签")}
     res["opened"] = _post(host.port, "/api/p/memo/open")
     opened: list[dict] = []
     t0 = time.time()
     while time.time() - t0 < 25:
-        opened = find_windows("便签")
+        opened = [w for w in find_windows("便签") if w["hwnd"] not in before]
         if opened:
             break
         time.sleep(0.5)
@@ -420,7 +430,7 @@ def qa_native() -> dict:
         res["shot"] = _shot(OUT / "native.png", opened[0]["hwnd"])
     res["closed"] = _post(host.port, "/api/p/memo/close")
     time.sleep(2.0)
-    after = len(find_windows("便签"))
+    after = [w for w in find_windows("便签") if w["hwnd"] not in before]
     res["exit"] = host.close()
     res["checks"] = [
         {"name": "打开前没有便签窗口", "ok": before == 0, "detail": str(before)},

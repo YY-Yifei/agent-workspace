@@ -169,3 +169,45 @@
 
 状态列：**已修** = 这一轮改了；**未修** = 见上面分类；行号是 ocr 给的原始行号。
 
+---
+
+## 第二轮：评审「我刚改的东西」
+
+修完不能自己说修好了。所以对**修复提交本身**再评一次（diff 模式，只看我改了什么）：
+
+```
+ocr review -c HEAD --audience agent --format json -o .tmp/ocr-review-2.json
+```
+
+结果 **15 条**（high 1 / medium 8 / low 6）—— 全部是「我这次改动带来的新问题」，
+说明这次改动本身也该被审。挑真问题修了 13 条：
+
+| 严重度 | 位置 | 问题 | 修法 |
+|---|---|---|---|
+| high | `link.py:275` | `_declare_fails` 只在成功时归零：同一份坏声明满 3 次后，**换了新声明第一次失败就直接被记成「已声明」**，新能力永远声明不上去 | 计数绑定到「哪一份声明」（`_declare_sig_tried`），换签名就重新计数 |
+| medium | `link.py:320` | `add_done_callback` 遇到已完成的 future 会在**注册线程同步执行**，而注册那段正持着非重入的 `_send_lock` → 死锁 | `_turn_done` 不再拿锁（bool 赋值本来就够） |
+| medium | `toolbox.py:190` | 落临时文件只是不占内存了：`yes` 在 30 秒里能写几个 GB 把 `%TEMP%` 塞满 | 改成读线程边读边限（60000 字符），超限即 kill |
+| medium | `qa.py:166` | `AdjustTokenPrivileges` 没授予特权时**照样返回 TRUE**（靠 `GetLastError()==1300` 表示） | 补 `ERROR_NOT_ALL_ASSIGNED` 判定 |
+| medium | `qa.py:398` | 原生 memo 窗口仍按标题认（那是另一个进程，按 pid 认不了） | 改成「打开前已在的句柄」差集，只认新窗口 |
+| medium | `selftest.py:453` | 复原判据写反了：文件被删时 `bp.exists()` 为假 → 跳过复原，留下没有 backend.py 的程序 | 判据改成「不存在或内容不对」 |
+| medium | `server.py:103` | `o.port is None` 指协议默认端口（80/443），不是本机随机端口 —— 于是「同源」判宽了 | 要求显式等于本机端口 |
+| medium | `.gitignore:15` | `.env.*` 把 `.env.example` 这类模板一起忽略；`secrets.*` 会误伤 `agentworkspace/secrets.py`；`build/`、`dist/` 去锚点后在任意深度误伤 | 加 `!` 例外、`secrets` 锚到根、`build|dist` 恢复根锚 |
+| low | `link.py:173` | `_mark_ready` 可能把 `stop()` 关掉的链路改回「已连上」 | `closed` 当终态 |
+| low | `server.py:100` | 畸形 `Origin`（`http://[`）让 `urlsplit` 抛 `ValueError`，冲出判定 | 捕 `ValueError` → 当作来路不明 |
+| low | `server.py:153` | 拒绝请求时没读 body，HTTP/1.1 keep-alive 会把 body 当下一个请求行（请求走私形态） | 拒绝时 `close_connection = True` |
+| low | `qa.py:129` | 原型声明在 `find_windows()` 里每次重设（`wait_window` 每 0.5 秒调一次） | 挪到模块级 |
+| low | `pyproject.toml:43` | `packages.find` 默认 `namespaces=true`，`assets/` 会作为命名空间包混进 wheel | `namespaces = false` |
+
+未改 2 条：纯风格建议（注释措辞/表格对齐），不改。
+
+回归：`python -m agentworkspace.selftest` → **98 通过 / 16 失败**，与第一轮、与改动前
+完全一致（16 项全是工作区缺 `pomodoro` / `memo` 的既有基线）。
+
+## 评审本身的两个坑（工具侧，不是我们的代码）
+
+1. **模型侧 JSON 坏了会静默丢结论**：第一轮有 2 条 `code_comment` 因为
+   `invalid character ')' after object key:value pair` 被丢，`status` 只说
+   `completed_with_errors`。做门禁时不能只看退出码，要看 `comments` 条数与 `status`。
+2. **换强模型不代表更好用**：同一份代码用 `deepseek-v4-pro` 复扫，30 分钟超时被杀
+   （`--timeout 25` 分钟的上限都没跑完），换成 flash 才跑得完。
+   评审的门槛是「跑得完 + 结论可读」，不是「模型最强」。

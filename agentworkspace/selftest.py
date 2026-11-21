@@ -450,7 +450,9 @@ def main() -> int:
     finally:
         # 断言先失败、或后面某步抛了，也不许把这个程序留在坏版本上 ——
         # 它会拖坏**后续每一次**运行
-        if bp.exists() and bp.read_text(encoding="utf-8") != good:
+        # 判据不能是 bp.exists()：要是坏写/校验把文件弄没了，正需要复原，
+        # 而 exists() 为假反而跳过 —— 那会留下一个没有 backend.py 的程序
+        if not bp.exists() or bp.read_text(encoding="utf-8") != good:
             bp.write_text(good, encoding="utf-8")
             rt.scan()
 

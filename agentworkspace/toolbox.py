@@ -23,7 +23,8 @@ import json
 import re
 import shutil
 import subprocess
-import tempfile
+import threading
+import time
 import sys
 from pathlib import Path
 
@@ -185,18 +186,42 @@ def shell(command: str) -> dict:
 
     command: 要执行的命令
     """
-    # 输出先落临时文件再读回来：capture_output 会把整份输出攒进内存，
-    # `yes` 一类命令在 30 秒里足以把内存吃光。这里最多留 60000 字符。
-    with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as buf:
-        try:
-            proc = subprocess.run(command, shell=True, cwd=str(_ws()), timeout=30,
-                                  stdout=buf, stderr=subprocess.STDOUT)
-        except subprocess.TimeoutExpired:
-            raise ValueError("命令超过 30 秒未结束，已终止")
-        buf.seek(0)
-        out = buf.read(60000).strip()
+    # 边读边限：`capture_output` 把整份输出攒进内存，落临时文件又会把磁盘写满
+    # （`yes` 在 30 秒里能做几个 GB）。所以起一个读线程，超过 60000 字符就杀掉进程。
+    LIMIT = 60000
+    buf: list[str] = []
+    total = 0
+    proc = subprocess.Popen(command, shell=True, cwd=str(_ws()),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace")
+    t0 = time.time()
+
+    def _reader() -> None:
+        nonlocal total
+        assert proc.stdout is not None
+        while True:
+            chunk = proc.stdout.read(8192)
+            if not chunk:
+                return
+            if total < LIMIT:
+                buf.append(chunk[: LIMIT - total])
+                total += len(chunk)
+            if total >= LIMIT and proc.poll() is None:
+                proc.kill()                    # 话太多就不听了：别让它继续占着管道
+                return
+
+    th = threading.Thread(target=_reader, name="toolbox-shell", daemon=True)
+    th.start()
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise ValueError("命令超过 30 秒未结束，已终止")
+    th.join(timeout=5)
+    out = "".join(buf).strip()
     return {"text": out[:6000] or f"（无输出，退出码 {proc.returncode}）",
-            "exit": proc.returncode}
+            "exit": proc.returncode, "seconds": round(time.time() - t0, 2)}
 
 
 # ------------------------------------------------------------------ 造

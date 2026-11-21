@@ -41,6 +41,9 @@ Issues = "https://github.com/YY-Yifei/agent-workspace/issues"
 # 用 find 而不是手写清单：以后 agentworkspace/ 下多一个子包（比如 assets/），
 # 忘了改 pyproject 就会静默打不进 wheel
 include = ["agentworkspace*"]
+# namespaces 默认 true：那样没有 __init__.py 的目录（如 assets/）也会被当成命名空间包
+# 打进 wheel，和 package-data 的意图不一样
+namespaces = false
 
 [tool.setuptools.package-data]
 agentworkspace = ["web/*.html", "assets/*.ico"]

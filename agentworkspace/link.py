@@ -102,6 +102,7 @@ class Link:
         self._turn_task: asyncio.Task | None = None
         self._declared_sig: tuple | None = None
         self._declare_fails = 0        # 同一份坏声明连续失败几次（用来停手）
+        self._declare_sig_tried: tuple | None = None   # 上面的计数属于哪一份声明
         self.status = "idle"            # idle | connecting | ready | error | closed
         self.error: str | None = None
         self.session_id: str | None = None
@@ -170,7 +171,9 @@ class Link:
     def _mark_ready(self, ok: bool) -> None:
         """声明成功才算 ready；没成功就留在 connecting —— send() 会如实说「还没连上」，
         而不是把人送进一轮「模型看不到任何能力」的对话。"""
-        if not ok or self.status == "ready":
+        if not ok or self.status in ("ready", "closed"):
+            # closed 是终态：stop() 可能在 declare 的往返途中把链路关掉，
+            # 那时再把 status 改回 ready，等于让一个已经关掉的 Link 声称「已连上」
             return
         self.status = "ready"
         self._emit("link.status", {"status": "ready", "sessionId": self.session_id,
@@ -272,11 +275,18 @@ class Link:
             # **不**把 sig 记成「已声明」：网络抖动是暂时的，得有机会重试；
             # 原来一失败就记上，这个程序就永远没有自己的函数了（而 status 还是 ready）。
             # 但同一份坏声明白重试 3 次就停手，等能力面再变。
+            # 计数必须按「声明内容」分开算：否则同一份坏声明攒到 3 次之后，
+            # 能力面变了、新声明第一次失败就直接 >= 3 被记成「已声明」——
+            # 新能力从此再也声明不上去（而且 status 可能永远停在 connecting）。
+            if sig != self._declare_sig_tried:
+                self._declare_sig_tried = sig
+                self._declare_fails = 0
             self._declare_fails += 1
             if self._declare_fails >= 3:
                 self._declared_sig = sig
             return False
         self._declare_fails = 0
+        self._declare_sig_tried = sig
         self._declared_sig = sig
         self.error = None
         self._emit("link.declared", {"revision": rev, "functions": list(names),
@@ -332,8 +342,10 @@ class Link:
             exc = inner
         if exc is None:
             return
-        with self._send_lock:
-            self._busy = False
+        # **不能在这里拿 _send_lock**：add_done_callback 遇到已经完成的 future
+        # 会在注册线程里同步执行回调，而注册那段正在 with self._send_lock 里 ——
+        # 非重入锁 → 那个线程（HTTP handler）永久阻塞。bool 赋值本身就够用了。
+        self._busy = False
         self.error = f"{type(exc).__name__}: {exc}"
         self._emit("turn.failed", {"error": self.error})
 
