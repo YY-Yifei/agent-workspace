@@ -85,8 +85,12 @@ def _fixture_note() -> None:
         print(f"[注意] 工作区里没有 {', '.join(gone)} 这些程序；"
               f"与它们有关的断言会失败 —— 那是工作区数据缺失，不是本轮改坏的。",
               flush=True)
+        pdir = WS / "plugins"
+        # plugins/ 本身不在时也要如实说出来 —— 那正是这条提示想覆盖的情况，
+        # 原来无条件 iterdir() 会先抛 FileNotFoundError，把整个自检掀翻
+        here = sorted(x.name for x in pdir.iterdir() if x.is_dir()) if pdir.is_dir() else None
         print(f"       要恢复：从 workspace/.backup/ 拷回，或让小助理重造。"
-              f"（当前 plugins/：{sorted(x.name for x in (WS / 'plugins').iterdir() if x.is_dir())}）",
+              f"（当前 plugins/：{here if here is not None else '连 plugins/ 都没有'}）",
               flush=True)
 
 
@@ -433,15 +437,22 @@ def main() -> int:
     # 底线二：改坏了要整份回滚（不然「这一次失败」会变成「下次开机起不来」）
     bp = WS / "plugins" / pid / "backend.py"
     good = bp.read_text(encoding="utf-8")
-    res = rt.dispatch("assistant", "plugin_write",
-                      {"pid": pid, "files": {"backend.py": "def broken(: pass\n"}},
-                      source="agent", caller=pid)
-    check("写坏的 backend 被拒，并说清已回滚",
-          res.status == "error" and "回滚" in (res.text or ""), (res.text or "")[:100])
-    check("磁盘退回提交前的版本", bp.read_text(encoding="utf-8") == good,
-          f"{len(bp.read_text(encoding='utf-8'))} 字符")
-    check("回滚把坏的也清了：装载后文本里没有 broken",
-          "def broken(" not in bp.read_text(encoding="utf-8"))
+    try:
+        res = rt.dispatch("assistant", "plugin_write",
+                          {"pid": pid, "files": {"backend.py": "def broken(: pass\n"}},
+                          source="agent", caller=pid)
+        check("写坏的 backend 被拒，并说清已回滚",
+              res.status == "error" and "回滚" in (res.text or ""), (res.text or "")[:100])
+        check("磁盘退回提交前的版本", bp.read_text(encoding="utf-8") == good,
+              f"{len(bp.read_text(encoding='utf-8'))} 字符")
+        check("回滚把坏的也清了：装载后文本里没有 broken",
+              "def broken(" not in bp.read_text(encoding="utf-8"))
+    finally:
+        # 断言先失败、或后面某步抛了，也不许把这个程序留在坏版本上 ——
+        # 它会拖坏**后续每一次**运行
+        if bp.exists() and bp.read_text(encoding="utf-8") != good:
+            bp.write_text(good, encoding="utf-8")
+            rt.scan()
 
     # 底线三：改程序只有一条路（裸写会绕过四道校验）
     res = rt.dispatch("assistant", "write",

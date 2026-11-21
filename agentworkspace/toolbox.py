@@ -23,6 +23,7 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 from pathlib import Path
 
@@ -72,6 +73,10 @@ def tree(max_depth: int = 3) -> dict:
             return
         for child in sorted(d.iterdir()):
             if child.name.startswith((".", "__")) or child.name in ("logs", ".tmp"):
+                continue
+            if child.is_symlink():
+                # 只显示、不跟进去：跟进去就绕开了「工作区边界」这句话
+                lines.append("  " * (depth - 1) + child.name + "@")
                 continue
             shown = child.name + ("/" if child.is_dir() else "")
             lines.append("  " * (depth - 1) + shown)
@@ -145,9 +150,12 @@ def _write_target(path: str) -> Path:
     不堵它，「只能改自己」就有一扇后门直接通向「改别人的权限」。
     """
     p = _safe(path)
-    rel = p.relative_to(_ws()).as_posix()
-    if "data" in p.parts[-2:]:
-        raise ValueError("不许写 data/ —— 那是用户的数据")
+    parts = p.relative_to(_ws()).parts
+    rel = "/".join(parts)
+    if "data" in parts:
+        # 按**路径分量**判，不是只看末两段：``data/sub/x.txt`` 的末两段是
+        # ``sub``/``x.txt``，剥两段的写法会放它过去 —— 防护等于没有。
+        raise ValueError(f"不许写 data/ —— 那是用户的数据（{rel}）")
     if rel.startswith("plugins/"):
         raise ValueError(
             f"改程序不走 write：{rel} 在程序目录里。用 plugin_write —— "
@@ -177,12 +185,16 @@ def shell(command: str) -> dict:
 
     command: 要执行的命令
     """
-    try:
-        proc = subprocess.run(command, shell=True, cwd=str(_ws()), timeout=30,
-                              capture_output=True, text=True, encoding="utf-8", errors="replace")
-    except subprocess.TimeoutExpired:
-        raise ValueError("命令超过 30 秒未结束，已终止")
-    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    # 输出先落临时文件再读回来：capture_output 会把整份输出攒进内存，
+    # `yes` 一类命令在 30 秒里足以把内存吃光。这里最多留 60000 字符。
+    with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as buf:
+        try:
+            proc = subprocess.run(command, shell=True, cwd=str(_ws()), timeout=30,
+                                  stdout=buf, stderr=subprocess.STDOUT)
+        except subprocess.TimeoutExpired:
+            raise ValueError("命令超过 30 秒未结束，已终止")
+        buf.seek(0)
+        out = buf.read(60000).strip()
     return {"text": out[:6000] or f"（无输出，退出码 {proc.returncode}）",
             "exit": proc.returncode}
 
@@ -284,9 +296,13 @@ def plugin_delete(pid: str, keep_data: bool = True) -> dict:
         raise ValueError(
             f"不能用手删掉自己：{pid} 一删，它自己的界面和那枚开发者模式开关就一起没了"
             f"（开关在 workspace/dev.json，这个目录之外）。要删就让用户删、或让小助理删。")
+    if not PID_RE.match(pid):
+        raise ValueError(f"插件 id {pid!r} 不合法：须匹配 {PID_RE.pattern}")
     root = _ws()
     pdir = (root / "plugins" / pid).resolve()
-    if root not in pdir.parents or not pdir.is_dir():
+    # 判据是「pdir 的父目录**就是** plugins」，不是「root 在它的祖先里」：
+    # 后者会让 pid="../data" 解析到 <ws>/data 而通过，接着 rmtree 掉整个数据目录。
+    if pdir.parent != (root / "plugins").resolve() or not pdir.is_dir():
         raise ValueError(f"没有插件 {pid}")
     backup = None
     if keep_data and (pdir / "data").is_dir():

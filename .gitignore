@@ -10,17 +10,32 @@
 /.tmp/
 /.openthree/
 
+# ── 凭据：任何形态都不许入库 ─────────────────────────
+.env
+.env.*
+*.key
+*.pem
+secrets.*
+.pypirc
+*.token
+
 # ── 构建与缓存 ───────────────────────────────────────
 __pycache__/
 *.py[cod]
+build/
+dist/
 *.egg-info/
-/build/
-/dist/
-/.venv/
-/venv/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# pywebview / WebView2 的用户配置（.tmp 里那份就是从这里长出来的）
-*.wvprofile*/
+# WebView2 / pywebview 的用户配置目录（pywebview 会建 WebView2/ 或 EBWebView/）
+wvprofile*/
+WebView2/
+EBWebView/
+.wvprofile*/
 wv_persist.json
 
 # ── 日志与备份 ───────────────────────────────────────

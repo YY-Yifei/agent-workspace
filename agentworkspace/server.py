@@ -80,6 +80,30 @@ class Handler(BaseHTTPRequestHandler):
             ctype += "; charset=utf-8"
         self._send(200, path.read_bytes(), ctype)
 
+    def _origin_ok(self) -> bool:
+        """状态变更请求只接受**本机页面**发来的。
+
+        为什么需要：这道门只听 127.0.0.1，但「只听本机」不等于「只有本机页面能用」——
+        任何网页都能往 http://127.0.0.1:<port>/api/p/<pid>/chat 发一个 text/plain 的
+        JSON body（不需要 CORS 预检），替人开口说话、拨开发者模式、改设置；
+        DNS rebinding 还能把 Host 变成攻击者的域名。
+
+        判据两条：Host 必须是本机名；有 Origin 就必须是本站。
+        （curl / --cli 这类没有 Origin 的本机客户端照旧放行。）
+        """
+        host = (self.headers.get("host") or "").strip().lower()
+        name = host.rsplit(":", 1)[0] if not host.startswith("[") else host.split("]")[0] + "]"
+        if name and name not in ("127.0.0.1", "localhost", "[::1]", "::1"):
+            return False
+        origin = self.headers.get("origin")
+        if origin:
+            o = urlsplit(origin)
+            if (o.hostname or "").lower() not in ("127.0.0.1", "localhost", "::1"):
+                return False
+            if o.port not in (None, self.server.server_address[1]):
+                return False
+        return True
+
     # -- 路由 ----------------------------------------------------------
     def do_GET(self) -> None:
         path = unquote(urlsplit(self.path).path)
@@ -89,7 +113,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._file(App.web / "index.html")
         if path.startswith("/web/"):
             target = (App.web / path[5:]).resolve()
-            if not str(target).startswith(str(App.web.resolve())):
+            # 按路径分量判，不是字符串前缀：兄弟目录名只要以同一前缀开头
+            # （web-evil / web2）就能骗过 startswith
+            if not target.is_relative_to(App.web.resolve()):
                 return self._json({"error": "forbidden"}, 403)
             return self._file(target)
 
@@ -117,13 +143,15 @@ class Handler(BaseHTTPRequestHandler):
             base = plugin.path / "ui"
             rel = "index.html" if rest in ("/", "") else rest.lstrip("/")
             target = (base / rel).resolve()
-            if not str(target).startswith(str(base.resolve())):
+            if not target.is_relative_to(base.resolve()):
                 return self._json({"error": "forbidden"}, 403)
             return self._file(target)
 
         return self._json({"error": "not found", "path": path}, 404)
 
     def do_POST(self) -> None:
+        if not self._origin_ok():
+            return self._json({"error": "只接受本机页面的请求"}, 403)
         path = unquote(urlsplit(self.path).path)
         rt, hub = App.runtime, App.hub
         length = int(self.headers.get("content-length") or 0)

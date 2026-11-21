@@ -182,6 +182,7 @@ const S = {
   settings: { url: '' },
   msgs: {},       // pid → [{role:'me'|'it', text, tools:[{label,status,text}]}]
   cur: {},        // pid → 当前这一轮那条消息的下标
+  tick: {},       // pid → 被事件碰过几次（用来判断 /api/state 的快照是否已过期）
   railSig: '', stageKey: '', busy: {},
 };
 
@@ -539,6 +540,7 @@ async function send(pid, text) {
 function on(ev) {
   const pid = ev.pid || 'assistant';
   const d = ev.data || {};
+  S.tick[pid] = (S.tick[pid] || 0) + 1;
   switch (ev.type) {
     case 'turn.started':
       S.cur[pid] = null; S.busy[pid] = true; curIt(pid); break;
@@ -546,11 +548,16 @@ function on(ev) {
       curIt(pid).text += (d.text || ''); break;
     case 'call.ready': {
       const m = curIt(pid);
-      m.tools.push({ label: labelOf(pid, d.name), status: '运行中', text: '' });
+      // 带上 callId：事件里一直有，是前端把它丢了 —— 于是「结果」只能认成
+      // 「最后一条」，交错的调用会把结果贴到别人的卡上
+      m.tools.push({ label: labelOf(pid, d.name), status: '运行中', text: '',
+                     callId: d.callId || '' });
       break;
     }
     case 'call.result': {
-      const m = curIt(pid), t = m.tools[m.tools.length - 1];
+      const m = curIt(pid);
+      let t = d.callId ? m.tools.find((x) => x.callId === d.callId) : null;
+      if (!t) t = m.tools.slice().reverse().find((x) => x.status === '运行中');
       if (t) { t.status = d.status || '完成'; t.text = String(d.text || '').slice(0, 600); }
       break;
     }
@@ -600,9 +607,14 @@ function labelOf(pid, wire) {
    所以这里以 /api/state 里的历史为准做一次对齐，而不是指望一条都没漏。
    正在跑的那一轮不覆盖：事件此刻还在往里写。 */
 async function syncAgents() {
+  // await 会把控制权交还给 SSE。快照是在 await **之前**取的，所以这期间可能已经
+  // 推进了一轮：那时快照里的 busy 还是 false，盖下去等于把刚到的消息和转圈一起抹掉。
+  // 判据：这个 pid 的 tick 变过，就跳过它 —— 让事件流继续负责这一轮。
+  const tick0 = { ...S.tick };
   const st = await fetch('/api/state').then((r) => r.json()).catch(() => null);
   if (!st) return;
   for (const [pid, a] of Object.entries(st.agents || {})) {
+    if ((S.tick[pid] || 0) !== (tick0[pid] || 0)) continue;
     S.agents[pid] = { status: a.status, error: a.error, busy: a.busy };
     S.busy[pid] = !!a.busy;
     if (S.busy[pid]) continue;

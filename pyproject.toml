@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,14 +8,14 @@ version = "0.1.0"
 description = "桌面 Agent 工作区内核：一个目录约定、一条 dispatch、一条事件流、一份能力面"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Agent Workspace contributors" }]
 keywords = ["agent", "aaas", "desktop", "pywebview", "workspace", "plugins"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Environment :: Win32 (MS Windows)",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: Microsoft :: Windows",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
@@ -32,8 +32,15 @@ gui = ["pywebview>=5.0"]
 [project.scripts]
 agent-workspace = "agentworkspace.main:main"
 
-[tool.setuptools]
-packages = ["agentworkspace"]
+[project.urls]
+Homepage = "https://github.com/YY-Yifei/agent-workspace"
+Source = "https://github.com/YY-Yifei/agent-workspace"
+Issues = "https://github.com/YY-Yifei/agent-workspace/issues"
+
+[tool.setuptools.packages.find]
+# 用 find 而不是手写清单：以后 agentworkspace/ 下多一个子包（比如 assets/），
+# 忘了改 pyproject 就会静默打不进 wheel
+include = ["agentworkspace*"]
 
 [tool.setuptools.package-data]
 agentworkspace = ["web/*.html", "assets/*.ico"]

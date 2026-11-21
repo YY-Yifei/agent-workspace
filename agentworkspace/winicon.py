@@ -60,6 +60,9 @@ class BITMAPINFOHEADER(ctypes.Structure):
                 ("biClrImportant", ctypes.c_uint32)]
 
 
+WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+
 def _bind() -> None:
     """显式声明参数类型。
 
@@ -85,6 +88,16 @@ def _bind() -> None:
     u.GetDC.restype = wintypes.HDC
     u.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
     u.ReleaseDC.restype = ctypes.c_int
+    # 下面这几个也在拿句柄：不声明 argtypes，ctypes 会把 hwnd 当 32 位 int 转，
+    # 64 位上门柄一大就 ValueError —— 而且只在真的找到窗口时才出现
+    u.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+    u.EnumWindows.restype = wintypes.BOOL
+    u.IsWindowVisible.argtypes = [wintypes.HWND]
+    u.IsWindowVisible.restype = wintypes.BOOL
+    u.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    u.GetWindowTextLengthW.restype = ctypes.c_int
+    u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    u.GetWindowTextW.restype = ctypes.c_int
 
 
 _bind()
@@ -95,7 +108,7 @@ def find_window(title: str) -> int | None:
     """标题含 ``title`` 的可见顶层窗口。"""
     found: list[int] = []
 
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    @WNDENUMPROC
     def cb(hwnd, _l):
         if not u.IsWindowVisible(hwnd):
             return True

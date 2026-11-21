@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from pathlib import Path
@@ -34,22 +35,25 @@ ASSISTANT = "assistant"
 
 # 提示词文件缺席时的兜底：短，且**不撒谎**（不承诺它其实没有的能力）。
 FALLBACK_ASSISTANT = "你是小助理。用户让你做什么，你就用你手上的能力做完它。"
-FALLBACK_DEV = """你是「{title}」这个程序里的助手，**开发者模式开着**。
+# 占位符必须写成 {{...}}：替换那一侧（_plugin_prompt）只认双花括号。
+# 写成单花括号时，一旦 prompts/ 下的文件缺失、走到这两个回退模板，
+# 模型收到的就是字面的「{title}」「{tools}」。
+FALLBACK_DEV = """你是「{{title}}」这个程序里的助手，**开发者模式开着**。
 
 你除了自己那几项能力，还能用下面这些通用的手（它们属于小助理）：
 
-{tools}
+{{tools}}
 
 开发者模式是人亲手给你打开的：你现在可以读写工作区里的文件、跑命令、
-也可以改你自己（{dir}）。改自己只走 plugin_write("{pid}", {{...}})，
+也可以改你自己（{{dir}}）。改自己只走 plugin_write("{{pid}}", {...})，
 先 plugin_verify 看一下，提交的是整份文件、不是补丁。别碰 data/。
 """
 
-FALLBACK_PLUGIN = """你是「{title}」这个程序里的助手。
+FALLBACK_PLUGIN = """你是「{{title}}」这个程序里的助手。
 
 你只有下面这些能力，没有别的 —— 你不能造程序、不能改代码、不能看别的文件：
 
-{tools}
+{{tools}}
 
 说话要短、要具体。用户想要的东西不在这份清单里，就直说做不了。
 """
@@ -97,6 +101,7 @@ class Link:
         self._send_lock = threading.Lock()
         self._turn_task: asyncio.Task | None = None
         self._declared_sig: tuple | None = None
+        self._declare_fails = 0        # 同一份坏声明连续失败几次（用来停手）
         self.status = "idle"            # idle | connecting | ready | error | closed
         self.error: str | None = None
         self.session_id: str | None = None
@@ -146,10 +151,9 @@ class Link:
 
         cr = self._caller.connect_result
         self.session_id = getattr(cr, "session_id", None)
-        self.status = "ready"
-        self._emit("link.status", {"status": "ready", "sessionId": self.session_id,
-                                   "historyMode": getattr(cr, "history_mode", None)})
-        await self._declare()
+        # **先声明，再标 ready。** 反过来的话，第一句话可能在 declare 还在路上时就被
+        # 调度出去 —— 那一轮里模型看不到这个程序的任何能力（工具还没到）。
+        self._mark_ready(await self._declare())
         # 连接活着的期间：**这个程序**的能力有变化就重新声明。
         # 判据是能力面的差异，不是 rt.version —— 版本号是全工作区的，
         # 别的插件变了也跟着跳，那会让每个程序无谓地重声明。
@@ -158,10 +162,20 @@ class Link:
             if self.status == "closed":
                 return
             if self._sig() != self._declared_sig:
-                await self._declare()
+                self._mark_ready(await self._declare())
 
     def _emit(self, kind: str, data: dict, source: str = "system") -> None:
         self.rt.publish(kind, pid=self.pid, source=source, data=data)
+
+    def _mark_ready(self, ok: bool) -> None:
+        """声明成功才算 ready；没成功就留在 connecting —— send() 会如实说「还没连上」，
+        而不是把人送进一轮「模型看不到任何能力」的对话。"""
+        if not ok or self.status == "ready":
+            return
+        self.status = "ready"
+        self._emit("link.status", {"status": "ready", "sessionId": self.session_id,
+                                   "historyMode": getattr(self._caller.connect_result,
+                                                          "history_mode", None)})
 
     # ------------------------------------------------------------------ 声明
     def instructions(self) -> str:
@@ -197,8 +211,19 @@ class Link:
         return f"{text}\n\n{own}" if own else text
 
     def _sig(self) -> tuple:
-        """这个程序的能力面指纹。变了才需要重声明。"""
-        return tuple(sorted(self.rt.capabilities_of(self.pid)))
+        """这个程序的能力面指纹。变了才需要重声明。
+
+        必须包含**声明相关的一切**：只看 wire 名字的话，改了 description、
+        参数 schema 或 timeout（改函数签名就会变）时指纹不动 —— 模型会一直看到
+        旧声明，而界面显示「已是最新」。
+        """
+        rows = []
+        for wire, cap in sorted(self.rt.capabilities_of(self.pid).items()):
+            rows.append((wire, cap.description or "",
+                         json.dumps(cap.parameters, sort_keys=True,
+                                    ensure_ascii=False, default=str),
+                         getattr(cap, "timeout_ms", None)))
+        return tuple(rows)
 
     def _tools(self) -> list[Tool]:
         tools: list[Tool] = []
@@ -226,10 +251,11 @@ class Link:
                                   reason=res.reason)
         return run
 
-    async def _declare(self) -> None:
+    async def _declare(self) -> bool:
+        """声明一次能力面。返回是否成功（成功才配叫 ready）。"""
         caller = self._caller
         if caller is None:
-            return
+            return False
         sig = self._sig()
         tools = self._tools()
         definition = aaas.AgentDefinition(
@@ -243,11 +269,19 @@ class Link:
             self.error = f"declare 失败：{type(exc).__name__}: {exc}"
             self._emit("link.status", {"status": "error", "error": self.error,
                                        "scope": "declare"})
-            self._declared_sig = sig          # 别每 0.5 秒重试同一份坏声明
-            return
+            # **不**把 sig 记成「已声明」：网络抖动是暂时的，得有机会重试；
+            # 原来一失败就记上，这个程序就永远没有自己的函数了（而 status 还是 ready）。
+            # 但同一份坏声明白重试 3 次就停手，等能力面再变。
+            self._declare_fails += 1
+            if self._declare_fails >= 3:
+                self._declared_sig = sig
+            return False
+        self._declare_fails = 0
         self._declared_sig = sig
+        self.error = None
         self._emit("link.declared", {"revision": rev, "functions": list(names),
                                      "version": self.rt.version})
+        return True
 
     def redeclare(self) -> None:
         """能力变了：下一轮生效。（协议本来就这样：declare 只影响后续轮次。）"""
@@ -281,11 +315,27 @@ class Link:
             try:
                 self._turn_task = asyncio.run_coroutine_threadsafe(  # type: ignore[assignment]
                     self._open_turn(msg), self._loop)
+                # 后台任务炸了也得有人知道：没有这个回调，异常只留在 Future 里，
+                # 界面永远停在「运行中」，也没有任何 turn.failed。
+                self._turn_task.add_done_callback(self._turn_done)
             except Exception as exc:               # 调度失败不能把闸门留在关着的位置
                 self._busy = False
                 self.error = f"{type(exc).__name__}: {exc}"
                 return self.error
         return "sent"
+
+    def _turn_done(self, fut) -> None:
+        """run_coroutine_threadsafe 回来的 Future：异常要落地成一条 turn.failed。"""
+        try:
+            exc = fut.exception()
+        except Exception as inner:            # CancelledError 之类的
+            exc = inner
+        if exc is None:
+            return
+        with self._send_lock:
+            self._busy = False
+        self.error = f"{type(exc).__name__}: {exc}"
+        self._emit("turn.failed", {"error": self.error})
 
     def _new_caps(self) -> list[str]:
         """本轮内**这个程序**新出现的能力。

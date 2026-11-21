@@ -70,6 +70,7 @@ def cli(ws: Path, message: str | None, pid: str = ASSISTANT) -> int:
     link = hub.link(pid, create=True)
     if link is None:
         print(f"[程序] 没有 {pid} 这个程序", flush=True)
+        hub.stop()                          # 早退也要收尸：否则 aaas 会话与线程都留着
         return 1
 
     q = rt.subscribe()
@@ -77,9 +78,13 @@ def cli(ws: Path, message: str | None, pid: str = ASSISTANT) -> int:
     while time.time() < deadline and link.status not in ("ready", "error"):
         _drain(q, quiet=True)
         time.sleep(0.05)
-    if link.status == "error":
-        print(f"[道] 连不上：{link.error}", flush=True)
+    if link.status != "ready":
+        # 超时也要算失败：idle / connecting 都不是「连上了」。原来只判 error，
+        # 于是 30 秒没连上照样打印「已连接 session=None」，再发一句必然发不出去的话。
+        why = link.error if link.status == "error" else f"30 秒内没连上（现在是 {link.status}）"
+        print(f"[道] 连不上：{why}", flush=True)
         print("     → 检查 workspace/config.json 里的 aaas.url，或先启动 aaas-service", flush=True)
+        hub.stop()
         return 1
     print(f"[道] 已连接 session={link.session_id}", flush=True)
 
@@ -91,10 +96,17 @@ def cli(ws: Path, message: str | None, pid: str = ASSISTANT) -> int:
             text = input("[你] ").strip()
     if not text:
         print("没有输入", flush=True)
+        hub.stop()
         return 2
 
     print(f"[你] {text}", flush=True)
-    hub.send(pid, text)
+    # send 的返回值是状态字符串：成功 "sent"，否则是一句人话原因。
+    # 丢掉它的话，一次失败的发送只会变成 300 秒后的「超时」—— 原因全被抹平。
+    sent = hub.send(pid, text)
+    if sent != "sent":
+        print(f"[道] 没送出去：{sent}", flush=True)
+        hub.stop()
+        return 4
     done = False
     while True:
         try:
@@ -105,10 +117,16 @@ def cli(ws: Path, message: str | None, pid: str = ASSISTANT) -> int:
             if done:
                 break
             print("[超时] 300 秒没有事件", flush=True)
+            hub.stop()
             return 3
         _print_event(ev)
         if ev["type"] == "turn.started":
             done = False
+        if ev["type"] == "turn.failed":
+            # 失败也是终态：不认它，CLI 会接着干等 300 秒，然后报一个假的「超时」
+            print("[轮] 这一轮失败了 —— 原因见上一条", flush=True)
+            hub.stop()
+            return 5
         if ev["type"] == "turn.completed":
             done = True
     hub.stop()

@@ -61,7 +61,10 @@ userenv = ctypes.WinDLL("userenv", use_last_error=True)
 WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 CREATE_UNICODE_ENVIRONMENT = 0x00000400
 SE_PRIVILEGE_ENABLED = 0x00000002
-TOKEN_ADJUST_DEFAULT, TOKEN_QUERY = 0x0080, 0x0008
+TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY = 0x0020, 0x0008
+# 说明：AdjustTokenPrivileges 要的是 TOKEN_ADJUST_PRIVILEGES（0x0020）。
+# 这里原来写的是 TOKEN_ADJUST_DEFAULT（0x0080）—— 于是 _enable() 从来没真的
+# 开过任何特权，Session 0 重投那一步只是「静默失败后照常往下走」。
 WM_CLOSE, SW_RESTORE = 0x0010, 9
 
 
@@ -116,11 +119,22 @@ def _text(hwnd) -> str:
     return b.value
 
 
-def find_windows(substr: str) -> list[dict]:
-    """标题含 ``substr`` 的**可见**顶层窗口。这就是「窗口真的在那儿」的判据。"""
+def find_windows(substr: str, pid: int | None = None) -> list[dict]:
+    """标题含 ``substr`` 的**可见**顶层窗口。这就是「窗口真的在那儿」的判据。
+
+    给了 ``pid`` 就只认**那个进程**的窗口。只按标题找会打到用户自己正开着的
+    同一个程序，或上一次测试留下的窗口 —— 那既会给出假截图，也会把别人的窗口关掉。
+    """
     out: list[dict] = []
+    u.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+    u.GetWindowThreadProcessId.restype = wt.DWORD
 
     def cb(hwnd, _):
+        if pid is not None:
+            owner = wt.DWORD()
+            u.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if int(owner.value) != pid:       # 别人家的窗口：不看、不碰
+                return True
         if substr in _text(hwnd) and u.IsWindowVisible(hwnd):
             r = RECT()
             u.GetWindowRect(hwnd, ctypes.byref(r))
@@ -149,7 +163,7 @@ def station() -> tuple[str, bool]:
 def _enable(name: str) -> None:
     h = wt.HANDLE()
     if not advapi32.OpenProcessToken(k32.GetCurrentProcess(),
-                                     TOKEN_ADJUST_DEFAULT | TOKEN_QUERY, ctypes.byref(h)):
+                                     TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, ctypes.byref(h)):
         return
     luid = LUID()
     if not advapi32.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
@@ -217,6 +231,19 @@ def _get(port: int, path: str, timeout: float = 4) -> dict:
         return json.loads(r.read().decode())
 
 
+def _have(port: int, pid: str) -> tuple[bool, str]:
+    """(程序在不在, 说不上来的原因)。
+
+    读不到 /api/state 是**门坏了**，不是「程序不在」—— 那种情况必须报红，
+    不能被当成「跳过」。原来一律吞成 False，于是宿主根本没起来时，
+    整个验收还能显示全绿。
+    """
+    try:
+        return have(port, pid), ""
+    except Exception as exc:                  # 连接被拒、超时、HTML 500 都算
+        return False, f"读不到 /api/state：{type(exc).__name__}: {exc}"
+
+
 def have(port: int, pid: str) -> bool:
     """工作区里现在有没有这个程序。
 
@@ -224,10 +251,7 @@ def have(port: int, pid: str) -> bool:
     —— 被删掉之后，硬跑只会得到一条看着像「功能坏了」的红线。缺数据该说「跳过」，
     那不是通过，也不该伪装成失败。
     """
-    try:
-        st = _get(port, "/api/state", 3)
-    except Exception:
-        return False
+    st = _get(port, "/api/state", 3)          # 读不到就抛：那是门坏了，不是「程序不在」
     return any(p.get("id") == pid for p in (st.get("programs") or []))
 
 
@@ -312,14 +336,14 @@ class Host:
     def wait_window(self, substr: str = "我的工作区", timeout: float = 40) -> list[dict]:
         t0 = time.time()
         while time.time() - t0 < timeout:
-            w = find_windows(substr)
+            w = find_windows(substr, self.proc.pid)
             if w:
                 return w
             time.sleep(0.5)
         return []
 
     def close(self) -> int:
-        wins = find_windows("我的工作区")
+        wins = find_windows("我的工作区", self.proc.pid)
         for w in wins:
             u.PostMessageW(w["hwnd"], WM_CLOSE, 0, 0)
         try:
@@ -371,10 +395,16 @@ def qa_native() -> dict:
     host = Host()
     res["port"] = host.port
     host.wait_window()
-    if not have(host.port, "memo"):
+    found, why = _have(host.port, "memo")
+    if why:
+        host.close()
+        res["checks"] = [{"name": "读不到 /api/state，没法判断 memo 在不在",
+                          "ok": False, "detail": why}]
+        return res
+    if not found:
         host.close()
         res["checks"] = [{"name": "跳过：工作区里没有 memo（原生窗口样例）——"
-                                  "「独立的真 OS 窗口」这件事本轮没有验到", "ok": True,
+                                  "「独立的真 OS 窗口」这件事本轮没有验到", "ok": False,
                           "skip": True}]
         return res
     before = len(find_windows("便签"))
@@ -417,10 +447,16 @@ def qa_ui(chat: bool = False) -> dict:
         host = Host(["--open", pid])
         res["port"] = host.port
         wins = host.wait_window()
-        if not have(host.port, pid):
+        found, why = _have(host.port, pid)
+        if why:
+            host.close()
+            res["checks"].append({"name": f"读不到 /api/state，没法判断 {pid} 在不在",
+                                  "ok": False, "detail": why})
+            continue
+        if not found:
             host.close()
             res["checks"].append({"name": f"跳过：工作区里没有 {pid}（没有页面样例可截）",
-                                  "ok": True, "skip": True})
+                                  "ok": False, "skip": True})
             continue
         seed = None
         hist = 0
@@ -459,14 +495,20 @@ def qa_ui(chat: bool = False) -> dict:
 
 def _report(res: dict) -> bool:
     ok = True
+    ran = skipped = 0
     print(f"\n  窗口站 {res.get('station')}  可见={res.get('visible')}")
     for c in res.get("checks", []):
         if c.get("skip"):
             print(f"  --  {c['name']}")
+            skipped += 1
             continue
+        ran += 1
         mark = "ok  " if c["ok"] else "!!  "
         ok = ok and c["ok"]
         print(f"  {mark}{c['name']}  {c['detail']}")
+    if ran == 0:                       # 一项都没真跑，不叫通过
+        print(f"  ** 一项都没真跑（{skipped} 项跳过）—— 这不是「全绿」，是没验 **")
+        return False
     return ok
 
 

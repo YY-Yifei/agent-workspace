@@ -89,11 +89,13 @@ class NativeHost:
             "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1",
         })
         try:
-            fh = log.open("w", encoding="utf-8")
-            proc = subprocess.Popen(
-                [self.python, "-c", _BOOT, str(entry)], cwd=str(plugin.path), env=env,
-                stdout=fh, stderr=subprocess.STDOUT,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            # 子进程拿到的是自己那一份句柄，父进程这份 Popen 一返回就能关：
+            # 否则每次开程序都漏一个句柄（Windows 上还一直攥着日志文件）
+            with log.open("w", encoding="utf-8") as fh:
+                proc = subprocess.Popen(
+                    [self.python, "-c", _BOOT, str(entry)], cwd=str(plugin.path), env=env,
+                    stdout=fh, stderr=subprocess.STDOUT,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError as exc:
             return {"status": "error", "message": f"拉不起来：{exc}"}
 

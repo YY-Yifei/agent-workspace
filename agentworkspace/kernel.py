@@ -347,8 +347,11 @@ class Runtime:
         try:                                               # 审计：谁点的、做了什么
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             with self.log_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(ev, ensure_ascii=False) + "\n")
-        except OSError:
+                # default=str：事件里可能带 Path 之类的非 JSON 值。审计写不进去
+                # 只该丢日志 —— 而 TypeError 不是 OSError，它会在 handler 成功之后
+                # 冲出 publish，让调用方拿不到 Result。
+                fh.write(json.dumps(ev, ensure_ascii=False, default=str) + "\n")
+        except (OSError, TypeError, ValueError):
             pass
         with self._lock:
             subs = list(self._subs)
@@ -363,27 +366,34 @@ class Runtime:
         """重扫插件目录。返回一行人话。**不思考，只落盘。**"""
         changed = False
         seen: set[str] = set()
+        # **不原地改** self.plugins：扫描可能在 HTTP 线程里跑，而能力面 / state()
+        # 在别的线程上遍历它。原地增删会让读侧抛
+        # RuntimeError: dictionary changed size during iteration，
+        # 或者拿到半新半旧的能力面（version 与实际能力不一致）。
+        # 先在副本上做完，最后整体换掉 —— 读侧要么看到旧的整份，要么看到新的整份。
+        plugins = dict(self.plugins)
         if self.plugins_dir.is_dir():
             for d in sorted(self.plugins_dir.iterdir()):
                 if not d.is_dir() or d.name.startswith(("_", ".")):
                     continue
                 seen.add(d.name)
-                old = self.plugins.get(d.name)
+                old = plugins.get(d.name)
                 stamp = self._stamp(d)
                 if old is not None and getattr(old, "_stamp", None) == stamp:
                     continue
                 p = Plugin(d)
                 self._load(p)
                 p._stamp = stamp                            # type: ignore[attr-defined]
-                self.plugins[d.name] = p
+                plugins[d.name] = p
                 changed = True
                 self.publish("plugin.loaded", pid=d.name,
                              data={"title": p.title, "functions": [c.wire for c in p.caps.values()],
                                    "error": p.error})
-        for gone in [k for k in self.plugins if k not in seen]:
-            del self.plugins[gone]
+        for gone in [k for k in plugins if k not in seen]:
+            del plugins[gone]
             changed = True
             self.publish("plugin.removed", pid=gone)
+        self.plugins = plugins                      # 整体换掉：读侧永远看不到中间态
         if changed:
             self.version += 1
         return f"插件 {len(self.plugins)} 个，能力 {len(self.capabilities())} 项，版本 v{self.version}"
@@ -678,7 +688,7 @@ class Runtime:
             text = value.get("text")
             rest = {k: v for k, v in value.items() if k != "text"}
             if text is None:
-                return json.dumps(rest, ensure_ascii=False), rest
+                return json.dumps(rest, ensure_ascii=False, default=str), rest
             return str(text), rest
         return json.dumps(value, ensure_ascii=False, default=str), {"value": value}
 
