@@ -81,6 +81,39 @@
   .msg .body{white-space:pre-wrap;word-break:break-word}
   .msg.me .body{background:var(--bubble);padding:8px 12px;border-radius:12px;max-width:86%}
   .msg .body.dim{color:var(--dim)}
+  /* 只有**智能体说的话**走这块排版（.body.md）。人说的话仍是 pre-wrap 原文，
+     工具返回的正文也不进来 —— 那是命令输出与日志，必须等宽、必须一字不动。 */
+  .msg .body.md{white-space:normal}
+  .md>*:first-child{margin-top:0}
+  .md>*:last-child{margin-bottom:0}
+  .md p{margin:8px 0}
+  .md h1,.md h2,.md h3,.md h4,.md h5,.md h6{margin:14px 0 6px;line-height:1.35;font-weight:600}
+  .md h1{font-size:18px} .md h2{font-size:16px} .md h3{font-size:15px}
+  .md h4,.md h5,.md h6{font-size:14px;color:var(--dim)}
+  .md ul,.md ol{margin:6px 0;padding-left:22px}
+  .md li{margin:2px 0}
+  .md li>ul,.md li>ol{margin:2px 0}
+  /* white-space 必须给行内 code 自己一份：父级 .md 是 normal，它会继承下去，
+     于是 `printf("a  b")` 里的两个空格被折成一个 —— 行内代码最要命的就是空格失真。
+     块级那一路由 .md pre code 的 pre 兜住（特异性更高，长行照旧横向滚动）。 */
+  .md code{font-family:ui-monospace,SFMono-Regular,Consolas,"Courier New",monospace;
+    font-size:12.5px;background:var(--bubble);padding:1px 5px;border-radius:4px;
+    white-space:pre-wrap;word-break:break-word}
+  .md pre{margin:8px 0;padding:10px 12px;border:1px solid var(--line);border-radius:8px;
+    background:var(--bubble);overflow:auto}
+  .md pre code{background:transparent;padding:0;font-size:12.5px;white-space:pre;
+    word-break:normal;display:block}
+  .md blockquote{margin:8px 0;padding:2px 0 2px 12px;border-left:2px solid var(--line);
+    color:var(--dim)}
+  .md hr{border:0;border-top:1px solid var(--line);margin:12px 0}
+  .md a{color:var(--accent);text-decoration:none}
+  .md a:hover{text-decoration:underline}
+  .md table{border-collapse:collapse;margin:8px 0;font-size:13px;display:block;
+    overflow:auto;max-width:100%}
+  .md th,.md td{border:1px solid var(--line);padding:4px 8px;text-align:left;vertical-align:top}
+  .md th{background:var(--bubble);font-weight:600}
+  .md .task{color:var(--dim)} .md .task.done{color:var(--ok)}
+  .md del{opacity:.7}
   /* 工具调用：默认**一行**。
      一轮里可能有二十次调用，全摊开就是拿执行日志当聊天记录 ——
      注意力被吃掉，人真正要读的那句话反而找不到。 */
@@ -169,6 +202,7 @@
     </div>
   </form>
 </div>
+<script src="/web/md.js"></script>
 <script>
 "use strict";
 const $ = (s) => document.querySelector(s);
@@ -438,12 +472,37 @@ function toolsOpen(m) {
   return !!S.busy[S.pid] && m === list[list.length - 1];
 }
 
+/* 智能体说的话 → Markdown（md.js）；人说的话 → 原文。
+ * 为什么不渲染人说的话：那是人自己的原话，打一句 `*这个*` 不该变成斜体。
+ * 为什么 note 也不渲染：那是**界面自己**的一句提示（「开发者模式已打开」这类），
+ * 不是模型说的话，出现位置也不该随 md 语法变形。
+ *
+ * 缓存按「文本没变就复用」：每收一个 delta 都会重绘整条 thread，
+ * 不缓存的话长对话每来一个字就要把整屏重解析一遍。 */
+function bodyHtml(m) {
+  if (typeof mdToHtml !== 'function') return esc(m.text);   // md.js 没加载 → 退回纯文本，不白屏
+  if (m._mdFor === m.text && m._mdHtml !== undefined) return m._mdHtml;
+  let html;
+  try {
+    html = mdToHtml(m.text);
+  } catch (err) {
+    // 渲染器是重正则 + 递归解析：一条消息把它打挂，不该把整条 thread 一起带走。
+    // 与这个文件既有的态度一致 —— 一条坏事件不掀桌，一条坏消息也一样。
+    html = esc(m.text);
+  }
+  m._mdFor = m.text;
+  m._mdHtml = html;
+  return html;
+}
+
 function msgHtml(m) {
   if (m.role === 'me') {
     return `<div class="msg me"><div class="body">${esc(m.text)}</div></div>`;
   }
+  // 降级时**不能**挂 md 类：.md 是 white-space:normal，会把兜底纯文本的换行折没
+  const cls = m.note ? ' dim' : (typeof mdToHtml === 'function' ? ' md' : '');
   const body = m.text
-    ? `<div class="body${m.note ? ' dim' : ''}">${esc(m.text)}</div>` : '';
+    ? `<div class="body${cls}">${m.note ? esc(m.text) : bodyHtml(m)}</div>` : '';
   return `<div class="msg">${body}${toolsHtml(m)}</div>`;
 }
 

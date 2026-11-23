@@ -62,7 +62,20 @@ def _load_cfg(ws: Path) -> dict:
         return {}
     if not isinstance(cfg, dict):
         return {}
-    if "server" in cfg and not isinstance(cfg["server"], dict):
+    srv = cfg.get("server")
+    if isinstance(srv, dict):
+        # 只护住「是对象」不够：一份外人的 config.json 可以是 {"port": null} /
+        # {"port": "8777"} / {"port": 70000}，这些会一路流到 socket.bind，
+        # 而它那时抛的是 TypeError / OverflowError —— **不是 OSError**，
+        # gui() 那条 except OSError 接不住，人拿到的正是一个裸 traceback。
+        # 所以这里把不合法的键当「没写」摘掉，落回默认值。
+        port = srv.get("port")
+        if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
+            srv = {k: v for k, v in srv.items() if k != "port"}
+        if "openBrowser" in srv and not isinstance(srv["openBrowser"], bool):
+            srv = {k: v for k, v in srv.items() if k != "openBrowser"}
+        cfg = {**cfg, "server": srv}
+    elif "server" in cfg:
         cfg = {k: v for k, v in cfg.items() if k != "server"}
     return cfg
 
@@ -328,12 +341,15 @@ def main(argv: list[str] | None = None) -> int:
         print("     → 用 --workspace 指定一个确定存在的路径", flush=True)
         return 2
     if not ws.is_dir():                  # 工作区就是一个目录：没有就建，
-        print(f"[工作区] 新建：{ws}", flush=True)   # 别让人先 mkdir 再启动
         try:
             ws.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:           # 没权限 / 路径中段是个同名文件
+        except OSError as exc:           # 没权限 / 路径中段是文件 / 它本身就是个文件
             print(f"[工作区] 建不出来：{ws}（{exc}）", flush=True)
+            print("     → 这个路径本身是个文件，或者中间某一级是文件；换个 --workspace",
+                  flush=True)
             return 2
+        # 成功之后才说「新建」：先报成功再失败，等于对人撒一次谎
+        print(f"[工作区] 新建：{ws}", flush=True)   # 别让人先 mkdir 再启动
     if not a.workspace:                  # 与上面「用真值挑工作区」同一个判据
         # 默认 = 启动时的当前目录，等于把「我在哪个目录」当成信任边界。
         # 这件事必须说出来：build() 里的 scan() 会 exec 这里每一个
@@ -348,7 +364,10 @@ def main(argv: list[str] | None = None) -> int:
         # 「是不是我们的工作区」要看**内容与痕迹**，不能看目录名：
         # plugins/ 太常见（别人的项目也常有），而只有一份 config.json 的工作区
         # 恰恰是本程序自己写出来的 —— 按目录名判会把两种情况都判反。
-        ours = bool({"aaas", "agent", "server"} & set(_load_cfg(ws))) \
+        # `server` **不在**标记集合里：Node / FastAPI / Unity 的 config.json 常有它，
+        # 而本程序从不写这一段（settings.save_url 只写 aaas）。把它当标记，
+        # 等于让一份外人配置冒充「我们的工作区」，提示被静默吞掉。
+        ours = bool({"aaas", "agent"} & set(_load_cfg(ws))) \
             or (ws / ".shell").is_dir() \
             or (ws / "logs" / "events.jsonl").is_file()
         if stray and not ours:

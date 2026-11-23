@@ -52,4 +52,4 @@ include = ["agentworkspace*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-agentworkspace = ["web/*.html", "assets/*.ico"]
+agentworkspace = ["web/*.html", "web/*.js", "assets/*.ico"]

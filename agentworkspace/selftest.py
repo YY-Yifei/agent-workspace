@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import threading
 import time
@@ -532,6 +533,54 @@ def main() -> int:
           "ws.chatw" in html and "${pid}" in html and "localStorage.setItem(`${CHATW_KEY}.${pid}`" in html, "")
     check("只有对话的程序没有抓手（否则是一根拖不动的缝）",
           "const gutter = solo ? '' :" in html, "")
+
+    print("[15] 智能体对话渲染 Markdown —— 分流、安全、打包三处都得在")
+    mdpath = Path(__file__).resolve().parent / "web" / "md.js"
+    mdsrc = mdpath.read_text(encoding="utf-8") if mdpath.is_file() else ""
+    check("md.js 在（零依赖、可离线）", bool(mdsrc), str(mdpath))
+    check("宿主页引用了它", '<script src="/web/md.js">' in html)
+    code, body, hdrs = get(base, "/web/md.js")
+    check("取得到，且是 javascript（取不到时页面会静默退回纯文本）",
+          code == 200 and "javascript" in (hdrs.get("content-type") or ""),
+          f"{code} {hdrs.get('content-type')} {len(body)}B")
+    check("md.js 自己不去拉任何东西（离线壳里没有第二次请求）",
+          "fetch(" not in mdsrc and "import(" not in mdsrc and "new Image" not in mdsrc)
+
+    check("智能体的话走 md、人说的话走原文",
+          "typeof mdToHtml === 'function' ? ' md' : ''" in html
+          and 'me"><div class="body">${esc(m.text)}' in html)
+    check("界面自己的提示（note）不渲染 md",
+          "m.note ? esc(m.text) : bodyHtml(m)" in html)
+    check("工具返回的正文不渲染 md（命令输出必须等宽原文）",
+          '<div class="r">${esc(t.text)}</div>' in html)
+    check("md.js 没加载时退回纯文本，不白屏",
+          "typeof mdToHtml !== 'function'" in html)
+    check("渲染结果按文本缓存（每个 delta 都会重绘整条 thread）",
+          "m._mdFor === m.text" in html)
+
+    check("渲染器先转义、再变换（别拿 var/let 字面量当判据，那是风格不是行为）",
+          bool(re.search(r"\b(?:var|let|const)\s+t\s*=\s*esc\(raw\)", mdsrc)), "")
+    check("链接只放行 http/https/mailto",
+          "/^(https?:\\/\\/|mailto:)/i" in mdsrc, "")
+    # 不查「源码里有没有 onclick=」——注释里写一句自我说明就会误伤（被绊过两次）。
+    # 只看**代码**：去块注释、去行首注释，再枚举它到底写得出哪些属性。
+    code_only = re.sub(r"/\*[\s\S]*?\*/", "", mdsrc)
+    # 行尾注释也要去：md.js 里有 `break;  // 顶格又不是新项 …` 这种。
+    # `(?<!:)` 是为了别把字符串里的 http:// 一起切掉。
+    code_only = re.sub(r"(?<!:)//[^\n]*", "", code_only)
+    check("去注释后仍留着实代码（不然下面那条是空转）",
+          "mailto:" in code_only and "const render" in code_only, "")
+    attrs = set(re.findall(r'\b([a-zA-Z-]+)="', code_only))
+    check("渲染器只写得出 href/class/style/target/rel/start 这六种属性",
+          attrs <= {"href", "class", "style", "target", "rel", "start"}, str(sorted(attrs)))
+    # 与引号无关地再查一遍事件属性：单引号、无引号也都是合法 HTML，
+    # 只盯 `on...="` 的话，`onclick='…'` 会从白名单眼皮底下溜过去。
+    check("代码里写不出内联事件属性（不论单/双引号或无引号）",
+          not re.search(r"\bon[a-z]{3,}\s*=", code_only, re.I), "")
+
+    pp = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    check("web/*.js 进了 package-data（漏了就是装完 404，本地试不出来）",
+          pp.is_file() and "web/*.js" in pp.read_text(encoding="utf-8"), str(pp))
 
     httpd.shutdown()
     if getattr(App, "native", None):
