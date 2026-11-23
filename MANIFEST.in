@@ -1,3 +1,4 @@
+# D:\projects\claw\open-agents\openagent-workspace\MANIFEST.in
 include LICENSE
 include README.md
 include docs/*.md
@@ -5,4 +6,8 @@ include agentworkspace/web/*.html
 include agentworkspace/web/*.js
 include agentworkspace/assets/*.ico
 recursive-include agentworkspace *.py
+# 源码包要能自己跑测试：`node tests/turn.test.js` 就是这套忙碌状态机的规格。
+# 原来这里一个 tests/ 都没有 —— 从 sdist 装的用户拿不到任何测试（而 wheel 里
+# 也没有，那是刻意的：wheel 是给人用的，sdist 是给改代码的人用的）。
+recursive-include tests *.js
 global-exclude __pycache__ *.py[cod] *.log

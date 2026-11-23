@@ -108,6 +108,118 @@ JS_MAIN = r"""
 })()
 """
 
+# 对话闸门：忙碌 / 停止 / 终态。全部**同步**驱动 —— evaluate_js 不 await，
+# 所以不真发请求（那样结果永远拿不到），而是拦下 fetch 看它到底打了哪个地址。
+JS_GATE = r"""
+(() => {
+  /* 注释要写在字符串里面：写到 Python 三引号外面就成了 Python 代码（上一版就这么错的）。 */
+  const out = {};
+  const pid = S.pid;
+  const btn = document.querySelector('#sendb');
+  const ta = document.querySelector('#ta');
+  const form = document.querySelector('#composer');
+  const snap = () => ({label: btn.textContent, cls: btn.className,
+                       disabled: !!btn.disabled, ta: ta.value});
+
+  // 0) 起点：空闲，输入框可编辑
+  S.phase[pid] = 'idle'; paintComposer(pid); paintThread();
+  out.idle = snap();
+  out.taDisabled = !!ta.disabled;
+
+  // 1) 按下发送（直接把相位推过去，不真发请求）
+  setPhase(pid, 'submit');
+  out.sending = snap();
+
+  // 2) 忙的时候按回车、按发送、再按一次发送：都不许提交、不许清空、不许插换行
+  ta.value = '这句要留在框里';
+  const n0 = msgs(pid).length;
+  ta.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true, cancelable: true}));
+  form.requestSubmit();
+  btn.click();
+  out.busy = snap();
+  out.busyAdded = msgs(pid).length - n0;      // 0 = 一条都没发出去
+  out.taEditable = !ta.readOnly && !ta.disabled;
+
+  // 3) 受理：按钮原地变「停止」（同一个位置，不是多出一个按钮）
+  setPhase(pid, 'started');
+  out.running = snap();
+  out.btnIsSame = document.querySelectorAll('#composer button').length;
+
+  // 4) 点停止 → 前端**真的**打了 /cancel（拦下 fetch 看地址）
+  const real = window.fetch;
+  const seen = [];
+  window.fetch = (u) => { seen.push(String(u));
+                          return Promise.resolve({json: () => Promise.resolve(
+                            {status: 'cancelling', message: '已请求取消'})}); };
+  btn.click();
+  out.cancelUrls = seen.slice();
+  out.stopping = snap();
+  window.fetch = real;
+
+  // 5) 终态 cancelled：已产出的内容保留，尾巴上注明「已停止」
+  S.cur[pid] = null;
+  const m = push(pid, {role: 'it', text: '已经跑了一半的回答',
+                       tools: [{label: '🛠 工具 · x', status: '完成', text: 'ok'}]});
+  S.cur[pid] = msgs(pid).indexOf(m);
+  on({type: 'turn.completed', pid, data: {status: 'cancelled', text: ''}});
+  paintThread();
+  out.afterCancel = snap();
+  out.keptText = document.querySelector('#thread').textContent.indexOf('已经跑了一半的回答') >= 0;
+  const note = document.querySelector('.stopnote');
+  out.stopNote = note ? note.textContent : null;
+
+  // 6) 一字未产出的那一轮：不留空气泡，换成一行「已停止」小字
+  S.cur[pid] = null;
+  curIt(pid);                                  // turn.started 时就会建的那条空气泡
+  on({type: 'turn.completed', pid, data: {status: 'cancelled'}});
+  paintThread();
+  out.emptyBubbles = msgs(pid).filter(
+    (x) => x.role === 'it' && !x.text && !(x.tools || []).length).length;
+  out.lastText = (msgs(pid)[msgs(pid).length - 1] || {}).text || '';
+
+  /* 6b) 中途才在场的页面（刚打开窗口 / SSE 重连）：没见过 turn.started，
+     也没收到过任何 delta —— 终态事件里的 d.text 是这一轮**唯一**的产出。
+     不接住，屏幕上就是「跑完了一轮，什么都不显示」，看起来像答案被吞了。 */
+  S.cur[pid] = null;
+  const nMid = msgs(pid).length;
+  on({type: 'turn.completed', pid,
+      data: {status: 'completed', text: '中途进来也接得住的那段回答'}});
+  paintThread();
+  out.midJoinText = document.querySelector('#thread').textContent
+    .indexOf('中途进来也接得住的那段回答') >= 0;
+  out.midJoinAdded = msgs(pid).length - nMid;
+
+  /* 6c) 删掉一条消息，后面的全前移一位：S.cur 不跟着挪，流式文本就会灌进
+     别人的气泡。被拒时正是这个形状 —— 人的话在 i、空气泡在 i+1。 */
+  S.cur[pid] = null;
+  const mMe = push(pid, {role: 'me', text: '这句要撤回'});
+  const mIt = push(pid, {role: 'it', text: '正在写的回答', tools: []});
+  S.cur[pid] = msgs(pid).indexOf(mIt);
+  dropMsg(pid, mMe);
+  out.curAfterDrop = (msgs(pid)[S.cur[pid]] || {}).text || null;
+
+  /* 6d) 一张卡都还挂在「运行中」就被停掉：没有任何操作撤回，
+     「已经跑完的操作不会撤回」在那时是**假话**，不许写。 */
+  S.cur[pid] = null;
+  push(pid, {role: 'it', text: '半句',
+             tools: [{label: '🛠 工具 · y', status: '运行中', text: ''}]});
+  S.cur[pid] = msgs(pid).length - 1;
+  on({type: 'turn.completed', pid, data: {status: 'cancelled'}});
+  paintThread();
+  const notes = document.querySelectorAll('.stopnote');
+  out.stopNoteNoTool = notes.length ? notes[notes.length - 1].textContent : null;
+
+  // 7) 连接断了：闸门必须开回去（否则界面永久「运行中」，只能重启）
+  setPhase(pid, 'started');
+  on({type: 'link.status', pid, data: {status: 'error', error: 'boom'}});
+  out.afterLinkDown = snap();
+
+  // 收尾：回到干净状态，不影响后面的设置那一段
+  S.phase[pid] = 'idle'; paintComposer(pid); ta.value = ''; paintThread();
+  return out;
+})()
+"""
+
 JS_BAD = r"""
 (() => {
   document.querySelector('#aaasurl').value = 'ftp://nope/';
@@ -214,6 +326,10 @@ def _probe(port: int) -> dict:
                 "!document.querySelector('#mask').classList.contains('on')")
             win.evaluate_js("document.querySelector('#setbtn').click()")
             box["prefillAgain"] = win.evaluate_js("document.querySelector('#aaasurl').value")
+
+            # 对话闸门：面板关掉之后再跑（遮罩开着时不该假装点得到东西）
+            win.evaluate_js("window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}))")
+            box["gate"] = win.evaluate_js(JS_GATE)
         except Exception as exc:
             box["error"] = f"{type(exc).__name__}: {exc}"
         finally:
@@ -306,6 +422,65 @@ def _judge(r: dict, box: dict, disk: dict, api: dict) -> list[dict]:
          "detail": str(box.get("statusText"))},
         {"name": "Escape 能关掉面板",
          "ok": box.get("closedByEsc") is True},
+
+        # -- 对话闸门（忙时禁发 / 按得动停止）------------------------------
+        *[{"name": n, "ok": ok, "detail": d} for n, ok, d in _judge_gate(box.get("gate") or {})],
+    ]
+
+
+def _judge_gate(g: dict) -> list[tuple[str, bool, str]]:
+    """对话闸门的事实判据。全是渲染之后才成立的东西：按钮文字、disabled、
+    输入框里的字、真发出去的请求、气泡里留下什么。"""
+    idle = g.get("idle") or {}
+    sending = g.get("sending") or {}
+    busy = g.get("busy") or {}
+    running = g.get("running") or {}
+    stopping = g.get("stopping") or {}
+    cancel = g.get("afterCancel") or {}
+    down = g.get("afterLinkDown") or {}
+    return [
+        ("空闲时按钮是「发送」且可点",
+         idle.get("label") == "发送" and idle.get("disabled") is False, str(idle)),
+        ("忙碌时输入框仍可编辑（字是人的东西，收走的只是「现在能送出去」）",
+         g.get("taEditable") is True and g.get("taDisabled") is False,
+         f"editable={g.get('taEditable')} disabled={g.get('taDisabled')}"),
+        ("按下发送后按钮变「发送中…」且不可点",
+         sending.get("label") == "发送中…" and sending.get("disabled") is True, str(sending)),
+        ("忙时按回车/点发送：一个字都不提交（没多出一条消息）",
+         g.get("busyAdded") == 0, f"新增 {g.get('busyAdded')} 条"),
+        ("忙时也不清空输入框（被拒的那句不会凭空消失）",
+         busy.get("ta") == "这句要留在框里", str(busy.get("ta"))),
+        # 原来这里有一条「回车没在框里插进一个换行」——**它永远为真**：
+        # dispatchEvent 造出来的 KeyboardEvent 是 untrusted 的，Chromium 不会为它
+        # 执行默认的文本插入，`ta.value` 根本不可能多出一个换行，所以这条断言
+        # 无论代码怎么写都绿。真正能证伪的是上一条「一个字都不提交」，那条在。
+        ("服务端受理后按钮**原地**变「停止」（没多出按钮）",
+         running.get("label") == "停止" and running.get("disabled") is False
+         and g.get("btnIsSame") == 1, f"{running} / 按钮数={g.get('btnIsSame')}"),
+        ("停止键是红的（.stop）", "stop" in str(running.get("cls")), str(running.get("cls"))),
+        ("点停止 → 前端真的打了 /cancel（原来全文件调用过 0 次）",
+         any("/cancel" in u for u in (g.get("cancelUrls") or [])), str(g.get("cancelUrls"))),
+        ("正在停止时按钮不可点（防连点）",
+         stopping.get("label") == "正在停止…" and stopping.get("disabled") is True, str(stopping)),
+        ("被停止的那一轮：已产出的内容**保留**（删掉等于撒谎）",
+         g.get("keptText") is True and cancel.get("label") == "发送", str(cancel)),
+        ("尾巴上注明「已停止」，并说清操作不会撤回",
+         "已停止" in str(g.get("stopNote")) and "不会撤回" in str(g.get("stopNote")),
+         str(g.get("stopNote"))),
+        ("一字未产出的那一轮不留空气泡（否则像「答了但内容丢了」）",
+         g.get("emptyBubbles") == 0, f"空气泡 {g.get('emptyBubbles')} 个"),
+        ("一字未产出时换成一行「已停止」小字", g.get("lastText") == "已停止",
+         str(g.get("lastText"))),
+        ("连接断了自动解锁（否则界面永久「运行中」，只能重启）",
+         down.get("label") == "发送" and down.get("disabled") is False, str(down)),
+        # ocr 第一轮评审补的三条（每条都是一个「屏幕上看不见但确实丢东西」的形状）
+        ("中途进页面（没见过 turn.started）也接住终态里的那段回答",
+         g.get("midJoinText") is True and g.get("midJoinAdded") == 1,
+         f"接住={g.get('midJoinText')} 新增={g.get('midJoinAdded')} 条"),
+        ("删掉一条消息后，流式写入仍指向原来那一条（索引要跟着挪）",
+         g.get("curAfterDrop") == "正在写的回答", str(g.get("curAfterDrop"))),
+        ("一张卡都没跑完就被停：不写「已经跑完的操作不会撤回」",
+         str(g.get("stopNoteNoTool") or "").strip() == "已停止", str(g.get("stopNoteNoTool"))),
     ]
 
 

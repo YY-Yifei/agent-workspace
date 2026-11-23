@@ -9,6 +9,9 @@
   :root{
     --bg:#0e1013; --panel:#14171b; --line:#22272e; --ink:#e6eaef; --dim:#8b949e;
     --bubble:#1c2128; --accent:#5aa2ff; --ok:#4bbd7a; --bad:#e0645b;
+    /* 停止键的底与边：与 --bad 同色系的低透明度两档。写死 rgba 的话，
+       浅色主题上会拿到一个"深色主题的红"，与同一行字的 color 不是一家。 */
+    --stop-bg:rgba(224,100,91,.12); --stop-line:rgba(224,100,91,.42);
     /* 滚动条三档：--sb 是**热区**（能抓住的宽度），视觉粗细由 thumb 的透明
        边框削掉；两档可见度 —— 静止时只是边界，鼠标压上去才是控件。 */
     /* 两档刻度按 WCAG 1.4.11 的非文本对比 3:1 定，而且是**算过**的：
@@ -26,6 +29,7 @@
   @media (prefers-color-scheme:light){
     :root{ --bg:#f6f7f9; --panel:#fff; --line:#e5e7eb; --ink:#171a1f; --dim:#6b7280;
            --bubble:#eef0f3; --accent:#2563eb; --ok:#1f9d55; --bad:#d13b30;
+           --stop-bg:rgba(209,59,48,.08); --stop-line:rgba(209,59,48,.38);
            --sb-thumb:rgba(107,114,128,.8); --sb-thumb-hi:rgba(107,114,128,.95);
            color-scheme:light; }
   }
@@ -151,6 +155,8 @@
   .msg.me{display:flex;justify-content:flex-end}
   .msg .body{white-space:pre-wrap;word-break:break-word}
   .msg.me .body{background:var(--bubble);padding:8px 12px;border-radius:12px;max-width:86%}
+  /* 没送出去的那一句（人切了程序，草稿放不回去）：虚线 + 淡，别把它画成「说过的话」 */
+  .msg.me.failed .body{background:transparent;border:1px dashed var(--dim);color:var(--dim)}
   .msg .body.dim{color:var(--dim)}
   /* 只有**智能体说的话**走这块排版（.body.md）。人说的话仍是 pre-wrap 原文，
      工具返回的正文也不进来 —— 那是命令输出与日志，必须等宽、必须一字不动。 */
@@ -224,7 +230,17 @@
   .composer button{height:40px;padding:0 14px;border-radius:12px;border:1px solid var(--line);
     background:var(--panel);color:var(--ink);font:inherit;cursor:pointer}
   .composer button.p{background:var(--accent);border-color:var(--accent);color:#fff}
-  .composer button.stop{color:var(--bad)}
+  /* 停止键不是「发送」的变体，是**另一个动作**：同一个位置上换装，
+     形状、尺寸、位置一个字都不改 —— 布局不许跳。 */
+  .composer button.stop{color:var(--bad);border-color:var(--stop-line);
+    background:var(--stop-bg)}
+  /* 两档「不能按」：发送中… / 正在停止…。它们不是灰色不可用，是**进行中** ——
+     用文字说清楚，别让人以为是卡住了。 */
+  .composer button.p.busy{background:var(--bubble);border-color:var(--line);color:var(--dim)}
+  .composer button.stop.busy{opacity:.6}
+  .composer button:disabled{cursor:default}
+  /* 停止后的尾注：小、灰、不抢戏 —— 只是「这一轮到此为止」的记号 */
+  .stopnote{font-size:11px;color:var(--dim);margin-top:2px}
   .empty{flex:1;display:grid;place-items:center;color:var(--dim);font-size:13px}
 
   /* 设置入口在左下角：它管的是「整个工作区连哪个道」，不是某一个程序的事。
@@ -273,6 +289,7 @@
     </div>
   </form>
 </div>
+<script src="/web/turn.js"></script>
 <script src="/web/md.js"></script>
 <script>
 "use strict";
@@ -289,6 +306,7 @@ const S = {
   cur: {},        // pid → 当前这一轮那条消息的下标
   tick: {},       // pid → 被事件碰过几次（用来判断 /api/state 的快照是否已过期）
   railSig: '', stageKey: '', busy: {},
+  phase: {},      // pid → idle|sending|running|stopping（判据全在 turn.js）
 };
 
 const prog = (pid) => S.programs.find((p) => p.id === pid);
@@ -306,6 +324,10 @@ function curIt(pid) {
 
 /* ------------------------------------------------------------------ 状态 */
 async function loadState() {
+  // 快照是**取的时候**的事实，不是「回来的时候」的事实：await 会把控制权交给
+  // SSE，这期间可能已经推进了一轮。判据与 syncAgents 同一条 —— 这个 pid 的 tick
+  // 变过，就说明事件流已经在负责它，快照让位。
+  const tick0 = { ...S.tick };
   const st = await fetch('/api/state').then((r) => r.json()).catch(() => null);
   if (!st) return null;
   S.programs = st.programs || [];
@@ -313,8 +335,9 @@ async function loadState() {
   S.devtools = st.devtools || null;   // 只为工具卡写清「谁在动手」，不进左侧栏
   S.settings = st.settings || S.settings;   // 只有一个设置项：aaas-service 地址
   for (const [pid, a] of Object.entries(st.agents || {})) {
+    if ((S.tick[pid] || 0) !== (tick0[pid] || 0)) continue;   // 这份快照已经过期
     S.agents[pid] = { status: a.status, error: a.error, busy: a.busy };
-    S.busy[pid] = !!a.busy;
+    setPhase(pid, { type: 'snapshot', busy: !!a.busy });
     if (!S.msgs[pid]) {                      // 只补一次：之后的增量在事件里
       S.msgs[pid] = (a.history || []).map((h) => ({
         role: h.role === 'user' ? 'me' : 'it', text: h.text || '', tools: [],
@@ -326,9 +349,16 @@ async function loadState() {
 
 /* 把一个程序的智能体叫起来（幂等）：打开面板时做一次，不在开机时做几十次 */
 async function warm(pid) {
+  const tick0 = S.tick[pid] || 0;
   const a = await fetch(`/api/p/${pid}/link`, { method: 'POST' })
     .then((r) => r.json()).catch(() => null);
-  if (a && a.status) { S.agents[pid] = { status: a.status, error: a.error, busy: a.busy }; paintConn(); }
+  // 同 syncAgents：快照在 await **之前**取，回来时可能已经过期。一个「不忙」的
+  // 旧快照盖在刚到的 turn.started 上，闸门就开了 —— 那正是这一轮要防的连发。
+  if (a && a.status && (S.tick[pid] || 0) === tick0) {
+    S.agents[pid] = { status: a.status, error: a.error, busy: a.busy };
+    setPhase(pid, { type: 'snapshot', busy: !!a.busy });   // 另一个窗口可能在跑
+    paintConn();
+  }
 }
 
 /* ------------------------------------------------------------------ 左侧窄栏 */
@@ -425,7 +455,7 @@ function paintStage(force) {
       <div id="thread"></div>
       <form class="composer" id="composer">
         <textarea id="ta" rows="1" placeholder="${esc(ph(p))}"></textarea>
-        <button class="p" id="sendb" type="submit">发送</button>
+        <button class="p" id="sendb" type="button">发送</button>
       </form>
     </aside></div>`;
   wireComposer();
@@ -517,20 +547,256 @@ const ph = (p) => p.id === 'assistant'
  ? '跟小助理说点什么，比如「给我做个喝水提醒」' : `跟「${p.title}」说点什么`;
 
 function wireComposer() {
-  const ta = $('#ta'), form = $('#composer');
+  const ta = $('#ta'), form = $('#composer'), btn = $('#sendb');
   if (!ta || !form) return;
   ta.oninput = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 160) + 'px'; };
+  // 回车只**尝试**提交：忙不忙的判据在 submitDraft 里，键盘/按钮/程序化提交
+  // 三条路共用同一处判断 —— 两处判断就一定会有一处忘了改。
   ta.onkeydown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
   };
-  form.onsubmit = (e) => {
-    e.preventDefault();
-    const text = ta.value.trim();
-    if (!text) return;
-    ta.value = ''; ta.style.height = 'auto';
-    send(S.pid, text);
+  form.onsubmit = (e) => { e.preventDefault(); submitDraft(); };
+  /* 按钮是 type="button"，不是 submit：忙的时候它已经**不是发送键**了
+     （原地变成停止）。留着 type="submit" 的话，按「停止」会先触发一次表单提交 ——
+     一次「发送」发生在停止键上，最难查的那类错。 */
+  if (btn) btn.onclick = () => {
+    const act = TM.btn(phaseOf(S.pid)).action;
+    if (act === 'stop') stopTurn(S.pid);
+    else if (act === 'send') submitDraft();
   };
+  paintComposer(S.pid);
   ta.focus();
+}
+
+/* ------------------------------------------------------- 对话的忙碌闸门
+   相位由 turn.js 那个纯函数决定；这里只做两件事：把相位翻译成界面、跑副作用。
+   界面里不再有第二处「忙不忙」的判断 —— 那正是并发与丢字的入口。 */
+const TM = (typeof TURN === 'object' && TURN) ? TURN : {
+  /* turn.js 没加载时的退化版：只有两档（空闲 / 在跑），**没有停止**。
+     刻意**不复刻** turn.js 的转移表 —— 复刻出来的那份一定与它走散（少 stopping、
+     少 cancelFailed，按钮永远不给「停止」），而「同一句操作在两个加载结果下行为
+     不同」比「简单但一致」危险得多。这里只保证一件事：输入框不许变成一块死板。 */
+  IDLE: 'idle', SENDING: 'sending', RUNNING: 'running', STOPPING: 'stopping',
+  next: (p, ev) => {
+    const t = (ev && ev.type) || String(ev || '');
+    if (!t) return p || 'idle';
+    if (t === 'terminal' || t === 'linkDown') return 'idle';
+    /* 退化版**只**丢掉 stopping 这一档。还有两处守卫必须留下 —— 它们防的不是
+       「停止」，而是两轮并发：
+         · reject 只认 sending：迟到的 reject 不许把已经在跑的一轮解锁；
+         · 快照说「不忙」不许解锁 sending：我们那次 POST 可能还没到服务端。
+       少了 sending 这一档，这两条就都保不住。 */
+    if (t === 'submit') return (p || 'idle') === 'idle' ? 'sending' : (p || 'idle');
+    if (t === 'sent' || t === 'started') return (p || 'idle') === 'idle' ? 'idle' : 'running';
+    if (t === 'reject') return (p || 'idle') === 'sending' ? 'idle' : (p || 'idle');
+    if (t === 'snapshot') return (ev && ev.busy) ? 'running'
+      : ((p || 'idle') === 'sending' ? 'sending' : 'idle');
+    return p || 'idle';
+  },
+  canSubmit: (p) => (p || 'idle') === 'idle',
+  canStop: () => false,                    // 没有转移表就别假装有「停止」
+  isBusy: (p) => (p || 'idle') !== 'idle',
+  btn: (p) => ((p || 'idle') === 'idle'
+    ? { label: '发送', cls: 'p', disabled: false, action: 'send' }
+    : { label: '运行中…', cls: 'p busy', disabled: true, action: null }),
+};
+
+const phaseOf = (pid) => S.phase[pid] || TM.IDLE;
+
+/* 换相位只有这一个入口：状态、闸门、按钮同时更新；
+   「进入 stopping 就上闹钟、离开就撤」也在这里，所以不会漏撤。 */
+function setPhase(pid, ev) {
+  const before = phaseOf(pid);
+  const wasBusy = !!S.busy[pid];
+  const nx = TM.next(before, ev);
+  S.phase[pid] = nx;
+  S.busy[pid] = TM.isBusy(nx);
+  if (nx !== before) {
+    if (nx === 'stopping') armStopWatch(pid); else disarmStopWatch(pid);
+  }
+  if (pid === S.pid) {
+    paintComposer(pid);
+    /* 闸门一变，thread 末尾那个「…」也该跟着来去：按下发送到 turn.started
+       之间可能有 20 秒（Link.send 会等连接），那段时间输入框已清空、按钮写着
+       「发送中…」，对话里却只有一句孤零零的问话 —— 看不出这一轮其实起来了。 */
+    if (!!S.busy[pid] !== wasBusy) paintThread();
+  }
+  return nx;
+}
+
+function paintComposer(pid) {
+  if (pid !== S.pid) return;
+  const btn = $('#sendb');
+  if (!btn) return;
+  const spec = TM.btn(phaseOf(pid));
+  if (btn.textContent !== spec.label) btn.textContent = spec.label;
+  btn.className = spec.cls;
+  btn.disabled = !!spec.disabled;
+  btn.setAttribute('aria-label', spec.label);
+  /* 忙碌时输入框**不禁用**：人常想「它跑着，我先把下一句写好」。
+     字是人的东西，界面不该收走 —— 收走的是「现在能送出去」这件事。 */
+}
+
+/* 发一句。三条不许破的规矩：
+   1) 忙的时候**不提交、不清空、不报错** —— 按下去没有反应，字还在原处；
+   2) 被拒就把原文放回输入框，且**不**在对话里留下「我说过的话」；
+   3) 按下就乐观置忙：按下到 turn.started 之间有一次往返，那段时间若不算忙，
+      连按两次回车就是两轮并发（第二条必被拒、而字已经先被清掉了）。
+   为什么「清空」在按下时就做（而不是等 sent）：Link.send 在连接还没建好时
+   会**等最多 20 秒**，那 20 秒里旧文字留在框里，人接着打字就拼在一起。
+   「不丢」由回滚保证 —— 「清空」和「不丢」本来就是两件事。 */
+async function submitDraft() {
+  const pid = S.pid, ta = $('#ta');
+  if (!ta) return;
+  if (!TM.canSubmit(phaseOf(pid))) { ta.focus(); return; }
+  const text = ta.value.trim();
+  if (!text) return;
+  // 先摆上去：消息顺序必须对。turn.started / delta 可能比 POST 的响应**先到**，
+  // 那时才 push 的话，人说的话会排在自己的回答后面。
+  const mine = push(pid, { role: 'me', text, tools: [] });
+  ta.value = ''; ta.style.height = 'auto';
+  setPhase(pid, 'submit');
+  S.cur[pid] = null;
+  const r = await fetch(`/api/p/${pid}/chat`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ text }),
+  }).then((x) => x.json()).catch((e) => ({ status: String(e) }));
+  const st = String((r && r.status) || '');
+  if (st === 'sent') {                     // 受理了：那句成为真的「我说过的话」
+    setPhase(pid, 'sent');
+    return;
+  }
+  // 没受理。但「没受理」有两种，撤不撤那句话完全相反 ——
+  // `reject` 只在 sending 这一档生效（turn.js）：相位已经推到 running 时
+  // （turn.started 顺着 SSE 先到、或快照说 busy），服务端其实**收下了**。
+  // 这时把话从对话里抽走、把文字塞回输入框，屏幕上就成了「有回答、没有提问」，
+  // 而回填的草稿一送又会被「上一轮还没结束」拒掉 —— 两头都不对。
+  const nx = setPhase(pid, 'reject');
+  if (nx !== TM.IDLE) {
+    push(pid, { role: 'it', note: true, tools: [],
+                text: `回执没拿到（${st || '未知原因'}）—— 但这一轮看起来已经在跑，就不把那句撤回来了` });
+    return;
+  }
+  // 先回填、再决定留不留：顺序反过来就是「话撤走了、字又放不回去」。
+  // 回填失败只有一种原因 —— 人已经切到别的程序，那个输入框不在了。那时
+  // **不能**把那句话撤走：撤走就是丢人的字。留着它，注明没送出去。
+  if (restoreDraft(pid, text)) {
+    dropMsg(pid, mine);
+    push(pid, { role: 'it', note: true, tools: [],
+                text: `没能送出去：${st || '未知原因'} —— 这句已经放回输入框` });
+  } else {
+    mine.failed = true;
+    push(pid, { role: 'it', note: true, tools: [],
+                text: `没能送出去：${st || '未知原因'} —— 已经切到别的程序，这句留在这里` });
+    if (pid === S.pid) paintThread();
+  }
+}
+
+function dropMsg(pid, m) {
+  const list = msgs(pid);
+  const i = list.indexOf(m);
+  if (i < 0) return;
+  list.splice(i, 1);
+  /* 删掉一条，后面的全部前移一位 —— 索引不跟着挪，`S.cur[pid]` 就会指向
+     **别人的**那条消息。被拒时正是这个形状：人的话在 i、空气泡在 i+1，
+     删掉 i 之后 `i+1` 成了「那条注脚」—— 于是流式文本灌进注脚里，
+     终态去改一条与它无关的消息。 */
+  const cur = S.cur[pid];
+  if (cur != null) S.cur[pid] = (cur === i) ? null : (cur > i ? cur - 1 : cur);
+  if (pid === S.pid) paintThread();
+}
+
+/* 把没送出去的那句放回输入框。人中途已经写下下一句时**不覆盖**：
+   旧的放上面、光标停在接缝 —— 两句都在，都能改。 */
+function restoreDraft(pid, text) {
+  // 返回「到底放回去没有」：调用方要靠它决定那句话撤不撤 ——
+  // 无条件宣称「已经放回输入框」会同时变成一句假话和一次静默丢字。
+  if (pid !== S.pid) return false;        // 已经切到别的程序：那个输入框不在了
+  const ta = $('#ta');
+  if (!ta) return false;
+  const now = ta.value;
+  if (!now.trim()) ta.value = text;
+  else if (now.trim() !== text) ta.value = text + '\n' + now;
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+  ta.selectionStart = ta.selectionEnd = text.length;
+  ta.focus();
+  return true;
+}
+
+/* 停止 = **请求**，不是完成。aaas 的 cancel 只表示「受理」（caller.cancel 的原话：
+   result 只表示受理，终态看事件）。所以三档：停止 → 正在停止… → 终态。
+   不这么做，人点一下没反应就会连点，而那时它根本还没停。 */
+async function stopTurn(pid) {
+  if (!TM.canStop(phaseOf(pid))) return;
+  setPhase(pid, 'stop');
+  const r = await fetch(`/api/p/${pid}/cancel`, { method: 'POST' })
+    .then((x) => x.json()).catch((e) => ({ status: 'error', message: String(e) }));
+  // 判据是服务端给的**机器码**，不是那句中文：靠 startswith 认结论，
+  // link.py 里改一个字、或新加一句同前缀的失败信息，界面就静默走错分支 ——
+  // 而这条路上走错的意思是「它还在跑，界面以为停住了」。
+  //   cancelling = 受理了，等终态；idle = 本来就没在跑（等于停住了）；error = 没送出去。
+  const code = String((r && r.status) || '');
+  const why = String((r && r.message) || '');
+  // 闹钟已经在 setPhase(pid,'stop') 里上好，不会无限等。
+  if (code === 'cancelling') return;        // 受理了：等终态
+  /* 往下都是「没受理」，而这条回执可能**迟到**：等它回来这段时间里，这一轮可能
+     已经正常收尾（turn.completed → idle），人还可能顺手发了下一句（→ sending）。
+     那时一条旧的取消回执**不许再动闸门** —— 尤其不许把 sending 解锁，那是连发与
+     丢字的入口。所以往下先看相位，只看自己该管的那个相位。 */
+  if (phaseOf(pid) !== 'stopping') return;
+  /* idle = 服务端说「本来就没在跑」。这两种情形**不会再有终态事件到来**
+     （没有可取消的轮次 / 没有 link），所以「等终态」是等不到的：按钮会卡在
+     「正在停止…」整 15 秒，然后闹钟再补一句「服务可能仍在执行」——
+     而那时它根本没在跑，一句凭空捏造的假话。这一轮既然已经结束，就按终态收掉
+     （顺带撤掉闹钟）。 */
+  if (code === 'idle') { setPhase(pid, 'terminal'); return; }
+  setPhase(pid, 'cancelFailed');
+  push(pid, { role: 'it', note: true, tools: [],
+              text: `停止请求没送出去：${why || code || '未知原因'} —— 它可能还在跑` });
+}
+
+/* 请求停止后等终态的兜底。模型正调长工具时，服务端可能几秒才回终态；
+   也可能**一直不回** —— 那时界面会永久「正在停止…」，除了重启没有出路。
+   15 秒后强制解锁，并把「没能确认」说出来：不假装停了。 */
+const STOP_WAIT_MS = 15000;
+const stopTimers = {};
+function armStopWatch(pid) {
+  disarmStopWatch(pid);
+  stopTimers[pid] = setTimeout(() => {
+    delete stopTimers[pid];
+    if (phaseOf(pid) !== 'stopping') return;
+    setPhase(pid, 'stopTimeout');
+    push(pid, { role: 'it', note: true, tools: [],
+                text: `等了 ${STOP_WAIT_MS / 1000} 秒还没确认停止：服务可能仍在执行，界面已解锁。` });
+  }, STOP_WAIT_MS);
+}
+function disarmStopWatch(pid) {
+  if (stopTimers[pid]) { clearTimeout(stopTimers[pid]); delete stopTimers[pid]; }
+}
+
+/* 停止后的那一轮：已经产出的内容**保留**（那是它真产出过的东西，删掉等于撒谎），
+   只在尾巴上注明「已停止」。一字未产出的空气泡不留 —— 一条空回答气泡
+   会让人以为它答了、内容丢了。 */
+function markStopped(pid, m) {
+  if (!m || (!m.text && !(m.tools || []).length)) {
+    if (m) dropMsg(pid, m);
+    push(pid, { role: 'it', note: true, tools: [], text: '已停止' });
+    return;
+  }
+  /* 被停掉的那一轮**永远不会再来一条 call.result**（这一轮已经没了）。
+     卡还挂在「运行中」，组头就会一边报「进行中」、紧挨着的尾巴却写着「已停止」——
+     而「有长工具在飞的时候按停止」恰恰是最常见的用法。
+     就地收尾：这些调用既不是「完成」也不是「失败」，是**被打断**。 */
+  for (const t of (m.tools || [])) if (t.status === '运行中') t.status = '已中断';
+  m.stopped = true;
+  m.gTouched = true; m.gOpen = false;     // 这一轮结束了：工具组收起
+  if (pid === S.pid) paintThread();
+}
+
+/* 一字未产出的气泡：结束时不留一个空壳。 */
+function dropEmpty(pid, m) {
+  if (m && !m.text && !(m.tools || []).length) dropMsg(pid, m);
 }
 
 function paintThread() {
@@ -581,13 +847,24 @@ function bodyHtml(m) {
 
 function msgHtml(m) {
   if (m.role === 'me') {
-    return `<div class="msg me"><div class="body">${esc(m.text)}</div></div>`;
+    // failed = 没送出去、又没能放回输入框（人切了程序）。它不能被画成
+    // 「我说过的一句话」，否则下一次看历史会以为它发出去了。
+    return `<div class="msg me${m.failed ? ' failed' : ''}"><div class="body">${esc(m.text)}</div></div>`;
   }
   // 降级时**不能**挂 md 类：.md 是 white-space:normal，会把兜底纯文本的换行折没
   const cls = m.note ? ' dim' : (typeof mdToHtml === 'function' ? ' md' : '');
   const body = m.text
     ? `<div class="body${cls}">${m.note ? esc(m.text) : bodyHtml(m)}</div>` : '';
-  return `<div class="msg">${body}${toolsHtml(m)}</div>`;
+  // 停止的记号：已经跑完的工具**不会撤回** —— 这句话必须写出来，
+  // 否则「停止」会被理解成「撤销」，而它从来不是。
+  /* 「跑完的操作不会撤回」按**每张卡自己的状态**判：一轮里第一张卡还挂在
+     「运行中」就被停掉时，什么也没撤回，写这句反而是假话。 */
+  // 只认**真正的完成**：被打断的（'已中断'）与失败的都不算「跑完了」。
+  const finished = (m.tools || []).some((t) => t.status === '完成' || t.status === 'ok');
+  const stop = m.stopped
+    ? `<div class="stopnote">已停止${finished ? ' · 已经跑完的操作不会撤回' : ''}</div>`
+    : '';
+  return `<div class="msg">${body}${toolsHtml(m)}${stop}</div>`;
 }
 
 function toolsHtml(m) {
@@ -595,9 +872,15 @@ function toolsHtml(m) {
   if (!list.length) return '';
   const open = toolsOpen(m);
   const run = list.some((t) => t.status === '运行中');
+  /* 被打断的那一张不能算「完成」：组头写「完成」、卡上写「已中断」、尾巴写
+     「已停止」—— 三句话互相打架。它单独占一档。 */
+  const cut = list.some((t) => t.status === '已中断');
   const lastOne = list[list.length - 1];
   // 收起时也要有一句人话：跑着就报「正在做什么」，跑完就报「做了几次」。
   const sum = run ? esc(lastOne.label) : `${list.length} 次工具调用`;
+  let head = '完成', headCls = '';
+  if (run) { head = '进行中'; headCls = ' run'; }
+  else if (cut) { head = '有中断'; headCls = ' bad'; }
   const rows = list.map((t, i) => {
     const bad = t.status && t.status !== '运行中' && t.status !== '完成' && t.status !== 'ok';
     const cls = t.status === '运行中' ? ' run' : (bad ? ' bad' : '');
@@ -609,7 +892,7 @@ function toolsHtml(m) {
   return `<div class="tgroup${open ? ' open' : ''}" data-mi="${m._i}">
     <button class="tgh" type="button"><span class="chev">▶</span>
       <span class="sum">${sum}</span>
-      <span class="st${run ? ' run' : ''}">${run ? '进行中' : '完成'}</span></button>
+      <span class="st${headCls}">${head}</span></button>
     <div class="tlist">${rows}</div></div>`;
 }
 
@@ -666,27 +949,22 @@ async function toggleNative(pid, running) {
   paintStage(true);
 }
 
-/* ------------------------------------------------------------------ 说话 */
-async function send(pid, text) {
-  push(pid, { role: 'me', text, tools: [] });
-  S.cur[pid] = null;
-  const r = await fetch(`/api/p/${pid}/chat`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ text }),
-  }).then((x) => x.json()).catch((e) => ({ status: String(e) }));
-  if (r.status !== 'sent') {
-    push(pid, { role: 'it', text: `没能送出去：${r.status || '未知原因'}`, tools: [] });
-  }
+/* ------------------------------------------------------------------ 事件 */
+/* aaas 的 error 转成一句话：它可能是 wire 字典（{code, message}），也可能直接是串。
+   `text: ${d.error}` 那种写法在字典上会渲染成 [object Object] —— 等于没给原因。 */
+function errText(e) {
+  if (!e) return '未知原因';
+  if (typeof e === 'string') return e;
+  return e.message || e.code || JSON.stringify(e);
 }
 
-/* ------------------------------------------------------------------ 事件 */
 function on(ev) {
   const pid = ev.pid || 'assistant';
   const d = ev.data || {};
   S.tick[pid] = (S.tick[pid] || 0) + 1;
   switch (ev.type) {
     case 'turn.started':
-      S.cur[pid] = null; S.busy[pid] = true; curIt(pid); break;
+      S.cur[pid] = null; curIt(pid); setPhase(pid, 'started'); break;
     case 'message.delta':
       curIt(pid).text += (d.text || ''); break;
     case 'call.ready': {
@@ -698,19 +976,65 @@ function on(ev) {
       break;
     }
     case 'call.result': {
+      // 这一轮已经收尾（S.cur 被清空）：迟到的结果不再去 curIt —— 那会凭空多出
+      // 一个「只有结果、没有问题」的空气泡。
+      if (S.cur[pid] == null) break;
       const m = curIt(pid);
       let t = d.callId ? m.tools.find((x) => x.callId === d.callId) : null;
       if (!t) t = m.tools.slice().reverse().find((x) => x.status === '运行中');
       if (t) { t.status = d.status || '完成'; t.text = String(d.text || '').slice(0, 600); }
       break;
     }
-    case 'turn.completed':
-      S.busy[pid] = false;
-      { const m = curIt(pid); if (!m.text && d.text) m.text = d.text; }
+    case 'turn.completed': {
+      // 不 curIt(...)：那会在没产出时**新建**一个空气泡，而我们正要判断「该不该留」
+      let m = (S.cur[pid] != null) ? msgs(pid)[S.cur[pid]] : null;
+      /* 这个页面可能**中途才在场**（刚打开窗口 / SSE 重连过）：它没见过
+         turn.started，也没收到过任何一条 delta，`S.cur[pid]` 是 null。
+         那一轮的唯一产出就是终态事件里的这份 d.text —— 不接住，屏幕上就是
+         「跑完了一轮，什么都不显示」，看起来像答案被吞了。
+         （被停止的那一轮同理：markStopped 只往空气泡上写注脚，正文得先有。） */
+      if (!m && d.text) m = push(pid, { role: 'it', text: d.text, tools: [] });
+      else if (m && !m.text && d.text) m.text = d.text;
+      const st = String(d.status || '');
+      /* 终态不止 completed / cancelled：aaas 的 final.status 原样转了过来，失败
+         也会走这条（另一条路是 turn.failed）。只认 'cancelled' 等于把「失败」当
+         「正常完成」—— 气泡留着、而 d.error 里那句原因一个字都不显示。 */
+      const stopped = st === 'cancelled';
+      const failed = !!st && st !== 'completed' && st !== 'cancelled';
+      /* 这一轮到此为止：`S.cur[pid]` 必须清掉。它从来不在正常终态时归零，所以
+         重连之后新一轮的 delta 会顺着旧索引灌进**上一轮**那条气泡（而这里 m
+         非空，终态里那份 d.text 又被跳过）—— 答案于是错位、或者整个丢掉。 */
+      S.cur[pid] = null;
+      setPhase(pid, 'terminal');          // 闹钟也在这里撤掉
+      if (stopped) markStopped(pid, m);
+      else {
+        dropEmpty(pid, m);
+        if (failed) {
+          push(pid, { role: 'it', note: true, tools: [],
+                      text: `这一轮没能完成（${st}）：${errText(d.error)}` });
+        }
+      }
       break;
+    }
     case 'turn.failed':
-      S.busy[pid] = false;
-      push(pid, { role: 'it', text: `出错了：${d.error || '未知'}`, tools: [] });
+      setPhase(pid, 'terminal');
+      dropEmpty(pid, (S.cur[pid] != null) ? msgs(pid)[S.cur[pid]] : null);
+      S.cur[pid] = null;                  // 这一轮结束了：下一轮的 delta 不许落进旧气泡
+      push(pid, { role: 'it', text: `出错了：${errText(d.error)}`, tools: [] });
+      break;
+    case 'turn.cancel_ack':
+      break;                              // 受理回执：界面已经在「正在停止…」了
+    case 'turn.cancel_failed':
+      // 取消没被受理（连接断了 / 服务端不认 aaas/cancelTurn）：它**还在跑**，
+      // 如实退回 running，别把「没停成」画成「停了」。
+      // 但这条是**另一次往返**的回执，迟到是常态：完全可能在 turn.completed
+      // 之后才到。那时相位已回 idle、`cancelFailed` 根本不会转移 —— 可这句话
+      // 照样会被 push，屏幕上就成了「给完整个回答，再说它可能还在跑」。
+      // 状态机已经拒绝了这次转移，界面就该跟着拒绝这句话。
+      if (phaseOf(pid) !== 'stopping') break;
+      setPhase(pid, 'cancelFailed');
+      push(pid, { role: 'it', note: true, tools: [],
+                  text: `没能停止：${d.error || '未知'} —— 它可能还在跑` });
       break;
     case 'link.status':
       S.agents[pid] = { ...(S.agents[pid] || {}), status: d.status, error: d.error };
@@ -718,6 +1042,14 @@ function on(ev) {
       if (d.status === 'error' && pid === S.pid) {
         push(pid, { role: 'it', text: `还没连上：${d.error || ''}`, tools: [] });
       }
+      /* 连接断了/关掉了：那一轮跟着没了，闸门必须开回去 —— 否则界面永久
+         停在「运行中」，而它看起来只是「不理人」。
+         但 `error` 并不都等于「连接没了」：重新声明能力面失败时也会发一条
+         `error`（scope='declare'），那时 Link 仍 ready、这一轮**还在跑**。
+         按断线处理会把「停止」变回「发送」、让「…」消失、并放行下一次提交
+         （它必被「上一轮还没结束」拒掉，草稿再回填）——用户当场失去停下来的入口。 */
+      const gone = d.status === 'closed' || (d.status === 'error' && d.scope !== 'declare');
+      if (gone) setPhase(pid, 'linkDown');
       break;
     case 'dev.changed': {
       const p = prog(pid); if (p) p.dev = !!(d && d.dev);
@@ -759,7 +1091,9 @@ async function syncAgents() {
   for (const [pid, a] of Object.entries(st.agents || {})) {
     if ((S.tick[pid] || 0) !== (tick0[pid] || 0)) continue;
     S.agents[pid] = { status: a.status, error: a.error, busy: a.busy };
-    S.busy[pid] = !!a.busy;
+    // 快照是权威：它说空闲就一定空闲（错过终态时这是唯一的出路），
+    // 它说忙就跟着忙（另一个窗口在跑，这边也该能停）。
+    setPhase(pid, { type: 'snapshot', busy: !!a.busy });
     if (S.busy[pid]) continue;
     S.msgs[pid] = (a.history || []).map((h) => ({
       role: h.role === 'user' ? 'me' : 'it', text: h.text || '', tools: [],

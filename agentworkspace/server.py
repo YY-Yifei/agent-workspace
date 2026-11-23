@@ -194,7 +194,9 @@ class Handler(BaseHTTPRequestHandler):
             if act == "link":
                 return self._json(hub.ensure(pid))
             if act == "cancel":
-                return self._json({"status": hub.cancel(pid)})
+                # cancel 自己就是 {"status": 机器码, "message": 人话}：再包一层
+                # 就成了 {"status": {"status": ...}}，前端读到的 status 是个对象。
+                return self._json(hub.cancel(pid))
             text = str((body or {}).get("text", ""))
             if not text.strip():
                 return self._json({"error": "空消息"}, 400)

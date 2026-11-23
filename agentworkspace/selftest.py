@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sys
@@ -546,9 +547,15 @@ def main() -> int:
     check("md.js 自己不去拉任何东西（离线壳里没有第二次请求）",
           "fetch(" not in mdsrc and "import(" not in mdsrc and "new Image" not in mdsrc)
 
+    # 判据锚到**语义**（人那条分支里只做了 esc，没走 md），不再比整段模板串：
+    # 原来比 'me"><div class="body">' —— 给这条气泡加一个 class（没送出去的虚线样式）
+    # 就误报成「人说的话被 md 渲染了」，而它真正要守的从来不是那串字符。
+    _i, _j = html.find("if (m.role === 'me') {"), html.find("// 降级时**不能**挂 md 类")
+    _me = html[_i:_j] if 0 <= _i < _j else ""
     check("智能体的话走 md、人说的话走原文",
           "typeof mdToHtml === 'function' ? ' md' : ''" in html
-          and 'me"><div class="body">${esc(m.text)}' in html)
+          and "esc(m.text)" in _me and "bodyHtml" not in _me,
+          f"人的那条分支有 {len(_me)} 字符")
     check("界面自己的提示（note）不渲染 md",
           "m.note ? esc(m.text) : bodyHtml(m)" in html)
     check("工具返回的正文不渲染 md（命令输出必须等宽原文）",
@@ -661,6 +668,162 @@ def main() -> int:
     # 那正是上一版"补一条 hover 覆盖回去"的来源。这一条守的是"别再加回去"。
     check("窄栏不重设 thumb（只改 width，颜色与边框全部继承全局）",
           re.search(r"#rail::-webkit-scrollbar-thumb", naked) is None, "")
+
+    # ── 对话闸门（第十二轮）。这一节守的是**四类会静默失效的错法**：
+    #   (a) 忙碌判断散在多处 → 总有一处忘了改，两轮并发就从那儿进来；
+    #   (b) 清空发生在受理之前 → 被拒的那句字没了（原来就是这样丢的）；
+    #   (c) 停止键还是 type=submit → 按「停止」会先提交一次表单；
+    #   (d) cancel 的 Future 没人取 → 「已请求取消」可能是句空话。
+    print("[16] 对话闸门：忙时禁发、按得动停止、丢不了字")
+    tj = (Path(__file__).resolve().parent / "web" / "turn.js")
+    tjsrc = tj.read_text(encoding="utf-8") if tj.is_file() else ""
+    check("turn.js 在（纯状态机：无 DOM / 无网络 / 无定时器，才能在 node 里跑）",
+          bool(tjsrc) and not any(k in tjsrc for k in
+                                  ("document", "fetch(", "setTimeout", "window.")), str(tj))
+    check("宿主页引用了它", '<script src="/web/turn.js">' in html, "")
+    tcode, tbody, thdrs = get(base, "/web/turn.js")
+    check("取得到，且是 javascript（取不到就退回只有两档的退化版：不能停）",
+          tcode == 200 and "javascript" in (thdrs.get("content-type") or ""),
+          f"{tcode} {thdrs.get('content-type')} {len(tbody)}B")
+    # (a) 判据只有一处：按键、回车、程序化提交都汇到 submitDraft，它第一句就是判据。
+    # 原来这条只证明「那一行在」：在 ta.onkeydown 或 btn.onclick 里**另加**一处
+    # `if (!TM.canSubmit(...))` 也照样绿 —— 而那正是这一节声称要防的「两处判断」。
+    # 判据改成数调用点。
+    n_can = html.count("TM.canSubmit(")
+    check("发送的忙碌判据只有一处（全文件只调一次 TM.canSubmit）",
+          n_can == 1, f"调用点 {n_can} 处")
+    # 名字要诚实：这条断言的是「闸门先于读输入框」，不是「空消息不占闸门」。
+    # str.index 找不到就抛 ValueError —— 那会把 main() 直接打断：后面 turn.js、
+    # package-data 那几条一条都跑不到，输出还从「N 通过 / M 失败」变成 traceback。
+    # 缺哪段就判这一条失败，不许掀桌。
+    _gate, _text = html.find("if (!TM.canSubmit(phaseOf(pid)))"), html.find("const text = ta.value.trim();")
+    check("忙碌判据在取文本之前（忙时连输入框都不读，更不会去清它）",
+          0 <= _gate < _text, f"gate={_gate} text={_text}")
+    # (b) 被拒要能回滚：把话放回输入框，并且**不**在对话里留下「我说过的话」。
+    check("被拒时把原文放回输入框", "restoreDraft(pid, text)" in html, "")
+    check("被拒时把那句从对话里收回（不假装说过）", "dropMsg(pid, mine)" in html, "")
+    # 原来那句话里嵌着 \n 与 8 个空格 —— 锚的是**排版**不是语义：换个缩进、
+    # 或写成单行，行为没变也会红。空白一律不敏感。
+    check("回滚只在 sending 这一档发生（迟到的 reject 不许解锁在跑的一轮）",
+          re.search(r"case 'reject':\s*\n\s*return p === SENDING \? IDLE : p;", tjsrc) is not None, "")
+    # (c) 停止键与发送键是同一个 DOM 位：它不能是 submit，否则按停止会先提交一次。
+    check("发送键是 type=button（按「停止」不许顺带提交表单）",
+          'id="sendb" type="button"' in html, "")
+    # `"ta.disabled" not in html` 两边都不准：写 `ta.disabled = false`（重绘后
+    # 显式保持可编辑）会假红；而 `ta.readOnly = true` 或 `setAttribute('disabled')`
+    # 这两种**真会禁用**的写法一个都抓不到。锚到「会把它关掉」的三种形态上。
+    check("忙碌时输入框**不**禁用（字是人的东西，收走的只是「现在能送出去」）",
+          not re.search(r"ta\.disabled\s*=\s*(true|'disabled'|\"disabled\")"
+                        r"|ta\.readOnly\s*=\s*true"
+                        r"|setAttribute\(\s*['\"]disabled", html), "")
+    check("按钮五态由纯函数给（界面里没有第二处「忙不忙」的判断）",
+          "const spec = TM.btn(phaseOf(pid));" in html, "")
+    # 停止：请求 ≠ 完成，终态看事件；等不到终态要有兜底，否则永久转圈。
+    check("停止真的发了 /cancel（原来全文件只调用过 0 次）",
+          "/api/p/${pid}/cancel" in html, "")
+    check("终态读 status（不读就分不出「答完了」「被停止了」「失败了」）",
+          "const stopped = st === 'cancelled';" in html
+          and "st !== 'completed' && st !== 'cancelled'" in html, "")
+    check("停止后注明「已经跑完的操作不会撤回」（停止不是撤销）",
+          "已经跑完的操作不会撤回" in html, "")
+    check("请求停止后等不到终态有兜底（否则界面永久「正在停止…」，只能重启）",
+          "stopTimeout" in html and "STOP_WAIT_MS" in html, "")
+    check("取消没被受理就退回去（不把「没停成」画成「停了」）",
+          "setPhase(pid, 'cancelFailed')" in html and "turn.cancel_failed" in html, "")
+    # (d) link.py：cancel 的 Future 必须有人取，而且不许拿 _send_lock（回调可能在
+    #     注册线程里同步跑，而注册那段正持锁 —— 非重入，那个 HTTP handler 会永久阻塞）。
+    lj = Path(__file__).resolve().parent / "link.py"
+    ljsrc = lj.read_text(encoding="utf-8")
+    tree = ast.parse(ljsrc)
+    # ast.walk **不保证顺序**，而 link.py 里有两个同名 cancel：Link.cancel 与
+    # Hub.cancel。靠「walk 到的第一个」去定位就是靠实现细节 —— 顺序一变（类顺序、
+    # 换成 DFS）就会去校验 Hub.cancel，那里没有 add_done_callback，这条断言从此
+    # 永远红、而且指错地方。锚到「Link 类体内的那个方法」。
+    def _meth(cls_name: str, meth: str):
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == cls_name:
+                for sub in node.body:
+                    # async def 也算：只认 FunctionDef 的话，将来把它改成
+                    # `async def` 会让下面两条断言在空集合上**自动通过**
+                    # （"x" not in set() 恒真），守卫就此静默失效。
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub.name == meth:
+                        return sub
+        return None
+
+    fn = _meth("Link", "cancel")
+    check("定位到 Link.cancel（不是同名的 Hub.cancel）", fn is not None, "")
+    calls = {n.func.attr for n in ast.walk(fn) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Attribute)} if fn else set()
+    check("link.cancel 真的取了 Future（add_done_callback）",
+          "add_done_callback" in calls, str(sorted(calls)))
+    check("link 有一个 _cancel_done 回调（异常落地成事件，不许躺着）",
+          "def _cancel_done" in ljsrc and '"turn.cancel_failed"' in ljsrc, "")
+    have = _meth("Link", "_cancel_done")
+    check("定位到 Link._cancel_done（定位不到，下面两条就是空转）", have is not None, "")
+    # 纯 AST 判据：名字与属性都算。按源码片段比会被注释误伤 ——
+    # 而 _cancel_done 的注释里恰好写了「不拿 _send_lock」，那就成了自我否定。
+    used = {n.id for n in ast.walk(have) if isinstance(n, ast.Name)} if have else set()
+    attr = {n.attr for n in ast.walk(have) if isinstance(n, ast.Attribute)} if have else set()
+    check("_cancel_done 里不拿 _send_lock（非重入锁：会让注册它的线程永久阻塞）",
+          "_send_lock" not in used and "_send_lock" not in attr,
+          str(sorted(used & {"_send_lock"}) or sorted(attr & {"_send_lock"})))
+    # 原来 grep 的是那五个字，而 link.py 里**一处注释**就写着它（_open_turn 的
+    # finally 里「否则聊天会永远回『上一轮还没结束』」）—— 就算把真正的返回值改掉
+    # 也照样绿。锚到 return 上。
+    check("服务端契约不变（第二条仍回「上一轮还没结束」，界面负责让它不发生）",
+          'return "上一轮还没结束"' in ljsrc, "")
+    check("turn.js 也在 package-data 里（web/*.js 那条覆盖它）",
+          pp.is_file() and "web/*.js" in pp.read_text(encoding="utf-8"), "")
+
+    # ── ocr 第一轮评审（14 条）。这一节守的是「评审修完又长回去」。
+    # 每条都锚到**语义特征**而不是位置：位置会漂，语义不会。
+    print("[17] 评审第一轮：终态不丢字 · 快照不复活 · 索引跟着挪 · 停止可机读")
+    check("终态里的 d.text 在没有气泡时也接住（中途进页面 / 重连）",
+          "if (!m && d.text) m = push(pid, { role: 'it', text: d.text, tools: [] });" in html, "")
+    # 数「(S.tick[pid] || 0)」出现几次是**假判据**：它一共 4 处，其中一处是 on()
+    # 里的自增（`S.tick[pid] = (S.tick[pid] || 0) + 1`），不是守卫 —— 删掉 warm
+    # 那条仍剩 3 处，照样绿。改锚**每个函数里**的守卫形状。
+    def _jsfn(name: str) -> str:
+        i = html.find("function " + name + "(")
+        if i < 0:
+            return ""
+        j = html.find("\n}\n", i)          # 列 0 的 }：内层的都是缩进的
+        return html[i:j] if j > i else ""
+    _ls, _wm = _jsfn("loadState"), _jsfn("warm")
+    check("loadState 里也判快照是否过期（一个旧快照就能把闸门重新打开）",
+          "!== (tick0[pid] || 0)) continue;" in _ls and _ls.count("tick0") >= 2,
+          f"loadState {len(_ls)} 字符")
+    check("warm 里也判快照是否过期（另一个窗口在跑时尤其要命）",
+          "=== tick0" in _wm, f"warm {len(_wm)} 字符")
+    check("删一条消息要挪 S.cur（否则流式文本灌进别人的气泡）",
+          "cur > i ? cur - 1 : cur" in html, "")
+    check("回填成功才撤那句话（先回填、后决定）",
+          "if (restoreDraft(pid, text)) {" in html, "")
+    check("回填失败就把它留在对话里并标成没送出去（不静默丢字）",
+          "mine.failed = true" in html and "m.failed ? ' failed' : ''" in html, "")
+    # 判据必须是「真的完成」，不能是「不等于运行中」：被停掉的那一轮会把残余的卡
+    # 收成「已中断」，而那不是跑完 —— 用它当判据，那句话就变成撒谎。
+    check("「跑完的操作不会撤回」只认真正的完成态（已中断/失败都不算）",
+          "t.status === '完成' || t.status === 'ok'" in html, "")
+    check("停掉那一轮时，残余的工具卡当场收尾（否则组头一直报「进行中」）",
+          "if (t.status === '运行中') t.status = '已中断';" in html, "")
+    check("停止的结果看机器码，不看中文串（改一个字不会静默走错分支）",
+          "code === 'cancelling'" in html and "startsWith('已请求取消')" not in html, "")
+    # 原来 grep 的是一句中文注释：改个措辞就假红，而给退化版**真**加上停止
+    # 却不碰注释就假绿 —— 两种错法都不报。改锚它的形状。
+    _fb = html[html.find("const TM = (typeof TURN === 'object' && TURN) ? TURN : {"):]
+    _fb = _fb[:_fb.find("\n};")] if "\n};" in _fb else ""
+    check("退化版 turn.js：不给「停止」、也不复刻转移表",
+          "next:" in _fb and "canStop: () => false" in _fb and "action: 'stop'" not in _fb,
+          f"退化版 {len(_fb)} 字符")
+    check("_pending 这个死字段不在了（设了没人读）", "_pending" not in html, "")
+    # link.py 侧
+    check("link.cancel 返回机器可读 status", '"status": "cancelling"' in ljsrc, "")
+    check("取消回执带上**被取消那一轮**的 id（不是回调时的 self._turn）",
+          "lambda f: self._cancel_done(f, turn_id)" in ljsrc
+          and 'getattr(self._turn, "turn_id"' not in ljsrc, "")
+    check("调度失败时把没 await 的协程 close 掉（否则 GC 喷 RuntimeWarning）",
+          'getattr(coro, "close", None)' in ljsrc, "")
 
     httpd.shutdown()
     if getattr(App, "native", None):

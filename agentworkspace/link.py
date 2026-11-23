@@ -428,12 +428,81 @@ class Link:
         }, source="agent")
         return final
 
-    def cancel(self) -> str:
-        if self._loop is None or self._caller is None or self._turn is None:
-            return "没有可取消的轮次"
-        asyncio.run_coroutine_threadsafe(
-            self._caller.cancel(self._turn.turn_id, reason="用户取消"), self._loop)
-        return "已请求取消"
+    def cancel(self) -> dict:
+        """请求取消这一轮。**只表示受理** —— 终态看事件（aaas §3.4 语义 3）。
+
+        原来这里把 run_coroutine_threadsafe 的返回值直接丢了：连接刚断、或服务端
+        不认 ``aaas/cancelTurn``（-32601）时，异常只躺在那个 Future 里没人取，
+        界面照样显示「已请求取消」—— 那句话是假的，而且没人会知道它是假的。
+        所以现在让 Future 落地成一条事件，前端据此如实退回「运行中」。
+
+        返回 ``{"status": ..., "message": ...}``：``status`` 给程序判，``message``
+        给人看。前端原来靠 ``startswith("已请求取消")`` 分支 —— 改一个字就静默走错，
+        而这条路上走错的意思是「它其实还在跑，界面以为停住了」。
+        status **只有三值**，别再加第四个：``cancelling``（受理了，等终态）/
+        ``idle``（本来就没在跑，等于停住了）/ ``error``（没送出去，人可以再按一次）。
+        调用方按这三值分派；加一个「既没受理也没失败」的中间态，就没有人知道该
+        拿它怎么办（真的试过 ``starting``：它变成一个既不执行也不重试的死胡同）。
+        """
+        if self._loop is None or self._caller is None:
+            return {"status": "error", "message": "还没连上 aaas-service"}
+        turn = self._turn
+        # aaas.Turn.done 是 **property**（返回 final is not None），不是方法。
+        # 轮次已经结束就别发这一趟：发出去只会拿到一条没人等的结果。
+        if turn is None or turn.done:
+            # ``_busy`` 与 ``_turn`` 不是同一时刻的事：``send()`` 一进来就置
+            # ``_busy``（同步），而 ``_turn`` 要等 ``caller.send(...)`` 回来才赋上，
+            # 一轮结束后也不会清回 None。所以「有活着的一轮、手上却没有可取消的
+            # id」是**常态**，它跟「本来就没在跑」是两件事。混成一句 idle，前端会
+            # 当场解锁（那正是本轮要消灭的错），而它其实还在跑。
+            if self._busy:
+                # 曾经的 `starting` 是个死胡同：调用方只能「继续等终态」，而这条
+                # 取消请求**根本没有发出去**、也没有任何东西会重试它 —— 用户还在
+                # 「正在停止…」里按不动停止键，这一轮照常跑到底。
+                # 如实报 error：前端退回「运行中」并说明没送出去，人可以再按一次。
+                return {"status": "error",
+                        "message": "这一轮还在起步（还没拿到 turn id），请再按一次停止"}
+            return {"status": "idle", "message": "没有可取消的轮次"}
+        turn_id = turn.turn_id
+        coro = self._caller.cancel(turn_id, reason="用户取消")
+        try:
+            fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        except Exception as exc:               # 调度失败：如实说，别假装受理了
+            # 协程对象是在调度**之前**建出来的：事件循环已经关了/停了（正是这个
+            # 分支要防的「连接刚断」）时没人 await 它，CPython 会在 GC 时朝 stderr
+            # 喷 ``RuntimeWarning: coroutine 'Caller.cancel' was never awaited``
+            # —— 桌面程序的日志里多一条与用户无关的噪音。自己收掉。
+            close = getattr(coro, "close", None)
+            if close is not None:
+                close()
+            return {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
+        # **把 turn_id 关进闭包**：回执是另一次往返，等回调真跑起来时 ``self._turn``
+        # 可能已经换成下一轮了（本轮因取消结束、闸门放开、用户立刻发了下一句）——
+        # 那时回执会声称「新的那一轮已受理取消」。取消的是哪一轮，必须当场记下。
+        fut.add_done_callback(lambda f: self._cancel_done(f, turn_id))
+        return {"status": "cancelling", "message": "已请求取消"}
+
+    def _cancel_done(self, fut, turn_id: str) -> None:
+        """cancel 的异常也要有人取 —— 否则「已请求取消」随时可能是一句空话。
+
+        ``turn_id`` 由注册处捕获进来，不读 ``self._turn``：那是「现在」的那一轮，
+        不是「被取消」的那一轮。
+        """
+        try:
+            exc = fut.exception()
+        except Exception as inner:             # CancelledError 之类的
+            exc = inner
+        if exc is None:
+            self._emit("turn.cancel_ack", {"turnId": turn_id})
+            return
+        # **不拿 _send_lock**：理由同 _turn_done —— add_done_callback 遇到已完成的
+        # future 会在注册线程里同步跑回调，而注册那一段正持有那把锁（非重入）。
+        code = getattr(exc, "code", None)
+        msg = ("服务端不支持停止（-32601）" if code == -32601
+               else f"{type(exc).__name__}: {exc}")
+        # 与 ack 对称：回执要说明**哪一轮**的取消失败了。它同样可能迟到
+        # （超时后才断线 / -32601），而那时 `self._turn` 已经是别人的一轮了。
+        self._emit("turn.cancel_failed", {"error": msg, "turnId": turn_id})
 
     # ------------------------------------------------------------------ 收尾
     def stop(self) -> None:
@@ -491,9 +560,11 @@ class Hub:
             return f"没有程序 {pid}"
         return l.send(text)
 
-    def cancel(self, pid: str) -> str:
+    def cancel(self, pid: str) -> dict:
         l = self.link(pid)
-        return "没有在跑的程序" if l is None else l.cancel()
+        if l is None:
+            return {"status": "idle", "message": "没有在跑的程序"}
+        return l.cancel()
 
     # -- 换地址 ---------------------------------------------------------
     @property
