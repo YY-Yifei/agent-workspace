@@ -3,6 +3,18 @@
 # logs/、config.json（aaas 地址）、dev.json（开发者模式开关）、prompts/、notes/
 /workspace/
 
+# 包默认把**启动时的当前目录**当工作区，所以在仓库根跑一次 open-agent-workspace
+# 就会把这些运行时产物落在仓库根 —— 它们不是内核，不该被 git add 带进来
+/logs/
+/plugins/
+/config.json
+/dev.json
+/dev.json.tmp
+/.config-*.json
+/.shell/
+/notes/
+/prompts/
+
 # 原型目录：proto/ 是当初试探协议用的草稿 + 一个样例程序及其 data/，不是内核
 /proto/
 

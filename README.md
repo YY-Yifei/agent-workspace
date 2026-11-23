@@ -35,20 +35,32 @@
 ## 装
 
 ```bash
-pip install agent-workspace-desktop          # 内核 + aaas 客户端
-pip install "agent-workspace-desktop[gui]"   # 再带上桌面窗口（pywebview）
+pip install open-agent-workspace
 ```
 
+一条命令就够：**pywebview 是默认依赖**，装完就有桌面窗口，不需要再补一个 `[gui]`。
 需要 Python 3.10+，以及一个能连上的 `aaas-service`（地址在设置里改，默认 `ws://localhost:8888`）。
+
+> 这个内核曾以 `agent-workspace-desktop` 0.1.0 发布过一版，是同一份东西。现在叫
+> `open-agent-workspace`。两个包提供同一个顶层模块 `agentworkspace`，**装新的之前先
+> `pip uninstall agent-workspace-desktop`**，否则会互相覆盖（先装的赢，后装的留下空壳）。
 
 ## 跑
 
 ```bash
-agent-workspace                     # 桌面窗口
-agent-workspace --browser           # 换成浏览器（pywebview 起不来时的形态）
-agent-workspace --cli               # 命令行：跟小助理说一句
-agent-workspace --cli -m "做个番茄钟"        # 同上
-agent-workspace --cli --as pomodoro -m "开始 25 分钟"   # 跟某个程序自己的助手说
+open-agent-workspace                # 桌面窗口
+open-agent-workspace --browser      # 换成浏览器（pywebview 起不来时的形态）
+open-agent-workspace --cli          # 命令行：跟小助理说一句
+open-agent-workspace --cli -m "做个番茄钟"        # 同上
+open-agent-workspace --cli --as pomodoro -m "开始 25 分钟"   # 跟某个程序自己的助手说
+```
+
+**工作区默认就是你敲命令时所在的目录**（没有会自动新建），所以它落在「你正在做的事」那里：
+
+```bash
+cd D:\我的项目
+open-agent-workspace                          # 工作区 = D:\我的项目
+open-agent-workspace --workspace D:\别处      # 也可以显式指定（不存在同样自动建）
 ```
 
 `--cli` 是验收形态：`connect → declare → sendInput → invokeFunction → 本地执行 →
@@ -56,7 +68,7 @@ functionResult → 模型续写 → turn.completed`。这条不通，界面做�
 
 ## 工作区长什么样
 
-工作区（默认 `./workspace`，可用 `--workspace` 换）是**运行时**，不在本仓库里：
+工作区（**默认 = 启动时的当前目录**，`--workspace` 可换）是**运行时**，不在本仓库里：
 
 ```
 workspace/

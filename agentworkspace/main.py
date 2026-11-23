@@ -7,6 +7,7 @@
 用法::
 
     python -m agentworkspace.main                       # 起桌面窗口（pywebview）
+    # 工作区默认就是**你敲命令时所在的目录**；--workspace 可换，不存在会自动新建
     python -m agentworkspace.main --browser             # 换成浏览器（pywebview 起不来时的形态）
     python -m agentworkspace.main --cli                 # 命令行：跟小助理说一句
     python -m agentworkspace.main --cli -m "做个番茄钟"    # 同上
@@ -38,15 +39,58 @@ try:                                   # 控制台多半是 GBK：不让一行�
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
-DEFAULT_WORKSPACE = ROOT.parent / "workspace"
+# 默认工作区 = **启动时的当前目录**。
+# 原来这里是 ROOT.parent / "workspace" —— 那是「从源码仓库里跑」的形状。
+# 一旦装进 site-packages，它就等于 site-packages/workspace：一个谁都没有的地方，
+# 对 PyPI 用户永远是错的默认值。而当前目录是「我现在要做的事」。
+# 求值故意推迟到 main()：常量会在 import 那一刻把 cwd 冻住，而真正的启动目录
+# 可能完全不同（编辑器、快捷方式、别的脚本)。
 ICON = ROOT / "assets" / "icon.ico"          # 窗口图标：我们自己画的，不是 python.exe 那个
 
 
 def _load_cfg(ws: Path) -> dict:
+    """读工作区设置；**形状不对就当没有**。
+
+    默认工作区可以是任意启动目录，所以这个文件可能根本不是我们的：解析成数组、
+    ``"server"`` 是 null / 字符串 / 列表，都见过。这里不猜，一律降级 —— 让调用方
+    永远能 ``cfg.get("server", {}).get(...)`` 而不炸。
+    （settings.load() 也读这份文件，它的 isinstance 护栏必须与这里一致。）
+    """
     try:
-        return json.loads((ws / "config.json").read_text(encoding="utf-8"))
+        cfg = json.loads((ws / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+    if not isinstance(cfg, dict):
+        return {}
+    if "server" in cfg and not isinstance(cfg["server"], dict):
+        cfg = {k: v for k, v in cfg.items() if k != "server"}
+    return cfg
+
+
+def _executable_plugins(ws: Path) -> list[str]:
+    """启动时**真的会被执行**的程序名 —— 给「默认工作区 = 当前目录」那条提示用。
+
+    判据必须与内核一致，宁可少说也不许多数：``Runtime.scan()`` 跳过 ``_`` / ``.``
+    开头的目录；``Runtime._load()`` 还要求 ``plugin.json`` 能解析、``backend.py``
+    存在，否则它只把 error 记在 Plugin 上，一行代码都不 exec。
+    这是「我加载了哪些代码」的告知，不是装饰 —— 判据漂一毫米，它就是假话。
+    """
+    out: list[str] = []
+    pdir = ws / "plugins"
+    try:
+        cands = [d for d in pdir.iterdir()
+                 if d.is_dir() and not d.name.startswith(("_", "."))]
+    except OSError:                      # 没有这个目录 / 没权限读：那就是一个都没有
+        return out
+    for d in sorted(cands, key=lambda p: p.name):
+        try:
+            if not (d / "backend.py").is_file():
+                continue
+            json.loads((d / "plugin.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):    # 与 _load() 一样：读不成就不执行
+            continue
+        out.append(d.name)
+    return out
 
 
 def build(ws: Path) -> tuple[kernel.Runtime, Hub]:
@@ -208,10 +252,17 @@ def gui(ws: Path, port: int, open_browser: bool, browser: bool = False,
             print("[就绪] 只起门，不开窗口（Ctrl+C 结束）", flush=True)
             _wait_forever()
         else:
-            status = "unavailable" if browser else shell.run(
+            # 四种结局必须区别对待：
+            #   ok / blank / unavailable 都是「试过壳」的结果，
+            #   browser 是「人明确不要壳」—— 此时说「pywebview 不可用」就是第二种谎，
+            #   因为根本没人去试。所以它单独成一个态，不借道 unavailable。
+            status = "browser" if browser else shell.run(
                 url, width=size[0], height=size[1], storage=ws / ".shell", icon=ICON)
-            # 三种结局必须区别对待：把"窗口开着但白屏"当成成功，是最坏的一种谎
-            if status == "ok":
+            if status == "browser":
+                print("[壳] --browser：用浏览器打开（没有尝试桌面窗口）", flush=True)
+                webbrowser.open(url)
+                _wait_forever()
+            elif status == "ok":
                 print("[壳] 桌面窗口已关闭", flush=True)
             elif status == "blank":
                 print("[壳] 窗口开了但页面没渲染出来（WebView2 初始化失败 / 无交互桌面）", flush=True)
@@ -220,6 +271,18 @@ def gui(ws: Path, port: int, open_browser: bool, browser: bool = False,
                 _wait_forever()
             else:
                 print("[壳] pywebview 不可用 → 回退浏览器", flush=True)
+                # 走到这里一定是「试过壳、壳起不来」。两种因用 shell.available()
+                # 分开（它只探 import），不靠猜：
+                if shell.available():            # import 通 = 装上了，只是起不来
+                    # available() 只证明 import 通了；run() 里任何异常都会返回
+                    # unavailable。所以这里给的是「最常见原因」，不是结论。
+                    print("     → pywebview 能 import，但窗口没起来。最常见是缺 GUI 后端"
+                          "（Windows 缺 WebView2 Runtime；Linux/macOS 缺 GTK/Qt），"
+                          "也可能是建窗口那一步就失败了",
+                          flush=True)
+                else:                            # import 不通 = 装坏了
+                    print("     → pywebview 是默认依赖，却 import 不到，"
+                          "说明装坏了：pip install --force-reinstall open-agent-workspace", flush=True)
                 webbrowser.open(url)
                 _wait_forever()
     except KeyboardInterrupt:
@@ -239,7 +302,8 @@ def _wait_forever() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="agentworkspace.main", description="Agent Workspace")
-    ap.add_argument("--workspace", default=str(DEFAULT_WORKSPACE))
+    ap.add_argument("--workspace", default=None, metavar="DIR",
+                    help="工作区目录（默认：启动时的当前目录；不存在则新建）")
     # None = 读 config.json；0 = 随机空闲端口（验收用它，绝不和别的宿主抢）
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--cli", action="store_true", help="不开界面，跑一条真链路")
@@ -253,10 +317,51 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--serve", action="store_true",
                     help="只起门、不开任何窗口（自动验收 / 自己接壳时用）")
     a = ap.parse_args(argv)
-    ws = Path(a.workspace).resolve()
-    if not ws.is_dir():
-        print(f"工作区不存在：{ws}", flush=True)
+    try:                                 # cwd 也可能取不到：启动目录被删、网络盘断开
+        ws = Path(a.workspace).expanduser() if a.workspace else Path.cwd()
+        ws = ws.resolve()
+    except (OSError, RuntimeError, KeyError) as exc:
+        # 除了 OSError（目录被删 / 网络盘断开），expanduser 在 POSIX 上还会抛
+        # RuntimeError（`~nosuchuser`）与 KeyError（$HOME 未设且 uid 查不到）。
+        # 三个都收：抛上去就是一个裸 traceback，而这行代码的存在意义正是不抛。
+        print(f"[工作区] 定位不到启动目录：{exc}", flush=True)
+        print("     → 用 --workspace 指定一个确定存在的路径", flush=True)
         return 2
+    if not ws.is_dir():                  # 工作区就是一个目录：没有就建，
+        print(f"[工作区] 新建：{ws}", flush=True)   # 别让人先 mkdir 再启动
+        try:
+            ws.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:           # 没权限 / 路径中段是个同名文件
+            print(f"[工作区] 建不出来：{ws}（{exc}）", flush=True)
+            return 2
+    if not a.workspace:                  # 与上面「用真值挑工作区」同一个判据
+        # 默认 = 启动时的当前目录，等于把「我在哪个目录」当成信任边界。
+        # 这件事必须说出来：build() 里的 scan() 会 exec 这里每一个
+        # plugins/*/backend.py，dev.json 也从同一个根读。别让它悄悄成立。
+        found = _executable_plugins(ws)
+        # 同一个信任前提还包括「读写」：config.json 里的 server.port / openBrowser
+        # 会被采用，而 /api/settings 保存时是 os.replace 覆盖它（settings.load() 对
+        # 解析失败的 JSON 返回 {} —— 也就是说，一份不是我们格式的 config.json，
+        # 会在人点一次「保存设置」时被整份抹掉）。
+        # 这不是本轮新增的行为，但默认 cwd 把它从「你挑的目录」变成「你恰好所在的目录」。
+        stray = [n for n in ("config.json", "dev.json") if (ws / n).is_file()]
+        # 「是不是我们的工作区」要看**内容与痕迹**，不能看目录名：
+        # plugins/ 太常见（别人的项目也常有），而只有一份 config.json 的工作区
+        # 恰恰是本程序自己写出来的 —— 按目录名判会把两种情况都判反。
+        ours = bool({"aaas", "agent", "server"} & set(_load_cfg(ws))) \
+            or (ws / ".shell").is_dir() \
+            or (ws / "logs" / "events.jsonl").is_file()
+        if stray and not ours:
+            print(f"[工作区] {ws} 里已有 {'、'.join(stray)}：本程序会把它当自己的设置读取，"
+                  f"保存设置时就地改写它", flush=True)
+            print("     → 这看起来更像别人的项目而不是工作区；"
+                  "不是你的就用 --workspace 换一处", flush=True)
+        if found:
+            shown = "、".join(found[:8]) + ("…" if len(found) > 8 else "")
+            print(f"[工作区] {ws}（= 启动时的当前目录）里有 {len(found)} 个程序：{shown}",
+                  flush=True)
+            print("     → 它们的 backend.py 会被加载执行；只在你信任这个目录时启动，"
+                  "否则用 --workspace 换一处", flush=True)
     if a.cli:
         return cli(ws, a.message, a.pid)
     cfg = _load_cfg(ws)

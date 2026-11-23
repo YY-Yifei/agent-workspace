@@ -3,8 +3,8 @@ requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-workspace-desktop"
-version = "0.1.0"
+name = "open-agent-workspace"
+version = "0.1.1"
 description = "桌面 Agent 工作区内核：一个目录约定、一条 dispatch、一条事件流、一份能力面"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,14 +23,20 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Topic :: Software Development :: User Interfaces",
 ]
-dependencies = ["aaas>=0.3.0"]
+# 桌面窗口（pywebview）是**默认**形态，所以它是必需依赖，不再是 extra：
+# 装完就有窗口，不该再让人去补一条 `pip install ...[gui]` 才能看见界面。
+# 它缺失时的退化（--browser / --cli）仍然保留 —— 那防的是"装了但坏了"，不是"没装"。
+dependencies = ["aaas>=0.3.0", "pywebview>=5.0"]
 
 [project.optional-dependencies]
-# 桌面窗口那层壳。不装也能用：--browser（浏览器）与 --cli（命令行）都不需要它
-gui = ["pywebview>=5.0"]
+# 空 extra：老命令 `pip install open-agent-workspace[gui]` 仍然成立（不报未知 extra）。
+# 它现在等于空气，因为没有额外的东西可装。
+gui = []
 
 [project.scripts]
-agent-workspace = "agentworkspace.main:main"
+# 只留这一个入口名：PyPI 上另有一个 agent-workspace（dropxhq 的 Rust 内核），
+# 我们再占 agent-workspace 这个脚本名，就会在用户的 Scripts/ 里和它互相覆盖。
+open-agent-workspace = "agentworkspace.main:main"
 
 [project.urls]
 Homepage = "https://github.com/YY-Yifei/agent-workspace"

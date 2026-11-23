@@ -39,6 +39,10 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# 验收用的工作区 = 这台机器上真正在跑的那份，与 selftest.WS **同一个路径**。
+# 不 import selftest 是为了不让 qa 背进 selftest 的模块状态；代价是这个表达式
+# 必须和 selftest.py 的那一行一起改。
+WS = ROOT / "workspace"
 OUT = ROOT / ".tmp" / "qa"
 
 # ---------------------------------------------------------------- Win32 句柄
@@ -316,8 +320,14 @@ class Host:
         OUT.mkdir(parents=True, exist_ok=True)
         self.log = OUT / "host.log"
         self.fh = open(self.log, "w", encoding="utf-8", buffering=1)
+        extra = list(extra or [])
+        # 显式给工作区：包默认已把「启动时的当前目录」当工作区，而这里 cwd=ROOT，
+        # 不传就会对着仓库根跑 ——「工作区里有 memo/mood 吗」那些检查会静默落进
+        # skip 分支，验收变成假绿（这是 ocr 第一轮抓到的 medium）。
+        if not any(str(x).split("=")[0] == "--workspace" for x in extra):
+            extra += ["--workspace", str(WS)]
         argv = [sys.executable, "-X", "utf8", "-m", "agentworkspace.main", "--port", "0",
-                "--no-browser"] + list(extra or [])
+                "--no-browser"] + extra
         self.proc = subprocess.Popen(
             argv,
             cwd=str(ROOT), stdout=self.fh, stderr=subprocess.STDOUT,
