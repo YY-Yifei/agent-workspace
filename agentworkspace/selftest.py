@@ -549,6 +549,18 @@ def main() -> int:
         check("dev_versions 看得到自己的历史",
               v_list.status == "ok" and "v1" in (v_list.text or ""),
               (v_list.text or "")[:100])
+        # 版本列表被截断时必须**说出来**：agent 看见 20 行会以为那就是全部历史。
+        # 判据用「多取一个」，所以这条也顺带验了取数逻辑没写成一刀切。
+        v_cut = rt.dispatch("dev", "versions", {"limit": 1}, source="agent", caller=pid)
+        check("dev_versions 被 limit 截断时明说「更早的还有」",
+              v_cut.status == "ok"
+              and (v_cut.data or {}).get("truncated") is True
+              and "更早的还有" in (v_cut.text or ""),
+              f"{v_cut.status}: {str(v_cut.data)[:80]}")
+        h_ver = json.loads(get(base, f"/api/p/{pid}/versions")[1])
+        check("版本接口带 truncated / shown（人这一侧也不静默截断）",
+              "truncated" in h_ver and "shown" in h_ver, str(sorted(h_ver)))
+
         v_show = rt.dispatch("dev", "show", {"version": "v1"}, source="agent", caller=pid)
         check("dev_show 不带 path → 给文件清单（不是灌全文）",
               v_show.status == "ok" and "plugin.json" in (v_show.text or ""),
@@ -661,6 +673,8 @@ def main() -> int:
     check("重绘只在贴底时跟随滚动（人往上翻就不会被拽回来）",
           "const atBottom = el.scrollTop + el.clientHeight" in html
           and "if (atBottom) el.scrollTop" in html, "")
+    check("版本面板被截断时明说「更早的还有」",
+          "更早的还有" in html and "r.truncated" in html, "")
     check("版本面板在（人这一侧的「看一眼 / 退回去」）",
           'id="vmask"' in html and 'id="vlist"' in html and "退回去" in html, "")
     check("面板只说「退回去」= 再提交一版，不出现 reset 这种说法",

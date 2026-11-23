@@ -550,7 +550,10 @@ async function openVersions(pid) {
     setVHint('还没有任何版本：这个程序下一次被写入成功时会记第 1 版。');
     return;
   }
-  setVHint(`共 ${rows.length} 版（最新在前）。「退回去」= 把那一版再提交一次，历史不会少。`);
+  setVHint((r.truncated
+    ? `只显示最近 ${rows.length} 版（更早的还有）。`
+    : `共 ${rows.length} 版（最新在前）。`)
+    + '「退回去」= 把那一版再提交一次，历史不会少。');
   $('#vlist').innerHTML = rows.map((v, i) => `
     <div class="vrow${i === 0 ? ' cur' : ''}">
       <div class="vmain">

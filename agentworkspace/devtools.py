@@ -171,7 +171,15 @@ def versions(limit: int = 20) -> dict:
     """
     vcs = _vcs()
     me = _me()
-    rows = vcs.versions(_pdir(), limit=max(1, min(int(limit or 20), 100)))
+    # 多取一个：多出来的那个只用来判断「还有更早的」。让 agent 以为
+    # 「一共就这 20 版」是错的 —— 它可能正需要更早那一版来对照。
+    want = max(1, min(int(limit or 20), 100))
+    rows = vcs.versions(_pdir(), limit=want + 1)
+    # 名字别叫 more：下面循环体里已经有一个 more（「文件太多」的省略号），
+    # 同名会把这里的标志覆盖掉 —— 然后 truncated 永远是空串，前端永远 falsy，
+    # 「更早的还有」永远不会显示，而没有任何东西会报错。
+    truncated = len(rows) > want
+    rows = rows[:want]
     if not rows:
         return {"text": f"{me} 还没有任何版本：下一次 dev_plugin_write 成功时会自动记第 1 版。",
                 "count": 0}
@@ -181,9 +189,12 @@ def versions(limit: int = 20) -> dict:
         more = "" if v["count"] <= 4 else f" …共 {v['count']} 个"
         lines.append(f"- v{v['ver']}  {v['short']}  {v['when']}  {v['msg']}\n"
                      f"    {files}{more}")
+    if truncated:
+        lines.append(f"\n…更早的还有（这里只列最新 {want} 版）："
+                     f"dev_versions(limit={min(want * 2, 100)})")
     lines.append("\n看某一版：dev_show(version)。看它和现在的差别：dev_diff(version)。"
                  "退回去：dev_revert(version)。")
-    return {"text": "\n".join(lines), "count": len(rows),
+    return {"text": "\n".join(lines), "count": len(rows), "truncated": truncated,
             "versions": [{k: v[k] for k in ("ver", "short", "sha", "msg", "when")} for v in rows]}
 
 

@@ -155,9 +155,16 @@ class Handler(BaseHTTPRequestHandler):
             from . import pluginvcs
 
             ok, why = pluginvcs.available()
-            rows = pluginvcs.versions(rt.root / "plugins" / pid, limit=30) if ok else []
+            # 多取一个：多出来的那个只用来判断「还有更早的」，不上界面。
+            # 面板不该让人以为「这个程序一共就这么多版」—— 静默截断比报错更坏。
+            LIMIT = 30
+            rows = (pluginvcs.versions(rt.root / "plugins" / pid, limit=LIMIT + 1)
+                    if ok else [])
+            more = len(rows) > LIMIT
+            rows = rows[:LIMIT]
             return self._json({
                 "pid": pid, "enabled": ok, "reason": "" if ok else why,
+                "truncated": more, "shown": len(rows),
                 "versions": [{k: v[k] for k in ("ver", "short", "sha", "msg", "when")} | {
                     "files": sorted(v["files"])} for v in rows]})
 
