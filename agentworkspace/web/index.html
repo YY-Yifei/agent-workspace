@@ -266,6 +266,30 @@
     background:var(--bg);color:var(--ink);font:inherit;cursor:pointer}
   .dlg .acts button.p{background:var(--accent);border-color:var(--accent);color:#fff}
   .dlg .acts button[disabled]{opacity:.6;cursor:default}
+  /* 版本面板：与设置面板同一套骨架（#mask/.dlg），只多一个可滚动的列表。
+     列表自己滚，标题与按钮不动 —— 版本多了也不会把「关闭」推出视野。 */
+  #vmask{position:fixed;inset:0;background:rgba(0,0,0,.42);display:none;
+    place-items:center;z-index:41}
+  #vmask.on{display:grid}
+  .vdlg{width:560px;max-height:calc(100% - 80px)}
+  .vlist{overflow:auto;display:flex;flex-direction:column;gap:8px;min-height:60px}
+  .vrow{display:flex;align-items:flex-start;gap:10px;padding:9px 11px;
+    border:1px solid var(--line);border-radius:10px;background:var(--bg)}
+  .vrow.cur{border-color:var(--accent)}
+  .vrow .vmain{flex:1 1 auto;min-width:0}
+  .vrow .vno{font-weight:600;font-size:13px;color:var(--ink)}
+  .vrow .vmeta{font-size:11px;color:var(--dim);margin-top:2px;word-break:break-all}
+  .vrow .vfiles{font-size:11px;color:var(--dim);margin-top:3px;word-break:break-all}
+  .vrow button{flex:0 0 auto;height:28px;padding:0 10px;border-radius:8px;
+    border:1px solid var(--line);background:var(--panel);color:var(--ink);font:inherit;
+    font-size:12px;cursor:pointer}
+  .vrow button:hover{border-color:var(--accent);color:var(--accent)}
+  .vrow button[disabled]{opacity:.55;cursor:default}
+  /* 入口按钮：和「开发者」开关同一行，靠右。它不改变任何状态，只是打开一页。 */
+  .vbtn{flex:0 0 auto;height:26px;padding:0 10px;border-radius:8px;
+    border:1px solid var(--line);background:transparent;color:var(--dim);font:inherit;
+    font-size:12px;cursor:pointer}
+  .vbtn:hover{border-color:var(--accent);color:var(--accent)}
 </style>
 </head>
 <body>
@@ -289,6 +313,16 @@
     </div>
   </form>
 </div>
+<div id="vmask" aria-hidden="true">
+  <div class="dlg vdlg" role="dialog" aria-label="版本历史">
+    <h3 id="vtitle">版本历史</h3>
+    <div class="vlist" id="vlist"></div>
+    <div class="hint" id="vmsg"></div>
+    <div class="acts">
+      <button type="button" id="vclose">关闭</button>
+    </div>
+  </div>
+</div>
 <script src="/web/turn.js"></script>
 <script src="/web/md.js"></script>
 <script>
@@ -302,6 +336,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"]/g,
 const S = {
   programs: [], agents: {}, native: {}, devtools: null, pid: null,
   settings: { url: '' },
+  vcs: { enabled: false, reason: '' },   // 版本化开关（内核没装 pure-python-git 时为 false）
   msgs: {},       // pid → [{role:'me'|'it', text, tools:[{label,status,text}]}]
   cur: {},        // pid → 当前这一轮那条消息的下标
   tick: {},       // pid → 被事件碰过几次（用来判断 /api/state 的快照是否已过期）
@@ -334,6 +369,7 @@ async function loadState() {
   S.native = st.native || {};
   S.devtools = st.devtools || null;   // 只为工具卡写清「谁在动手」，不进左侧栏
   S.settings = st.settings || S.settings;   // 只有一个设置项：aaas-service 地址
+  S.vcs = st.vcs || S.vcs;                  // 版本化是否可用：门只搬运，不重新发明
   for (const [pid, a] of Object.entries(st.agents || {})) {
     if ((S.tick[pid] || 0) !== (tick0[pid] || 0)) continue;   // 这份快照已经过期
     S.agents[pid] = { status: a.status, error: a.error, busy: a.busy };
@@ -450,7 +486,7 @@ function paintStage(force) {
   stage.innerHTML = `<div class="split${solo ? ' solo' : ''}">${pane}${gutter}
     <aside class="chat">
       <header>${esc(p.icon || '')}<b>${esc(p.title)}</b><span>${esc(p.description || '')}</span>
-        ${p.id === 'assistant' ? '' : `<label class="dev${p.dev ? ' on' : ''}" title="打开后它能读写工作区里的文件、改自己的代码（碰不到别的程序）"><input type="checkbox" id="devsw"${p.dev ? ' checked' : ''}><i></i>开发者</label>`}
+        ${p.id === 'assistant' ? '' : `<label class="dev${p.dev ? ' on' : ''}" title="打开后它能读写工作区里的文件、改自己的代码（碰不到别的程序）"><input type="checkbox" id="devsw"${p.dev ? ' checked' : ''}><i></i>开发者</label><button type="button" class="vbtn" id="verbtn" title="看这个程序的版本历史 / 退回去">版本</button>`}
       </header>
       <div id="thread"></div>
       <form class="composer" id="composer">
@@ -460,6 +496,7 @@ function paintStage(force) {
     </aside></div>`;
   wireComposer();
   wireDev();
+  wireVersions();
   wireGutter();
   if (p.uiKind === 'native') {
     $('#natbtn').onclick = () => toggleNative(p.id, (S.native[p.id] || {}).status === 'running');
@@ -472,6 +509,85 @@ function wireDev() {
   const box = $('#devsw');
   if (!box) return;
   box.onchange = () => toggleDev(S.pid, box.checked);
+}
+
+/* ------------------------------------------------------------------ 版本 */
+/* 版本面板是**人**这一侧的「看一眼 / 退回去」。它不发明语义：
+   GET 拿到的就是内核的版本链，POST 的语义是「把那一版再提交一次」——
+   所以退回去之后历史里多一版，而不是少几版。
+   不弹 confirm：回退本身可逆（再退回来就行），这是设计里的一条不变量；
+   而 pywebview 的 confirm 支持与否取决于版本，弹不出来就是「点了没反应」。 */
+function wireVersions() {
+  const b = $('#verbtn');
+  if (!b) return;
+  b.onclick = () => openVersions(S.pid);
+}
+
+function setVHint(text, cls) {
+  const el = $('#vmsg');
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = 'hint' + (cls ? ' ' + cls : '');
+}
+
+async function openVersions(pid) {
+  const m = $('#vmask');
+  if (!m) return;
+  m.classList.add('on');
+  m.setAttribute('aria-hidden', 'false');
+  $('#vtitle').textContent = `${(prog(pid) || {}).title || pid} · 版本历史`;
+  setVHint('读取中…');
+  $('#vlist').innerHTML = '';
+  const r = await fetch(`/api/p/${pid}/versions`).then((x) => x.json())
+    .catch((err) => ({ error: String(err) }));
+  if (r.error) { setVHint(r.error, 'bad'); return; }
+  if (!r.enabled) {
+    setVHint(`版本化未启用：${r.reason || '未安装 pure-python-git'}`, 'bad');
+    return;
+  }
+  const rows = r.versions || [];
+  if (!rows.length) {
+    setVHint('还没有任何版本：这个程序下一次被写入成功时会记第 1 版。');
+    return;
+  }
+  setVHint(`共 ${rows.length} 版（最新在前）。「退回去」= 把那一版再提交一次，历史不会少。`);
+  $('#vlist').innerHTML = rows.map((v, i) => `
+    <div class="vrow${i === 0 ? ' cur' : ''}">
+      <div class="vmain">
+        <div class="vno">v${v.ver} <span class="vmeta">${esc(v.short)} · ${esc(v.when)}</span></div>
+        <div class="vmeta">${esc(v.msg || '（无摘要）')}</div>
+        <div class="vfiles">${(v.files || []).map(esc).join(' · ') || '—'}</div>
+      </div>
+      <button type="button" data-ver="v${v.ver}"${i === 0 ? ' disabled title="这就是当前这一版"' : ''}>退回去</button>
+    </div>`).join('');
+  $('#vlist').querySelectorAll('button[data-ver]').forEach((b) => {
+    b.onclick = () => doRevert(pid, b.dataset.ver, b);
+  });
+}
+
+async function doRevert(pid, version, btn) {
+  btn.disabled = true;
+  setVHint(`正在退回到 ${version}…`);
+  const r = await fetch(`/api/p/${pid}/versions`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ version }),
+  }).then((x) => x.json()).catch((err) => ({ status: 'error', message: String(err) }));
+  if (!r || r.status !== 'ok') {
+    btn.disabled = false;
+    setVHint((r && r.message) || '回退失败', 'bad');
+    return;
+  }
+  setVHint(r.message || '已回退', 'ok');
+  await loadState();
+  paintStage(true);
+  await openVersions(pid);   // 重新拉一遍：历史里多了一版
+}
+
+function closeVersions() {
+  const m = $('#vmask');
+  if (!m) return;
+  m.classList.remove('on');
+  m.setAttribute('aria-hidden', 'true');
 }
 
 /* 对话面板宽度：localStorage 记住，按程序分开记。
@@ -1160,7 +1276,13 @@ async function saveSettings(e) {
 $('#setcancel').onclick = closeSettings;
 $('#setform').onsubmit = saveSettings;
 $('#mask').addEventListener('click', (e) => { if (e.target.id === 'mask') closeSettings(); });
-window.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSettings(); });
+$('#vclose').onclick = closeVersions;
+$('#vmask').addEventListener('click', (e) => { if (e.target.id === 'vmask') closeVersions(); });
+window.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  closeVersions();      // 版本面板在上层，先关它
+  closeSettings();
+});
 
 /* ------------------------------------------------------------------ 启动 */
 function select(pid) {

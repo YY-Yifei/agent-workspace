@@ -35,6 +35,9 @@ OPEN_RE = re.compile(r"^/api/p/(?P<pid>[a-z][a-z0-9_]*)/(?P<act>open|close)$")
 AGENT_RE = re.compile(r"^/api/p/(?P<pid>[a-z][a-z0-9_]*)/(?P<act>chat|cancel|link)$")
 DEV_RE = re.compile(r"^/api/p/(?P<pid>[a-z][a-z0-9_]*)/dev$")
 PLUGIN_RE = re.compile(r"^/plugin/(?P<pid>[a-z][a-z0-9_]*)(?P<rest>/.*)?$")
+# 版本历史：人这一侧的「看一眼 / 退回去」。两个都只作用于 plugins/<pid>，
+# 与 static 路由一样按 pid 分段匹配 —— 不拼路径，就不会有越界。
+VERSIONS_RE = re.compile(r"^/api/p/(?P<pid>[a-z][a-z0-9_]*)/versions$")
 
 
 class App:
@@ -128,17 +131,35 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state":
             # 门只做搬运，**不重新发明** state 的形状：内核多一个字段（比如 devtools），
             # 界面就该收到它。这里曾经逐项挑着搬，于是新增字段静默消失。
+            from . import pluginvcs
+
+            vcs_ok, vcs_why = pluginvcs.available()
             st = rt.state()
             return self._json({**st,
                                "native": App.native.info() if App.native else {},
                                "settings": {"url": hub.url} if hub else {},
-                               "agents": hub.status() if hub else {}})
+                               "agents": hub.status() if hub else {},
+                               "vcs": {"enabled": vcs_ok, "reason": vcs_why}})
         if path == "/api/events":
             return self._sse()
         if path == "/api/settings":
             if hub is None:
                 return self._json({"error": "智能体池未装配"}, 503)
             return self._json({"url": hub.url, "agents": hub.status()})
+
+        m = VERSIONS_RE.match(path)
+        if m:
+            pid = m.group("pid")
+            if rt.program(pid) is None:
+                return self._json({"error": f"没有程序 {pid}"}, 404)
+            from . import pluginvcs
+
+            ok, why = pluginvcs.available()
+            rows = pluginvcs.versions(rt.root / "plugins" / pid, limit=30) if ok else []
+            return self._json({
+                "pid": pid, "enabled": ok, "reason": "" if ok else why,
+                "versions": [{k: v[k] for k in ("ver", "short", "sha", "msg", "when")} | {
+                    "files": sorted(v["files"])} for v in rows]})
 
         m = PLUGIN_RE.match(path)
         if m:
@@ -201,6 +222,25 @@ class Handler(BaseHTTPRequestHandler):
             if not text.strip():
                 return self._json({"error": "空消息"}, 400)
             return self._json({"status": hub.send(pid, text), "pid": pid})
+
+        # 版本回退：人点的按钮。语义是**再提交一版**（不是 reset）——
+        # 所以它走的是与写入同一条落盘路径，四道校验照样挡在前面。
+        m = VERSIONS_RE.match(path)
+        if m:
+            pid = m.group("pid")
+            if rt.program(pid) is None:
+                return self._json({"error": f"没有程序 {pid}"}, 404)
+            from . import toolbox
+
+            version = str((body or {}).get("version") or "").strip()
+            paths = (body or {}).get("paths") or None
+            try:
+                out = toolbox._plugin_revert(pid, version, paths, by="human",
+                                             why=str((body or {}).get("why") or "人点的回退"))
+            except ValueError as exc:
+                # 校验没过 / 没有这一版：消息本来就是给人看的一句话，原样回
+                return self._json({"status": "error", "pid": pid, "message": str(exc)}, 400)
+            return self._json({"status": "ok", "pid": pid, "message": out["text"]})
 
         # 开发者模式：人手拨的一枚开关。开着 = 这个程序的助手借来小助理的手
         m = DEV_RE.match(path)

@@ -32,6 +32,11 @@ dependencies = ["aaas>=0.3.0", "pywebview>=5.0"]
 # 空 extra：老命令 `pip install open-agent-workspace[gui]` 仍然成立（不报未知 extra）。
 # 它现在等于空气，因为没有额外的东西可装。
 gui = []
+# 插件程序的版本化（docs/plugin-versioning.md）。**故意不在 dependencies 里**：
+# 主机上没有它也得能跑 —— 版本化是旁路，缺了就把历史关掉，写入照旧。
+# 上界卡 <2：pythongit 与真 git 的标志位差异是 behavior 层面的（§6 全是实跑结论），
+# 光靠"它说它是 1.x"挡不住下一个小版本改语义。
+vcs = ["pure-python-git>=1.0.2,<2"]
 
 [project.scripts]
 # 只留这一个入口名：PyPI 上另有一个 agent-workspace（dropxhq 的 Rust 内核），

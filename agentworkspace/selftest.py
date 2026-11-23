@@ -394,9 +394,22 @@ def main() -> int:
           r.get("status") == "ok" and r.get("dev") is True, str(r)[:140])
     dev_caps = sorted(rt.capabilities_of(pid))
     borrowed = [w for w in dev_caps if not w.startswith(pid + "_")]
-    check("打开后借到的**恰好**是这五项（多一项都算越界）",
-          borrowed == ["dev_plugin_write", "dev_read", "dev_search", "dev_tree", "dev_write"],
+    check("打开后借到的**恰好**是这九项（多一项都算越界）",
+          borrowed == ["dev_diff", "dev_plugin_write", "dev_read", "dev_revert",
+                       "dev_search", "dev_show", "dev_tree", "dev_versions", "dev_write"],
           str(borrowed))
+    check("借来的手里**没有**一件能动历史的危险动作（remote/push/branch/reset…）",
+          not any(k in w for w in borrowed for k in
+                  ("remote", "fetch", "push", "branch", "merge", "tag", "stash",
+                   "reset", "clean", "rebase", "checkout")), str(borrowed))
+    check("四个版本动词都没有 pid 参数（碰别人的仓在签名上就不存在）",
+          all("pid" not in rt.devtools[fn].parameters.get("properties", {})
+              for fn in ("versions", "show", "diff", "revert")),
+          str([fn for fn in ("versions", "show", "diff", "revert")
+               if "pid" in rt.devtools[fn].parameters.get("properties", {})]))
+    check("dev_read 能分页（没有 offset/limit，「返回路径」那条路走不通）",
+          {"offset", "limit"} <= set(rt.devtools["read"].parameters.get("properties", {})),
+          str(sorted(rt.devtools["read"].parameters.get("properties", {}))))
     check("借来的手里没有一件能碰别的程序（list / call / delete / 终端）",
           not ({"assistant_plugin_list", "assistant_plugin_call", "assistant_plugin_delete",
                 "assistant_shell"} & set(dev_caps)), str(borrowed))
@@ -496,11 +509,69 @@ def main() -> int:
           res.status == "error" and "回滚" in (res.text or "")
           and bp2.read_text(encoding="utf-8") == good2, (res.text or "")[:80])
 
+    # 先记一个数：历史里只该有「真的成了的版本」。
+    # 判据放在成功写入**之前**取，才能同时覆盖下面「写坏」那一次。
+    from . import pluginvcs as _pv
+    _pv_ok, _pv_why = _pv.available()
+    _pdir = WS / "plugins" / pid
+
     res = rt.dispatch("dev", "plugin_write", {"files": {"plugin.json": pj}},
                       source="agent", caller=pid)
     check("改自己成功时说得清「改的是你自己」（同一条落盘路径）",
           res.status == "ok" and "你自己" in (res.text or ""),
           f"{res.status}: {(res.text or '')[:60]}")
+
+    if not _pv_ok:
+        print(f"  --  跳过版本化断言：{_pv_why}", flush=True)
+    else:
+        # 上面那次写的是**原样回写**的 plugin.json：内容没变 → 空提交 → 不建版。
+        # 那是正确行为（[13b] 专门断言了它），不是版本化没生效 ——
+        # 所以「多一版」必须用**内容真的变了**的写入来验，否则测到的是
+        # 空提交的语义，不是版本化的语义。
+        n_before = len(_pv.versions(_pdir))
+        grow = bp2.read_text(encoding="utf-8") + "\n# selftest: 让内容真的变化\n"
+        res_g = rt.dispatch("dev", "plugin_write", {"files": {"backend.py": grow}},
+                            source="agent", caller=pid)
+        n_ok = len(_pv.versions(_pdir))
+        check("成功写入（内容真的变了）→ 历史多一版（懒触发：不是启动时建仓）",
+              res_g.status == "ok" and n_ok == n_before + 1,
+              f"{res_g.status}: {n_before} → {n_ok}")
+        n_bad0 = n_ok
+        res = rt.dispatch("dev", "plugin_write",
+                          {"files": {"backend.py": "def broken(: pass\n"}},
+                          source="agent", caller=pid)
+        check("校验失败的那一次**不入历史**（历史里只有真的成了的版本）",
+              res.status == "error" and len(_pv.versions(_pdir)) == n_bad0,
+              f"{res.status}: {len(_pv.versions(_pdir))} 版")
+
+        # 四个动词经内核真调一遍：读历史、看某一版、看差别
+        v_list = rt.dispatch("dev", "versions", {}, source="agent", caller=pid)
+        check("dev_versions 看得到自己的历史",
+              v_list.status == "ok" and "v1" in (v_list.text or ""),
+              (v_list.text or "")[:100])
+        v_show = rt.dispatch("dev", "show", {"version": "v1"}, source="agent", caller=pid)
+        check("dev_show 不带 path → 给文件清单（不是灌全文）",
+              v_show.status == "ok" and "plugin.json" in (v_show.text or ""),
+              (v_show.text or "")[:100])
+        v_file = rt.dispatch("dev", "show", {"version": "v1", "path": "backend.py"},
+                             source="agent", caller=pid)
+        check("dev_show 带 path → 给那一版的片段，并说清有多少行",
+              v_file.status == "ok" and (v_file.data or {}).get("lines"),
+              str(v_file.data)[:120])
+        v_diff = rt.dispatch("dev", "diff", {"version": "v1"}, source="agent", caller=pid)
+        check("dev_diff 给出「那一版 → 现在」的差别或明说没有差别",
+              v_diff.status == "ok"
+              and ("→ 你现在" in (v_diff.text or "") or "一模一样" in (v_diff.text or "")),
+              (v_diff.text or "")[:100])
+        v_data = rt.dispatch("dev", "show", {"version": "v1", "path": "data/store.json"},
+                             source="agent", caller=pid)
+        check("data/ 连只读都不给（dev_show 同样按白名单拒）",
+              v_data.status != "ok" and "data" in (v_data.text or ""),
+              f"{v_data.status}: {(v_data.text or '')[:80]}")
+        v_bad = rt.dispatch("dev", "show", {"version": "v99"}, source="agent", caller=pid)
+        check("没有这一版时说的是人话（不是裸异常）",
+              v_bad.status == "error" and "没有这一版" in (v_bad.text or ""),
+              f"{v_bad.status}: {(v_bad.text or '')[:80]}")
 
     rt.set_dev(pid, False)
     check("关掉之后手立刻收回",
@@ -510,6 +581,69 @@ def main() -> int:
     check("关掉之后硬调 dev_* 也被拒（不等下一轮重声明）",
           res.status == "rejected" and "开发者模式" in (res.text or ""),
           f"{res.status}: {(res.text or '')[:60]}")
+
+    print("[13b] 版本化本身：就地 .git、白名单、按字节回读")
+    if not _pv_ok:
+        print(f"  --  跳过：{_pv_why}", flush=True)
+    else:
+        import tempfile as _tf
+
+        box = Path(_tf.mkdtemp(prefix="vcs-"))
+        pd = box / "demo"
+        (pd / "ui").mkdir(parents=True)
+        (pd / "data").mkdir()
+        (pd / "data" / "store.json").write_text('{"secret": 1}', encoding="utf-8")
+        (pd / "__pycache__").mkdir()
+        (pd / "__pycache__" / "x.pyc").write_bytes(b"\x00")
+        (pd / "plugin.json").write_text('{"id": "demo", "title": "演示"}', encoding="utf-8")
+        (pd / "backend.py").write_text("def pong() -> dict:\n    return {'v': 1}\n",
+                                       encoding="utf-8")
+        (pd / "ui" / "index.html").write_text("<h1>v1</h1>", encoding="utf-8")
+        AUTH = ("演示", "demo@plugin.local")
+
+        r1 = _pv.commit_all(pd, author=AUTH, notes={"By": "agent"})
+        vs = _pv.versions(pd)
+        check("首次提交 → 第 1 版，仓库就地长在 plugins/<pid>/.git",
+              r1[0] and len(vs) == 1 and (pd / ".git").is_dir(), str(r1)[:100])
+        first = _pv.files_at(pd, vs[0]["sha"]) if vs else {}
+        check("data/ 永不入库", not any(p.startswith("data/") for p in first),
+              str(sorted(first)))
+        check("__pycache__ / *.pyc 也没混进去",
+              not any("__pycache__" in p or p.endswith(".pyc") for p in first),
+              str(sorted(first)))
+        check("只跟踪 plugin.json / backend.py / ui/**",
+              sorted(first) == ["backend.py", "plugin.json", "ui/index.html"],
+              str(sorted(first)))
+
+        old_bytes = _pv.read_at(pd, vs[0]["sha"], "backend.py") if vs else None
+        (pd / "backend.py").write_text(
+            "def pong() -> dict:\n    return {'v': 2}\n\ndef echo(x) -> dict:\n"
+            "    return {'x': x}\n", encoding="utf-8")
+        r2 = _pv.commit_all(pd, author=AUTH, notes={"By": "agent"})
+        vs2 = _pv.versions(pd)
+        check("再写一次 → 第 2 版", r2[0] and len(vs2) == 2, str(r2)[:100])
+        check("版本号从第一版起数（v1 最早、v2 最新）",
+              [v["ver"] for v in vs2] == [2, 1], str([v["ver"] for v in vs2]))
+        check("旧版按**字节**取得回来（回退的地基：decode 再 encode 会改 CRLF）",
+              _pv.read_at(pd, vs2[-1]["sha"], "backend.py") == old_bytes, "")
+
+        r3 = _pv.commit_all(pd, author=AUTH)          # 什么都没改
+        check("没有改动时不白建一版", (not r3[0]) or len(_pv.versions(pd)) == 2, str(r3)[:80])
+
+        head0 = (pd / ".git" / "HEAD").read_text(encoding="utf-8")
+        files, drops, err = _pv.revert_files(pd, "v1")
+        check("回退只**取内容**，不落盘、也不动 HEAD（落盘要过四道校验）",
+              not err and files and "backend.py" in files
+              and (pd / ".git" / "HEAD").read_text(encoding="utf-8") == head0
+              and "{'v': 2}" in (pd / "backend.py").read_text(encoding="utf-8"), err)
+        check("没有这一版 → 明说（白名单，不解析 HEAD~1 这类语法）",
+              _pv.revert_files(pd, "v99")[2] != "", "")
+        check("data/ 的只读也不给", _pv.read_at(pd, vs2[0]["sha"], "data/store.json") is None, "")
+        check("路径穿越当普通字符串（不是跟踪路径就当没有）",
+              _pv.read_at(pd, vs2[0]["sha"], "../plugin.json") is None, "")
+        arc = _pv.archive(pd, box / "graveyard")
+        check("删程序前能把 .git 归档取走（删了想找回上一版，正是最需要历史的时候）",
+              arc is not None and Path(arc).is_dir() and not (pd / ".git").exists(), str(arc))
 
     print("[14] 界面：工具默认折叠、两栏能拖 —— 断的是结构，不是手感")
     html = (Path(__file__).resolve().parent / "web" / "index.html").read_text(encoding="utf-8")
@@ -527,6 +661,12 @@ def main() -> int:
     check("重绘只在贴底时跟随滚动（人往上翻就不会被拽回来）",
           "const atBottom = el.scrollTop + el.clientHeight" in html
           and "if (atBottom) el.scrollTop" in html, "")
+    check("版本面板在（人这一侧的「看一眼 / 退回去」）",
+          'id="vmask"' in html and 'id="vlist"' in html and "退回去" in html, "")
+    check("面板只说「退回去」= 再提交一版，不出现 reset 这种说法",
+          "再提交一次" in html and "reset" not in html.lower().replace("复位", ""), "")
+    check("回退不弹 confirm（pywebview 支持与否取决于版本，弹不出来就是点了没反应）",
+          "confirm(" not in html, "")
     check("两栏之间有抓手，宽度走一个变量", 'id="gutter"' in html and "--chatw" in html, "")
     check("宽度夹在 300 与「舞台宽-320」之间（拖动/键盘/缩放共用同一个纯函数）",
           "function clampChatW" in html and "stageW || 0) - 320" in html, "")

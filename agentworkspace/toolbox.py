@@ -89,16 +89,47 @@ def tree(max_depth: int = 3) -> dict:
     return {"text": f"工作区 {root.name}/：\n{body}", "root": str(root)}
 
 
-def read(path: str) -> dict:
-    """读一个文件的内容（工作区内）。
+MAX_READ_CHARS = 20000          # 一次读进上下文的硬顶（字符）
+
+
+def read(path: str, offset: int = 1, limit: int = 0) -> dict:
+    """读一个文件的内容（工作区内，可**分页**）。
 
     path: 相对工作区的路径，如 plugins/pomodoro/backend.py
+    offset: 从第几行开始（1 = 文件开头）
+    limit: 最多读多少行（0 = 尽可能多，仍受 20000 字符硬顶）
+
+    为什么现在要分页：老版本是 ``text[:20000]`` —— 截了却不**说**，于是 agent 看见
+    ``lines: 3000``、实际只拿到 800 行，却以为自己读完了整份文件，然后基于半份文件
+    去改程序。报错会让它换个办法，静默会让它写错。所以返回值里带上
+    ``truncated`` / ``shown_lines`` / ``more`` / ``next_offset``：**能不能自证完整**，
+    比多给几千字符重要得多。
     """
     p = _safe(path, must_exist=True)
     if p.is_dir():
         raise ValueError(f"{path} 是目录，用 tree 看结构")
     text = p.read_text(encoding="utf-8", errors="replace")
-    return {"text": text[:20000], "path": str(p.relative_to(_ws())), "lines": text.count("\n") + 1}
+    lines = text.splitlines(keepends=True)
+    start = max(0, int(offset or 1) - 1)
+    want = int(limit or 0)
+    chunk = lines[start: start + want] if want > 0 else lines[start:]
+    body = "".join(chunk)
+    cut = len(body) > MAX_READ_CHARS
+    if cut:
+        body = body[:MAX_READ_CHARS]
+    shown = body.count("\n") + (1 if body and not body.endswith("\n") else 0)
+    consumed = start + shown
+    more = consumed < len(lines)
+    out = {"text": body, "path": p.relative_to(_ws()).as_posix(),
+           "lines": len(lines), "shown_lines": shown,
+           "truncated": bool(more or cut), "more": more}
+    if more:
+        out["next_offset"] = consumed + 1
+        out["text"] += (f"\n…（还有 {len(lines) - consumed} 行没读，"
+                        f"接着读用 offset={consumed + 1}）")
+    elif cut:
+        out["text"] += "\n…（这一页已到 20000 字符硬顶，请用 offset 分页读）"
+    return out
 
 
 def search(pattern: str, path: str = ".", limit: int = 30) -> dict:
@@ -259,12 +290,16 @@ def plugin_write(pid: str, files: dict) -> dict:
             "plugin": pid, "functions": caps}
 
 
-def _commit(pid: str, files: dict) -> tuple[list[str], str]:
+def _commit(pid: str, files: dict, *, by: str = "agent", why: str = "") -> tuple[list[str], str]:
     """把 files 提交成插件 pid 的当前版本；四道校验不过 → 整份回滚并抛错。
 
     返回 (能力清单, uiKind)。这是**改程序的唯一落盘路径**：小助理的
-    ``plugin_write`` 与开发者模式的 ``dev_plugin_write`` 都走它 —— 于是
-    「会回滚」不会只对一半路径成立。
+    ``plugin_write``、开发者模式的 ``dev_plugin_write``、以及两者的**回退**
+    都走它 —— 于是「会回滚」和「会记一版」都不会只对一半路径成立。
+
+    ``files`` 的值可以是 ``str``（正常写入）或 ``bytes``（回退：旧版内容必须
+    **按字节**写回，decode 一次再 encode 回去，CRLF 会变 LF、GBK 文件直接炸）。
+    ``by`` / ``why`` 只进提交消息：``self`` / ``agent`` / ``human``，以及一句人话。
 
     为什么回滚是硬要求：开发者模式让一个程序能改自己，而「改坏了」最坏的结局
     不是这一次失败，是**下次开机起不来**（装载发生在启动时，旁边没人能救）。
@@ -287,13 +322,16 @@ def _commit(pid: str, files: dict) -> tuple[list[str], str]:
     snap = _snapshot(pdir)
     try:
         for name, content in files.items():
-            if not isinstance(content, str):
-                raise ValueError(f"{name} 的内容必须是字符串")
+            if not isinstance(content, (str, bytes)):
+                raise ValueError(f"{name} 的内容必须是字符串或字节")
             target = (pdir / name).resolve()
             if pdir not in target.parents and target != pdir:
                 raise ValueError(f"{name} 路径越界")
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+            if isinstance(content, bytes):
+                target.write_bytes(content)          # 回退：原样写回，一个字节都不改
+            else:
+                target.write_text(content, encoding="utf-8")
 
         report = _verify(pid)
     except Exception:                       # 写到一半就炸：也退回原样
@@ -308,7 +346,72 @@ def _commit(pid: str, files: dict) -> tuple[list[str], str]:
     _rt().scan()                               # 继承：内核只落盘；变更由事件广播出去
     caps = [c.wire for c in _rt().plugins[pid].caps.values()] if pid in _rt().plugins else []
     kind = _rt().plugins[pid].ui_kind if pid in _rt().plugins else "web"
+    _vcs_commit(pid, pdir, caps=caps, by=by, why=why)   # 旁路：失败只留痕，绝不影响写入
     return caps, kind
+
+
+def _vcs_commit(pid: str, pdir: Path, *, caps: list[str], by: str, why: str) -> None:
+    """成功写入之后记一版。**这里抛出的任何东西都不许冒泡**（不变量 1）。
+
+    为什么挂在 ``_commit`` 而不是各个调用方：小助理、插件自己、人的回退按钮
+    最终都落到这一处；挂在这里，「一版」的语义才只有一种解释
+    ——「一次被四道校验接受的改动」。
+    """
+    try:
+        from . import pluginvcs
+
+        ok, detail = pluginvcs.available()
+        if not ok:
+            return                                 # 没装 / 自检不过：静默退化
+        prog = _rt().plugins.get(pid)
+        title = (getattr(prog, "title", "") or pid) if prog is not None else pid
+        done, detail = pluginvcs.commit_all(
+            pdir, author=(title, f"{pid}@plugin.local"),
+            notes={"Caps": ", ".join(caps), "By": by, "Why": why, "Check": "verify=ok, import=ok"})
+        if done:
+            v = pluginvcs.versions(pdir, limit=1)
+            _rt().publish("plugin.commit", pid=pid, source="system",
+                          data={"sha": detail[:8], "ver": (v[0]["ver"] if v else 0),
+                                "msg": (v[0]["msg"] if v else "")})
+        elif detail != "nothing to commit":
+            _rt().publish("plugin.commit", pid=pid, source="system",
+                          data={"sha": "", "error": detail})
+    except Exception as exc:                       # 版本化是旁路，写入已经成功了
+        try:
+            _rt().publish("plugin.commit", pid=pid, source="system",
+                          data={"sha": "", "error": f"{type(exc).__name__}: {exc}"})
+        except Exception:
+            pass
+
+
+def _plugin_revert(pid: str, version: str, paths: list[str] | None = None, *,
+                   why: str = "", by: str = "human") -> dict:
+    """把某一版的内容**再提交一次** —— 回退不是 reset，历史只增不改。
+
+    为什么必须回到 ``_commit`` 里走一遍：回退到一版坏代码时，四道校验要能拦住它，
+    并说出原因。绕过校验的回退等于给「改坏了」开一扇后门，而坏事总是从那扇门进来。
+    """
+    from . import pluginvcs
+
+    ok, detail = pluginvcs.available()
+    if not ok:
+        raise ValueError(f"版本化不可用：{detail}")
+    root = _ws()
+    pdir = (root / "plugins" / pid).resolve()
+    if pdir.parent != (root / "plugins").resolve() or not pdir.is_dir():
+        raise ValueError(f"没有插件 {pid}")
+    files, drops, err = pluginvcs.revert_files(pdir, version, paths)
+    if files is None:
+        raise ValueError(err)
+    for name in drops:                             # 那一版没有、现在却有 → 删掉才是「回到那一版」
+        drop = (pdir / name).resolve()
+        if pdir in drop.parents and drop.is_file():
+            drop.unlink()
+    caps, kind = _commit(pid, files, by=by, why=why)
+    v = pluginvcs.resolve(pdir, version)
+    return {"text": f"已回到 v{(v or {}).get('ver', '?')}（{(v or {}).get('short', '')}）："
+                    f"内容按字节写回，再提交成一版新版本。能力 {caps}。",
+            "plugin": pid, "functions": caps, "version": version}
 
 
 def plugin_delete(pid: str, keep_data: bool = True) -> dict:
@@ -335,10 +438,19 @@ def plugin_delete(pid: str, keep_data: bool = True) -> dict:
         if backup.exists():
             shutil.rmtree(backup)
         shutil.move(str(pdir / "data"), str(backup))
+    arch = None
+    try:
+        from . import pluginvcs
+
+        if pluginvcs.available()[0]:
+            arch = pluginvcs.archive(pdir, _ws() / BACKUP)   # 删程序 ≠ 扔历史
+    except Exception:
+        arch = None
     shutil.rmtree(pdir)
     _rt().scan()
-    return {"text": f"已删除插件 {pid}" + (f"，数据备份在 {backup.name}" if backup else ""),
-            "plugin": pid}
+    tail = "".join([f"，数据备份在 {backup.name}" if backup else "",
+                    f"，历史归档在 {BACKUP}/{arch.name}" if arch else ""])
+    return {"text": f"已删除插件 {pid}" + tail, "plugin": pid}
 
 
 def plugin_list() -> dict:
@@ -394,7 +506,9 @@ def _snapshot(pdir: Path) -> Path | None:
         shutil.rmtree(dst)
     for f in pdir.rglob("*"):
         rel = f.relative_to(pdir)
-        if not f.is_file() or rel.parts[0] == "data":
+        # .git 也要跳过：就地长出一个仓之后，不跳的话每写一次就把整个仓库
+        # 拷进 .backup/<pid>/ —— 几十毫秒变几秒。
+        if not f.is_file() or rel.parts[0] in ("data", ".git"):
             continue
         t = dst / rel
         t.parent.mkdir(parents=True, exist_ok=True)
@@ -407,10 +521,14 @@ def _restore(pdir: Path, snap: Path | None) -> int:
     n = 0
     for f in sorted(pdir.rglob("*"), key=lambda x: len(x.parts), reverse=True):
         rel = f.relative_to(pdir)
-        if f.is_file() and rel.parts[0] != "data":
+        # **最致命的一处**：不跳过 .git，一次失败的回滚会把整个历史删掉 ——
+        # 而那时正是最需要「退回去」的时候。
+        if rel.parts[0] in ("data", ".git"):
+            continue
+        if f.is_file():
             f.unlink()
             n += 1
-        elif f.is_dir() and rel.parts[0] != "data" and not any(f.iterdir()):
+        elif f.is_dir() and not any(f.iterdir()):
             f.rmdir()
     if snap is not None:
         for f in snap.rglob("*"):
