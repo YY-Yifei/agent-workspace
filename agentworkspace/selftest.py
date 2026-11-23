@@ -582,6 +582,86 @@ def main() -> int:
     check("web/*.js 进了 package-data（漏了就是装完 404，本地试不出来）",
           pp.is_file() and "web/*.js" in pp.read_text(encoding="utf-8"), str(pp))
 
+    # ── 滚动条。这一块在第十轮之前是**零命中**：跑的一直是系统默认那条
+    # （17px 宽、浅灰凹槽、两头各一个箭头），背景却是 #0e1013 —— 它比页面上
+    # 任何内容都亮。下面守的不是"有没有写样式"，是三个会静默失效的错法：
+    #   (a) 裸写 scrollbar-width   → Chromium 121+ 整段忽略 ::-webkit-scrollbar
+    #   (b) thumb:hover 用 background 简写 → 重置 background-clip，滑块当场胖一圈
+    #   (c) 只留 width:3px         → 热区=视觉，看得见、点不中
+    idx = Path(__file__).resolve().parent / "web" / "index.html"
+    hsrc = idx.read_text(encoding="utf-8") if idx.is_file() else ""
+    css = re.search(r"<style>(.*?)</style>", hsrc, re.S)
+    check("index.html 有 <style> 段", css is not None, str(idx))
+    naked = re.sub(r"/\*.*?\*/", "", css.group(1) if css else "", flags=re.S)
+    # 锚在**声明**上，不是锚在选择器上：`#rail::-webkit-scrollbar{width:8px}` 里
+    # 也有 `::-webkit-scrollbar{` —— 全局那条被删掉，这条检查照样绿，等于空转。
+    check("滚动条不是系统默认那条（锚在声明上，别被窄栏那条满足）",
+          "::-webkit-scrollbar{width:var(--sb)" in naked, "")
+    check("箭头按钮与 corner 都处置了（默认样式里最扎眼的两处）",
+          "::-webkit-scrollbar-button{display:none" in naked
+          and "::-webkit-scrollbar-corner{background:transparent}" in naked, "")
+    outside = re.sub(r"@supports \(-moz-appearance:none\)\s*\{.*?\n  \}", "", naked, flags=re.S)
+    check("scrollbar-width/color 只出现在 -moz 门内",
+          "scrollbar-width" not in outside and "scrollbar-color" not in outside, "")
+    # 视觉粗细来自 base 那条：3px 透明边 + background-clip:padding-box 把热区削窄。
+    # 删掉任一个，滑块就画成热区全宽（4px → 10px，窄栏 2px → 8px），而下面的
+    # hover 检查仍然绿 —— 它只证明"悬停没用简写"，证明不了"本来就是细的"。
+    thumb = re.search(r"::-webkit-scrollbar-thumb\s*\{([^}]*)\}", naked)
+    check("thumb 用 3px 透明边 + padding-box 削出视觉粗细（缺了就胖成热区）",
+          bool(thumb) and "background-clip:padding-box" in thumb.group(1)
+          and "border:3px solid transparent" in thumb.group(1), "")
+    hov = re.search(r"::-webkit-scrollbar-thumb:hover\s*\{([^}]*)\}", naked)
+    check("thumb:hover 用 background-color（简写会重置 background-clip）",
+          bool(hov) and "background-color" in hov.group(1)
+          and not re.search(r"(?<!-)background\s*:", hov.group(1)), "")
+    check("深浅两套 color-scheme（缺浅色那套，浅色系统上仍画深色原生控件）",
+          re.search(r"color-scheme\s*:\s*dark", naked) is not None
+          and re.search(r"color-scheme\s*:\s*light", naked) is not None, "")
+    th = re.search(r"#thread\s*\{([^}]*)\}", naked)
+    check("#thread 的 gutter 单边常驻（both-edges 会让正文比标题多缩 10px）",
+          bool(th) and "scrollbar-gutter:stable" in th.group(1)
+          and "both-edges" not in th.group(1), "")
+    # 3:1 是算出来的，不是看着够 —— .55 实测 2.67:1（这段注释第一版就这么错的）
+    # 锚在**语义特征**上（这一块声明了 color-scheme:dark），不是锚在"第一个 :root"。
+    # 上一版锚位置，暗色块被删掉就落到浅色块（alpha .8），照样绿 —— 空转的第二次。
+    # `[\d.]+`：`1`（整数）、`.62`、`0.62` 都合法，别把写法差异当失败。
+    dark_root = re.search(r":root\s*\{([^}]*color-scheme\s*:\s*dark[^}]*)\}", naked)
+    light_root = re.search(r":root\s*\{([^}]*color-scheme\s*:\s*light[^}]*)\}", naked)
+
+    def _alpha(block: str, var: str):
+        """取某个 --sb* 变量的 alpha；取不到返回 None（None 一律判失败，别当 0 放过）。"""
+        m = re.search(var + r"rgba\(\d+,\s*\d+,\s*\d+,\s*([\d.]+)\)", block)
+        return float(m.group(1)) if m else None
+
+    a_dark = _alpha(dark_root.group(1) if dark_root else "", "--sb-thumb:")
+    check("暗色静止档 alpha ≥ .6（低于此不到 WCAG 1.4.11 的 3:1）",
+          a_dark is not None and a_dark >= 0.6, f"alpha={a_dark}")
+    # 只验暗色是不够的：浅色覆盖被删（合并冲突、误删）就退回暗色 .62，
+    # 而 .62 落到 #f6f7f9 上只有 ~1.8:1 —— 浅色模式下滚动条基本看不见。
+    a_light = _alpha(light_root.group(1) if light_root else "", "--sb-thumb:")
+    check("浅色静止档 alpha ≥ .78（暗色 .62 落到浅底上只有 ~1.8:1）",
+          a_light is not None and a_light >= 0.78, f"alpha={a_light}")
+    h_dark = _alpha(dark_root.group(1) if dark_root else "", "--sb-thumb-hi:")
+    h_light = _alpha(light_root.group(1) if light_root else "", "--sb-thumb-hi:")
+    check("两套悬停档都在，且各自比静止档更亮（两档不能塌成一档）",
+          None not in (h_dark, h_light) and h_dark > a_dark and h_light > a_light,
+          f"暗 {a_dark}→{h_dark} 浅 {a_light}→{h_light}")
+    # 让 #rail 真能滚的是这两条，不是滚动条样式：少了 overflow-y:auto 就没有容器，
+    # 少了 .rbtn 的主尺寸，flex 子项会先缩到 min-content 把图标压扁 —— 滚动条永不出现。
+    check("窄栏真的能滚（少了这两条，下面 keepTop 那条就是空转）",
+          "overflow-y:auto" in naked
+          and re.search(r"#rail\s+\.rbtn\s*\{[^}]*flex:0 0 auto", naked) is not None, "")
+    rsb = re.search(r"#rail::-webkit-scrollbar\s*\{([^}]*)\}", naked)
+    rw = re.search(r"width\s*:\s*(\d+)px", rsb.group(1)) if rsb else None
+    check("窄栏热区 ≥ 8px（热区=视觉就点不中）",
+          bool(rw) and int(rw.group(1)) >= 8, rw.group(0) if rw else "无 width")
+    check("窄栏重绘保住 scrollTop（否则点靠下的图标会跳回顶部）",
+          "const keepTop = rail.scrollTop" in hsrc and "rail.scrollTop = keepTop" in hsrc, "")
+    # 窄栏一旦重设 thumb，特异性就抬到 (1,0,1)，全局 :hover 当场失效 ——
+    # 那正是上一版"补一条 hover 覆盖回去"的来源。这一条守的是"别再加回去"。
+    check("窄栏不重设 thumb（只改 width，颜色与边框全部继承全局）",
+          re.search(r"#rail::-webkit-scrollbar-thumb", naked) is None, "")
+
     httpd.shutdown()
     if getattr(App, "native", None):
         App.native.shutdown()                       # 收尸：不留孤儿窗口

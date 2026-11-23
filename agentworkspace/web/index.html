@@ -9,19 +9,85 @@
   :root{
     --bg:#0e1013; --panel:#14171b; --line:#22272e; --ink:#e6eaef; --dim:#8b949e;
     --bubble:#1c2128; --accent:#5aa2ff; --ok:#4bbd7a; --bad:#e0645b;
+    /* 滚动条三档：--sb 是**热区**（能抓住的宽度），视觉粗细由 thumb 的透明
+       边框削掉；两档可见度 —— 静止时只是边界，鼠标压上去才是控件。 */
+    /* 两档刻度按 WCAG 1.4.11 的非文本对比 3:1 定，而且是**算过**的：
+         暗 静止 .62 → 3.08:1    悬停 .8  → 4.36:1
+         浅 静止 .80 → 3.13:1    悬停 .95 → 4.10:1
+       上一版写 .55，实测只有 2.67:1 —— 注释里写着 3:1，其实是空话，而没人会去手算。
+       滚动条是"这个容器还能滚"的唯一提示，太淡就等于没有。细（视觉 4px）+
+       半透明仍然安静，但不该隐形。 */
+    --sb:10px; --sb-thumb:rgba(139,148,158,.62); --sb-thumb-hi:rgba(139,148,158,.8);
+    /* 这一行是"治本"：默认滚动条不受页面 CSS 影响，但受 color-scheme 影响。
+       没有它，即使写了下面的伪元素，未覆盖的地方（以及 iframe 里的原生控件）
+       仍会被画成浅色。 */
+    color-scheme:dark;
   }
   @media (prefers-color-scheme:light){
     :root{ --bg:#f6f7f9; --panel:#fff; --line:#e5e7eb; --ink:#171a1f; --dim:#6b7280;
-           --bubble:#eef0f3; --accent:#2563eb; --ok:#1f9d55; --bad:#d13b30; }
+           --bubble:#eef0f3; --accent:#2563eb; --ok:#1f9d55; --bad:#d13b30;
+           --sb-thumb:rgba(107,114,128,.8); --sb-thumb-hi:rgba(107,114,128,.95);
+           color-scheme:light; }
   }
   *{box-sizing:border-box}
+  /* 滚动条。系统默认那一条是画给"文档"的：17px 宽、浅灰凹槽、两头各一个
+     箭头按钮 —— 放在 #0e1013 上，它比任何内容都亮，这就是违和的来源。
+     四处处置：
+       1) 箭头按钮归零、corner 透明（默认样式里最扎眼的两处）；
+       2) 滑块用 3px 透明边框把 10px 热区削成 4px 视觉：细，但仍抓得住；
+       3) 静止 .62 / 悬停拖动 .8 —— 不滚动时它只是容器边缘的一道影子；
+       4) Firefox 兜底用 `@supports (-moz-appearance:none)` 当门。
+          反过来拿 `@supports not selector(::-webkit-scrollbar)` 当门有风险：
+          碰上"声称支持该伪元素却又不画它"的引擎会两头落空，而 Gecko 正好
+          在这条线上模糊。`-moz-` 属性只有 Gecko 认，零误伤。
+     ⚠ 这里**不能**出现裸的 scrollbar-width/scrollbar-color：Chromium 121+ 一旦
+       看到它们就整段忽略 ::-webkit-scrollbar，圆角与"悬停才亮"会当场全丢。
+     ⚠ 悬停档用 background-color 而不是 background：简写会把 background-clip
+       重置回 border-box，滑块会在悬停那一瞬间由 4px 胖成 10px。 */
+  ::-webkit-scrollbar{width:var(--sb);height:var(--sb);background:transparent}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background-color:var(--sb-thumb);border-radius:99px;
+    border:3px solid transparent;background-clip:padding-box}
+  ::-webkit-scrollbar-thumb:hover{background-color:var(--sb-thumb-hi)}
+  ::-webkit-scrollbar-thumb:active{background-color:var(--sb-thumb-hi)}
+  ::-webkit-scrollbar-button{display:none;width:0;height:0}
+  ::-webkit-scrollbar-corner{background:transparent}
+  @supports (-moz-appearance:none){
+    /* Gecko 的 thumb 没有 :hover/:active —— 上面那套"静止一档、压上去一档"
+       在这里会塌成永久静止档，于是所有容器的滚动条都停在最淡的那一档。
+       没有第二档可升，就只能让第一档就是亮的：直接给 --sb-thumb-hi。 */
+    *{scrollbar-width:thin;scrollbar-color:var(--sb-thumb-hi) transparent}
+    /* 56px 的栏里塞不下 Gecko 的 thin（8–11px），图标会被挤歪；而 Gecko 又没有
+       2px 这一档。取舍：这里不要可见的栏 —— scrollbar-width:none 只隐藏 UI，
+       滚轮与键盘照样滚，代价是「栏还能往下滚」在 Gecko 上没有视觉提示。
+       （桌面壳走 WebView2/Chromium，那一路是 8px 热区 + 2px 视觉，有提示。） */
+    #rail{scrollbar-width:none}
+  }
   html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);
     font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
   #app{display:flex;height:100%}
 
   /* 左：一条窄栏。只有图标 —— 程序的名字在悬停里，不在界面上 */
+  /* 程序装多了这一栏会溢出，而它是 overflow:visible —— 最后一个图标会被裁掉，
+     连个滚动条都没有。给它滚。
+     两个尺寸必须分开：热区 8px（鼠标抓得住），视觉 2px（由全局那条 3px 透明边框
+     从 8px 里削出来）。写 width:3px 会让热区也变成 3px —— 看得见、点不中，
+     那只是把"丑"换成了"不能操作"。
+     gutter 常驻：溢出出现/消失时 38px 的图标不会横跳。 */
   #rail{width:56px;flex:0 0 56px;display:flex;flex-direction:column;align-items:center;gap:4px;
-    padding:10px 0;background:var(--panel);border-right:1px solid var(--line)}
+    padding:10px 0;background:var(--panel);border-right:1px solid var(--line);
+    overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable}
+  /* ⚠ 只加 overflow-y:auto 换不来「装多了就滚」：flex 列里子项默认 flex-shrink:1，
+     溢出时它们会先被压到 min-content（38px 的图标缩成 ~19px），滚动条根本轮不到
+     出现。把主尺寸钉死，溢出的才是真溢出。（.grow{flex:1} 的 basis 是 0，不受影响） */
+  #rail .rbtn{flex:0 0 auto}
+  /* 窄栏只需要一条规则：把**宽度**收窄。颜色、圆角、那圈 3px 透明边框
+     全部继承全局那条 —— 所以这里只出现 width，特异性不出这个属性之外，
+     全局的 :hover 档照样生效。
+     （曾经这里还写了一条 thumb{background-color:…}，与全局一字不差、纯 no-op，
+       却把特异性抬到 (1,0,1)，于是又得补一条悬停覆盖回来。两条冗余都是它生的。）
+     也**不要**在这里写 border:0 —— 那会把热区与视觉都压成 8px。 */
+  #rail::-webkit-scrollbar{width:8px}
   .rbtn{width:38px;height:38px;border:0;border-radius:10px;background:transparent;color:var(--ink);
     font-size:19px;line-height:1;cursor:pointer;display:grid;place-items:center;
     transition:background .12s}
@@ -74,7 +140,12 @@
   .dev.on{color:var(--accent)}
   .dev.on i{background:var(--accent);opacity:.4}
   .dev.on i::after{transform:translateX(11px);background:var(--accent)}
-  #thread{flex:1;overflow:auto;padding:18px 16px;display:flex;flex-direction:column;gap:14px}
+  /* scrollbar-gutter:stable —— 流式输出时每来一段都会让滚动条出现一次，
+     没有它正文会跟着左右抖 10px。位置定死，抖动就消失。
+     不用 both-edges：那会让正文左边缘比 header 和输入框各多缩 10px（26 vs 16）。
+     一列字的左基线对齐，比"左右对称"重要。 */
+  #thread{flex:1;overflow:auto;padding:18px 16px;display:flex;flex-direction:column;gap:14px;
+    scrollbar-gutter:stable}
   .solo #thread{max-width:720px;margin:0 auto;width:100%}
   .msg{width:100%;max-width:100%}
   .msg.me{display:flex;justify-content:flex-end}
@@ -266,6 +337,11 @@ function paintRail() {
   if (sig === S.railSig) return;
   S.railSig = sig;
   const rail = $('#rail');
+  /* 窄栏现在是滚动容器：`innerHTML` 一换，scrollTop 就归零 —— 程序多到要滚时，
+     点一个靠下的图标会让整条栏跳回顶部，刚选中的那个当场从视野里消失。
+     位置先记后放；选中项**只在看不见时**才滚进视口（block:'nearest' 是最小移动，
+     已经看得见就一步也不动）。 */
+  const keepTop = rail.scrollTop;
   rail.innerHTML = S.programs.map((p) =>
     `<button class="rbtn${p.id === S.pid ? ' on' : ''}" data-pid="${p.id}"
              title="${esc(p.title)}">${esc(p.icon || (p.title || '?').slice(0, 1))}</button>`
@@ -277,6 +353,14 @@ function paintRail() {
     b.onclick = () => select(b.dataset.pid);
   });
   $('#setbtn').onclick = openSettings;
+  rail.scrollTop = keepTop;
+  /* 别把这个变量叫 `on`：本脚本顶层有个事件分发器 `on(ev)`，同名会在函数里把它
+     遮住 —— 今天不在这儿调它所以不报错，明天谁在这里写一句 on(...) 就是 TypeError。 */
+  const sel = rail.querySelector('.rbtn.on');
+  if (sel) {
+    const rb = rail.getBoundingClientRect(), sb2 = sel.getBoundingClientRect();
+    if (sb2.top < rb.top || sb2.bottom > rb.bottom) sel.scrollIntoView({ block: 'nearest' });
+  }
   paintConn();
 }
 
