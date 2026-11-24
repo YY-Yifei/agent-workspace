@@ -14,6 +14,7 @@
 /.shell/
 /notes/
 /prompts/
+/sessions/
 
 # 原型目录：proto/ 是当初试探协议用的草稿 + 一个样例程序及其 data/，不是内核
 /proto/

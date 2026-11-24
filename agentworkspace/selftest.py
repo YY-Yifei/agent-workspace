@@ -2165,6 +2165,81 @@ def _run() -> int:
               f"{len(errs2)} 个异常，{len(lines2)} 行，可解析={_all_parse(lines2)}，"
               f"当前 {cur2.stat().st_size}B / 上限 {rt_race2.log_max}B"
               + (f"，首个={errs2[0]!r}" if errs2 else ""))
+        # E8-E12：轮转**失败**时会发生什么。
+        # 旧实现是「先删最老的 .2 → 再把 .1 顶成 .2 → **最后**才挪当前文件」。
+        # 于是在 Windows 上当前文件被别人打开着（WinError 32，实测过：只读句柄
+        # 就足以挡住 replace 与 unlink，但不挡追加写）时，归档已经被吃掉一格，
+        # 而当前文件纹丝不动。更糟的是失败后 _log_size 停在旧值，下一次写又触发
+        # 一遍轮转 —— 几十条事件就能把两份归档啃光。
+        # 审计是故障发生后唯一能回查的东西，偏偏它在故障发生时最不可信。
+        tmp_fail = Path(tempfile.mkdtemp(prefix="aw-log-fail-"))
+        tmp_stage = Path(tempfile.mkdtemp(prefix="aw-log-stage-"))
+        try:
+            def _blob(path: Path) -> bytes:
+                """读归档；不在了就是空 —— 坏实现会把它删掉，断言要报红不是抛异常。"""
+                try:
+                    return path.read_bytes()
+                except OSError:
+                    return b""
+
+            def _delta(before: bytes, after: bytes) -> str:
+                if before == after:
+                    return "未变"
+                return "被删掉" if not after else f"被改成 {len(after)}B"
+
+            rt_fail = kernel.Runtime(tmp_fail)
+            rt_fail.log_max = 512
+            for i in range(200):
+                rt_fail.publish("probe.fail", data={"i": i, "pad": "y" * 40})
+            logs_f = tmp_fail / "logs"
+            cur_f = logs_f / "events.jsonl"
+            a1 = _blob(logs_f / "events.jsonl.1")
+            a2 = _blob(logs_f / "events.jsonl.2")
+            # 占住当前文件 = 让它挪不动（E8 的前提，不是假设，是探针实测过的）
+            hold = open(cur_f, "rb")
+            try:
+                for i in range(50):
+                    rt_fail.publish("probe.fail2", data={"i": i})
+                a1b = _blob(logs_f / "events.jsonl.1")
+                a2b = _blob(logs_f / "events.jsonl.2")
+                size_told = rt_fail._log_size
+                cur_bytes = cur_f.read_bytes()
+            finally:
+                hold.close()
+            check("E8 轮转失败时归档一份都不许动（旧版：删 .2 → .1 顶成 .2 → 当前文件挪不动）",
+                  a1b == a1 and a2b == a2,
+                  f".1 {_delta(a1, a1b)}、.2 {_delta(a2, a2b)}")
+            check("E9 失败后 _log_size 与当前文件的真实字节数一致（不一致就让每次写都重试轮转）",
+                  size_told == len(cur_bytes),
+                  f"_log_size={size_told} 真实={len(cur_bytes)}")
+            _crlf = b"\r\n" in cur_bytes
+            check("E10 写审计用二进制追加：文件里没有 CRLF、计数与字节数同源"
+                  "（text 模式把 \\n 翻成 \\r\\n，_log_size 从此每行差 1 字节）",
+                  not _crlf and size_told == len(cur_bytes),
+                  f"含 CRLF={_crlf}，_log_size={size_told}，真实={len(cur_bytes)}")
+            # 放开句柄后必须立刻恢复：失败状态不许粘住
+            rt_fail.publish("probe.fail3", data={"i": 99})
+            a1c = _blob(logs_f / "events.jsonl.1")
+            check("E12 句柄放开后下一次写就能正常轮转（失败状态不粘连）",
+                  a1c == cur_bytes, f".1 {len(a1c)}B vs 失败时的当前文件 {len(cur_bytes)}B")
+
+            # 轮转中途崩掉会在磁盘上留一份 .staging —— 里面是「当时全部的当前事件」。
+            # 把它当垃圾删掉 = 悄悄吃掉一段审计，所以重启时第一件事就是收拾它。
+            logs_s = tmp_stage / "logs"
+            logs_s.mkdir(parents=True)
+            stale = logs_s / "events.jsonl.staging"
+            stale.write_bytes(b'{"type":"probe.old"}\n')
+            rt_st = kernel.Runtime(tmp_stage)          # 模拟重启
+            rt_st.publish("probe.new", data={"i": 1})
+            merged = (logs_s / "events.jsonl").read_bytes()
+            check("E11 重启时收拾上次崩在中途留下的 .staging（否则那段审计被静默吃掉）",
+                  b'"probe.old"' in merged and b'"probe.new"' in merged
+                  and not stale.exists(),
+                  f"当前 {len(merged)}B，.staging 还在={stale.exists()}")
+        finally:
+            for d in (tmp_fail, tmp_stage):
+                shutil.rmtree(d, ignore_errors=True)
+
     finally:
         for d in (tmp7, tmp8, tmp9):
             shutil.rmtree(d, ignore_errors=True)

@@ -35,6 +35,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import threading
 import time
 import traceback
@@ -465,6 +466,7 @@ class Runtime:
         self.log_max = LOG_MAX_BYTES
         self.log_keep = LOG_KEEP
         self._log_lock = threading.Lock()
+        self._recover_staging()   # 上次崩在轮转中途 → 先把那段审计并回来，别当垃圾
         try:
             self._log_size = self.log_path.stat().st_size     # 接着上次的大小算
         except OSError:
@@ -519,10 +521,44 @@ class Runtime:
             with self._log_lock:
                 if self._log_size > 0 and self._log_size + len(data) > self.log_max:
                     self._rotate_log()
-                with self.log_path.open("a", encoding="utf-8") as fh:
-                    fh.write(line)
+                # **二进制追加**，不用 text 模式：Windows 上 text 会把 "\n" 翻成
+                # "\r\n"，写进去的字节比 len(data) 多一行一个 —— 而 _log_size 是按
+                # len(data) 累加的，于是它从此一直偏小（实测每行差 1 字节），
+                # 阈值判断跟着失真：行数越多偏得越多，上界变成「差不多」。
+                with self.log_path.open("ab") as fh:
+                    fh.write(data)
                 self._log_size += len(data)
         except (OSError, TypeError, ValueError):
+            pass
+
+    def _staging_path(self) -> Path:
+        """轮转的中转站：当前文件先去这里，归档链走完了才改名成 ``.1``。"""
+        return self.log_path.parent / (self.log_path.name + ".staging")
+
+    def _log_bytes(self) -> int:
+        """当前文件的真实字节数（在不在都给一个数）。"""
+        try:
+            return self.log_path.stat().st_size
+        except OSError:
+            return 0
+
+    def _recover_staging(self) -> None:
+        """收拾上一次轮转崩在中途留下的现场。
+
+        崩在「当前文件已经挪开、归档链还没走完」之间时，事件全在那份 .staging
+        里。把它当垃圾删掉就是**悄悄吃掉一段审计** —— 宁可这一次超阈值，也不丢。
+        """
+        stage = self._staging_path()
+        try:
+            if not stage.exists():
+                return
+            if not self.log_path.exists():
+                stage.replace(self.log_path)
+                return
+            with stage.open("rb") as src, self.log_path.open("ab") as dst:
+                shutil.copyfileobj(src, dst)
+            stage.unlink()
+        except OSError:
             pass
 
     def _rotate_log(self) -> None:
@@ -530,9 +566,23 @@ class Runtime:
 
         调用者必须持有 ``_log_lock``。只保留 ``log_keep`` 份：审计是给人查
         「最近发生了什么」的，不是归档 —— 要么这里给上界，要么这个文件没有上界。
+
+        **顺序是有意的**：先把当前文件挪到 .staging，成了之后才动归档。
+        旧实现反着来（先删 .2 → 再把 .1 顶成 .2 → 最后才挪当前文件），于是当前
+        文件挪不动的时候（Windows 上被别的进程打开着 → WinError 32），归档已经
+        被吃掉：第一次失败丢 .2，第二次失败连 .1 也没了 —— 实测**两次就把两份
+        归档清空**，而当前文件一个字节没动。审计是故障之后唯一能回查的东西，
+        偏偏它最容易死在故障上。
         """
         logs = self.log_path.parent
+        stage = self._staging_path()
+        self._recover_staging()
         try:
+            self.log_path.replace(stage)        # ① 先把自己挪开
+        except OSError:
+            self._log_size = self._log_bytes()  # 挪不动 = 本次不轮转，归档一根手指都不碰
+            return
+        try:                                    # ② 自己安全了，才有资格动归档
             oldest = logs / f"{self.log_path.name}.{self.log_keep}"
             if oldest.exists():
                 oldest.unlink()
@@ -540,9 +590,14 @@ class Runtime:
                 src = logs / f"{self.log_path.name}.{n}"
                 if src.exists():
                     src.replace(logs / f"{self.log_path.name}.{n + 1}")
-            self.log_path.replace(logs / f"{self.log_path.name}.1")
+            stage.replace(logs / f"{self.log_path.name}.1")
         except OSError:
-            return                       # 轮转失败不该丢事件：接着往当前文件写
+            try:                                # 归档链走不下去：把当前文件扶回去
+                stage.replace(self.log_path)
+            except OSError:
+                pass                            # 双重失败：内容还在 .staging，下次进来先收拾
+            self._log_size = self._log_bytes()
+            return
         self._log_size = 0
 
     def _offer(self, q: queue.Queue, ev: dict) -> None:
