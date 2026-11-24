@@ -1282,11 +1282,19 @@ def _run() -> int:
     class _FakeUi:
         """一条真的在跑消息循环的线程（模拟 WinForms 的 UI 线程）。"""
 
+        _LIVE: list = []                 # 所有活着的替身，收尾时统一收
+
         def __init__(self, responsive: bool = True) -> None:
             self.responsive = responsive
             self.q: queue.Queue = queue.Queue()
             self.thread = threading.Thread(target=self._loop, name="fake-ui", daemon=True)
             self.thread.start()
+            _FakeUi._LIVE.append(self)
+
+        def stop(self) -> None:
+            """收尸：投个哨兵让消息循环退出。daemon 不该是「线程收不掉」的借口
+            —— 门自己漏线程，久了会让后面的时序断言变得不可解释。"""
+            self.q.put(None)
 
         def _loop(self) -> None:
             while True:
@@ -1299,7 +1307,7 @@ def _run() -> int:
             if self.responsive:      # 不响应 = 消息循环卡着，投递进去石沉大海
                 self.q.put(job)
 
-        def call(self, fn):
+        def call(self, fn, timeout: float = 5.0):
             """在 UI 线程上跑 fn，并把结果/异常带回调用者（模拟「人点了一下」）。"""
             box: dict = {}
             done = threading.Event()
@@ -1313,7 +1321,11 @@ def _run() -> int:
                     done.set()
 
             self.q.put(_job)
-            done.wait(5)
+            if not done.wait(timeout):
+                # 旧版是 done.wait(5) 之后直接取 box：卡住时返回 None，
+                # 于是一条「在 UI 线程上做了什么」的断言会在空值上变绿。
+                # 替身的失败必须响亮。
+                raise TimeoutError(f"UI 线程 {timeout:g}s 内没有执行")
             if "e" in box:
                 raise box["e"]
             return box.get("v")
@@ -1499,6 +1511,17 @@ def _run() -> int:
     check("拿不到 native 不抛异常（页面里还有兜底）",
           _okc3 is False and bool(_why3), str(_why3)[:80])
 
+    _nr = _FakeUi()
+    _nr.stop()                    # 消息循环先退出：投进去的活真的没人执行
+    _nr.thread.join(2)
+    _raised = ""
+    try:
+        _nr.call(lambda: 1, timeout=0.2)
+    except Exception as exc:                          # noqa: BLE001
+        _raised = f"{type(exc).__name__}: {exc}"
+    check("替身卡住时 call() 要抛（旧版 done.wait(5) 之后直接取 box → 悄悄返回 None）",
+          _raised.startswith("TimeoutError"), _raised or "没有抛，返回了 None")
+
     # ---- 源码判据：把「为什么必须投递」钉在 pywebview 自己的代码上，而不是我的复述
     # try **只裹读文件**。以前 check 也裹在里面：任何一条断言自己抛异常（键不存在、
     # 正则没匹配上），except 就把它吞成一条「跳过：…」的**绿**。读不到才是跳过的
@@ -1530,6 +1553,14 @@ def _run() -> int:
     _i_doors = sh_src.find("open_copy_doors(window, debug)")
     check("loaded.set() 在开门之前（开门出事也不能让外壳判成白屏）",
           0 <= _i_loaded < _i_doors, f"loaded@{_i_loaded} doors@{_i_doors}")
+
+    for _ui in _FakeUi._LIVE:                        # 收尸：不许靠 daemon 硬退
+        getattr(_ui, "stop", lambda: None)()
+    for _ui in _FakeUi._LIVE:
+        _ui.thread.join(2)
+    _leaked = [t.thread.name for t in _FakeUi._LIVE if t.thread.is_alive()]
+    check("替身的 UI 线程收得掉（哨兵退出，不靠 daemon 硬退）", not _leaked,
+          f"没收掉 {len(_leaked)} 条：{_leaked}")
 
     print("\n[20] schema 构造：一种注解只该长出**一份** schema（协议、表单、校验同源）")
     _s604 = kernel.build_schema(_probe_pep604)
@@ -2097,8 +2128,8 @@ def _run() -> int:
         cap = rt6.capabilities().get("assistant_read")
         real = (rt6.programs["assistant"].caps.get("read")
                 if rt6.programs.get("assistant") else None)
-        denied = [e for e in rt6.events
-                  if e.get("type") == "plugin.error" and e.get("pid") == "assistant"]
+        revoked = [e for e in rt6.events           # D8 里那个 denied 是 dispatch 结果，不是这个
+                   if e.get("type") == "plugin.error" and e.get("pid") == "assistant"]
         # 注意断言的不是「留一个带 error 的插件对象」：那种僵尸插件会让
         # program("assistant") 先查到 plugins 里那个目录，把内置程序劫持掉。
         # 正确形态是**根本不进 plugins**，并且用事件把原因说出来。
@@ -2106,8 +2137,8 @@ def _run() -> int:
               "assistant" not in rt6.plugins
               and rt6.programs.get("assistant") is not None
               and rt6.program("assistant") is rt6.programs.get("assistant")
-              and bool(denied),
-              f"plugins={sorted(rt6.plugins)} 事件={denied[-1:]!r}")
+              and bool(revoked),
+              f"plugins={sorted(rt6.plugins)} 事件={revoked[-1:]!r}")
         check("D2 声明与执行是同一份：assistant_read 声明的就是执行的那个",
               cap is not None and real is not None and cap.handler is real.handler,
               f"声明方={getattr(cap.handler, '__module__', None)!r}")
@@ -2168,7 +2199,9 @@ def _run() -> int:
     try:
         rt_log = kernel.Runtime(tmp7)
         rt_log.log_max = 4096                      # 阈值调小，别真写 5MB
-        for i in range(300):
+        # 事件条数按保留份数派生：改 LOG_KEEP 不该让这条断言变成「轮转次数不够」的假红
+        _N = max(300, (rt_log.log_keep + 2) * 80)
+        for i in range(_N):
             rt_log.publish("probe.tick", data={"i": i, "pad": "x" * 40})
         logs = tmp7 / "logs"
         cur = logs / "events.jsonl"
@@ -2192,12 +2225,13 @@ def _run() -> int:
         check("E1 事件日志按大小轮转（旧版：只 append，单文件能长到 48MB）",
               (logs / "events.jsonl.1").exists() and size <= rt_log.log_max,
               f"当前 {size}B / 上限 {rt_log.log_max}B，轮转出 {_names(logs)}{_cur_why}")
+        _keep = rt_log.log_keep
         check("E2 轮转份数有上限（不许长成无限多个 events.jsonl.N）",
-              (logs / "events.jsonl.2").exists()
-              and not (logs / "events.jsonl.3").exists(),
-              f"{_names(logs)}")
+              (logs / f"events.jsonl.{_keep}").exists()
+              and not (logs / f"events.jsonl.{_keep + 1}").exists(),
+              f"LOG_KEEP={_keep}，{_names(logs)}")
         check("E3 最新的那条一定还在当前文件里（轮转不许把「现在」丢掉）",
-              last_i == 299, f"末行 i={last_i!r}，共 {len(lines)} 行")
+              last_i == _N - 1, f"末行 i={last_i!r}（应到 {_N - 1}），共 {len(lines)} 行")
         check("E4 轮转之后每一行仍是完整的 JSON（半个事件比没有事件更坏）",
               parsed_ok and bool(lines), f"{len(lines)} 行，可解析={parsed_ok}")
 
