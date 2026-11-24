@@ -229,11 +229,6 @@ class Handler(BaseHTTPRequestHandler):
             # 内核认（hasUi=true、uiName 就是它），门不认（去开 ui/index.html），
             # 于是界面上是 iframe 里一段 {"error":"not found"}。白板，而且不报错。
             # 同一条事实算两遍，必然走岔。
-            # **界面入口只有一处判据：Plugin.ui** —— 它读的就是 plugin.json 的 ui。
-            # 这道门从前自己拼 "ui/index.html"：插件把入口写成 "ui/tool.html" 时，
-            # 内核认（hasUi=true、uiName 就是它），门不认（去开 ui/index.html），
-            # 于是界面上是 iframe 里一段 {"error":"not found"}。白板，而且不报错。
-            # 同一条事实算两遍，必然走岔。
             entry = plugin.ui
             if entry is None or plugin.ui_kind != "web":
                 # 原生程序只有 .py 窗口脚本：它跑在自己的进程里，不是网页。

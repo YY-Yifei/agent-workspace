@@ -432,6 +432,15 @@ def plugin_delete(pid: str, keep_data: bool = True) -> dict:
     # 后者会让 pid="../data" 解析到 <ws>/data 而通过，接着 rmtree 掉整个数据目录。
     if pdir.parent != (root / "plugins").resolve() or not pdir.is_dir():
         raise ValueError(f"没有插件 {pid}")
+    # 开发者模式开关是**目录之外**的状态（workspace/dev.json）：程序删了，那个
+    # true 还留在文件里，下一个同名插件一出现就悄悄带着开发者模式上岗。删程序的
+    # 时候一并收掉。顺序要紧：set_dev 对「不在 plugins 里」的 pid 会拒绝，所以
+    # 必须赶在 rmtree 之前。
+    try:
+        if _rt().dev_mode(pid):
+            _rt().set_dev(pid, False)
+    except Exception:                   # 开关收不掉也不许拦住删除本身
+        pass
     backup = None
     if keep_data and (pdir / "data").is_dir():
         backup = pdir.parent / f".trash-{pid}-data"

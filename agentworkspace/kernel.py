@@ -508,7 +508,15 @@ class Runtime:
             data = {}
         if not isinstance(data, dict):
             data = {}
-        data[pid] = bool(on)
+        if on:
+            data[pid] = True
+        else:
+            # dev.json 只记「**开着的**」：关掉就把条目删了。
+            # 为什么不是写成 false：删掉一个程序之后，那个条目没有任何东西会再清理它
+            # —— 它会以 "habit": false 的形状永远留在文件里（0.3.0 的工作区里就有一枚
+            # "habit": true，而 habit 这个程序早删了）。一个说不清来历的条目，比没有
+            # 条目更坏：下一次同名插件出现时，人是照着它做判断的。
+            data.pop(pid, None)
         tmp = self.dev_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.dev_path)                     # 原子换名：别留半份 JSON

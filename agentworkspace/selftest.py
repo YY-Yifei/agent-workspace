@@ -9,14 +9,16 @@ from __future__ import annotations
 import ast
 import json
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from . import kernel, server
+from . import fixtures, kernel, server
 from .link import Hub, Link
 from .server import App, serve
 
@@ -112,8 +114,50 @@ def _fixture_note() -> None:
               flush=True)
 
 
-def main() -> int:
-    _fixture_note()
+def main(argv: list[str] | None = None) -> int:
+    """自检入口：**默认在临时工作区里跑**，``--here`` 才动真工作区。
+
+    为什么默认隔离：这份自检里有一组断言验的是「内核 × 真实程序」的对接
+    （pomodoro 的 4 个能力、memo 的原生窗口）。那两个程序是**工作区数据**，不是
+    代码 —— 谁把它们删了（``workspace/plugins/.trash-*-data`` 就是删除残留），那
+    16 条就红着。红着不解释的质量门等于没有门：下一次真出问题，没人分得清
+    「数据缺了」和「代码坏了」。所以默认把 ``workspace/`` 只读复制一份、补上
+    fixture 再跑 —— 同一份代码在任何一台机器上给出同一份答案。
+
+    ``--here``  就在当前工作区里跑（真实的、有数据的那个）；缺数据的断言会如实
+                失败，并在开头说明「那是数据缺失，不是代码坏了」。
+    ``--keep``  保留临时工作区。默认规则：全绿就删，红了留着方便复查。
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    unknown = [a for a in args if a not in ("--here", "--keep")]
+    if unknown:
+        print(f"[用法] 不认识的参数：{unknown}（只认 --here / --keep）", flush=True)
+        return 2
+    here, keep = "--here" in args, "--keep" in args
+
+    global WS
+    tmp: Path | None = None
+    if here:
+        print(f"[当前工作区] {WS}（--here：不隔离，缺数据的断言会如实失败）", flush=True)
+        _fixture_note()
+    else:
+        tmp = Path(tempfile.mkdtemp(prefix="aw-selftest-"))
+        WS = fixtures.build(tmp)
+        print(f"[临时工作区] {WS}", flush=True)
+        print("        （workspace/ 的只读副本 + pomodoro/memo；--here 改测真工作区）",
+              flush=True)
+    try:
+        rc = _run()
+    finally:
+        if tmp is not None:
+            if keep or bad:
+                print(f"\n（临时工作区保留在 {tmp}，方便复查；确认后可删）", flush=True)
+            else:
+                shutil.rmtree(tmp, ignore_errors=True)
+    return rc
+
+
+def _run() -> int:
     print("[1] 内核：能力面，以及**按程序切开**")
     rt = kernel.Runtime(WS)
     from . import assistant
@@ -478,6 +522,15 @@ def main() -> int:
     pid = "mood" if "mood" in rt.plugins else next(iter(rt.plugins))
     for one in list(rt.plugins):                # 从干净的开关状态开始，别吃上一轮的残留
         rt.set_dev(one, False)
+    try:
+        dev_now = json.loads(rt.dev_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        dev_now = {}
+    # dev.json 只记「**开着的**」：关掉就删条目，不留 "xxx": false。
+    # 0.3.0 的工作区里就有一枚 "habit": true，而 habit 这个程序早删了 —— 一个说不清
+    # 来历的条目比没有条目更坏：下一次同名插件出现时，人是照着它做判断的。
+    check("关掉开关不留死条目（dev.json 只记「开着的」）",
+          not any(k in dev_now for k in rt.plugins), str(dev_now))
     check("开关不在程序目录里（它改坏自己时，人还得能把它关掉）",
           rt.dev_path.parent == WS and "plugins" not in rt.dev_path.parts,
           str(rt.dev_path))
@@ -626,11 +679,16 @@ def main() -> int:
         # 那是正确行为（[13b] 专门断言了它），不是版本化没生效 ——
         # 所以「多一版」必须用**内容真的变了**的写入来验，否则测到的是
         # 空提交的语义，不是版本化的语义。
-        n_before = len(_pv.versions(_pdir))
+        # versions() 默认只取 20 条（那是给人看的一页）。用在「多一版」这个
+        # 判据上就是**假红**：[13] 挑的 pid 是 next(iter(rt.plugins))，未必是刚
+        # 建的 —— 实测 dingtalk 在临时工作区里被写到 21 版，len(versions()) 于是
+        # 恒等于 20，"多一版"永远看不见。判据要的是「链长了」，就得看全链。
+        _ALLV = 10 ** 6
+        n_before = len(_pv.versions(_pdir, limit=_ALLV))
         grow = bp2.read_text(encoding="utf-8") + "\n# selftest: 让内容真的变化\n"
         res_g = rt.dispatch("dev", "plugin_write", {"files": {"backend.py": grow}},
                             source="agent", caller=pid)
-        n_ok = len(_pv.versions(_pdir))
+        n_ok = len(_pv.versions(_pdir, limit=_ALLV))
         check("成功写入（内容真的变了）→ 历史多一版（懒触发：不是启动时建仓）",
               res_g.status == "ok" and n_ok == n_before + 1,
               f"{res_g.status}: {n_before} → {n_ok}")
@@ -639,8 +697,8 @@ def main() -> int:
                           {"files": {"backend.py": "def broken(: pass\n"}},
                           source="agent", caller=pid)
         check("校验失败的那一次**不入历史**（历史里只有真的成了的版本）",
-              res.status == "error" and len(_pv.versions(_pdir)) == n_bad0,
-              f"{res.status}: {len(_pv.versions(_pdir))} 版")
+              res.status == "error" and len(_pv.versions(_pdir, limit=_ALLV)) == n_bad0,
+              f"{res.status}: {len(_pv.versions(_pdir, limit=_ALLV))} 版")
 
         # 四个动词经内核真调一遍：读历史、看某一版、看差别
         v_list = rt.dispatch("dev", "versions", {}, source="agent", caller=pid)
