@@ -1363,10 +1363,21 @@ def _run() -> int:
             self.ui.post(action)
 
     class _WVNoAffinity:
-        """不像 WinForms：问不到线程亲和性。"""
+        """不像 WinForms：问不到线程亲和性。
+
+        除了「没写」，还要记「碰了没」：拿不到亲和性时的正确做法是**什么都不碰**，
+        连读 ``.CoreWebView2`` 都不该做（读到的是 COM 对象，跨线程一样不安全）。
+        只断言「没写」的话，一个只读不写的实现会假绿 —— 这正是这一条要堵的洞。
+        """
 
         def __init__(self) -> None:
-            self.CoreWebView2 = _Core()
+            self.touched = 0
+            self._core = _Core()
+
+        @property
+        def CoreWebView2(self):
+            self.touched += 1                 # 被测代码每读一次就记一次
+            return self._core
 
     class _Native:
         def __init__(self, wv) -> None:
@@ -1427,9 +1438,11 @@ def _run() -> int:
 
     _w6 = _Win(_WVNoAffinity())
     _ok6n, _why6n = sh.open_copy_doors(_w6, debug=False)
-    check("问不到线程亲和性时：宁可不设，也不在未知线程上碰 COM",
-          _ok6n is False and bool(_why6n)
-          and _w6.native.webview.CoreWebView2.Settings.log == [], str(_why6n))
+    _touched6 = _w6.native.webview.touched          # 先取计数：下面的断言自己也会读一次
+    check("问不到线程亲和性时：宁可不设，也不在未知线程上碰 COM（连读都不读）",
+          _ok6n is False and bool(_why6n) and _touched6 == 0
+          and _w6.native.webview.CoreWebView2.Settings.log == [],
+          f"{_why6n} touched={_touched6}")
 
     class _Broken:
         @property
@@ -1441,9 +1454,18 @@ def _run() -> int:
           _okc3 is False and bool(_why3), str(_why3)[:80])
 
     # ---- 源码判据：把「为什么必须投递」钉在 pywebview 自己的代码上，而不是我的复述
+    # try **只裹读文件**。以前 check 也裹在里面：任何一条断言自己抛异常（键不存在、
+    # 正则没匹配上），except 就把它吞成一条「跳过：…」的**绿**。读不到才是跳过的
+    # 理由，断言失败永远不是。
+    _srcs_ok, _srcs_why = True, ""
     try:
         _ev_src = (_wvdir / "event.py").read_text(encoding="utf-8")
         _edge_src = (_wvdir / "platforms" / "edgechromium.py").read_text(encoding="utf-8")
+    except OSError as exc:
+        _srcs_ok, _srcs_why = False, f"{type(exc).__name__}: {exc}"
+        _ev_src = _edge_src = ""
+    check("pywebview 源码可读（读不到这一节就一条都验不了）", _srcs_ok, _srcs_why)
+    if _srcs_ok:
         check("pywebview 的 loaded 事件没开 should_lock（closing 开了，对照）",
               "self.events.loaded = Event(self)" in _win_src
               and "self.events.closing = Event(self, True)" in _win_src, "")
@@ -1456,8 +1478,6 @@ def _run() -> int:
         check("它从别的线程碰控件时一律 Invoke 投递（我们与它同一手法）",
               "self.webview.Invoke(" in _edge_src
               and "must be accessed in the main thread" in _edge_src, "")
-    except Exception as exc:
-        check("pywebview 源码可读（读不到就跳过源码判据）", True, f"跳过：{exc}")
 
     # ---- 顺序：开门是装潢，不许决定「窗口成没成」
     _i_loaded = sh_src.find("loaded.set()")
@@ -2271,6 +2291,11 @@ def _run() -> int:
         fine.__module__ = mod.__name__
         mod.__dict__.update({"_hidden": _hidden, "Read": Read, "fine": fine})
 
+        # 名字合规、是小写、是函数 —— 唯一能拦住它的是「__module__ 不是本模块」。
+        # 上一版这里是 probe_IMPORTED（大写），wire 正则先就把它拒了，于是那一条
+        # 判据从来没被验过：删掉 __module__ 检查，F2 照样绿。
+        mod.__dict__["imported_lower"] = _probe_bare
+
         rt_f = kernel.Runtime(tmp10)
         rt_f.mount(mod, pid="probe")
         names = sorted(rt_f.capabilities())
@@ -2279,8 +2304,10 @@ def _run() -> int:
         check("F1 mount 遇到非法 wire 名不再静默：只收合法的，并把原因说出来",
               names == ["probe_fine"] and bool(denied),
               f"能力={names} 事件={denied[-1:]!r}")
-        check("F2 私有函数与导入进来的函数都不变成能力",
-              "probe__hidden" not in names and "probe_IMPORTED" not in names, str(names))
+        check("F2 私有函数与导入进来的函数都不变成能力"
+              "（imported_lower 名字完全合法，只有 __module__ 那条能拦住它）",
+              "probe__hidden" not in names and "probe_imported_lower" not in names,
+              str(names))
 
         mod2 = _types.ModuleType("aw_probe_dev")
 
