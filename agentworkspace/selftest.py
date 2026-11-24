@@ -2026,6 +2026,12 @@ def _run() -> int:
     try:
         ws6 = fixtures.build(tmp6)
         (ws6 / "probe.txt").write_text("PLAIN-FILE", encoding="utf-8")
+        # assistant.install 会把 toolbox._RT / devtools._RT 指到这个**临时**工作区上，
+        # 而本段结束就 rmtree。不还原的话，后面任何一次用到那两把「手」，
+        # 都在对着一个已经不存在的目录干活：要么凭空建出一个空目录（断言在空地上
+        # 全绿），要么报一个跟被测代码毫无关系的错。所以先存后还。
+        from . import devtools as _devtools
+        _prev_tb, _prev_dv = toolbox._RT, _devtools._RT
         rt6 = kernel.Runtime(ws6)
         assistant.install(rt6)
         rt6.scan()
@@ -2100,6 +2106,10 @@ def _run() -> int:
               allowed.status == "ok" and denied.status == "rejected",
               f"{allowed.status} → {denied.status}")
     finally:
+        toolbox._RT, _devtools._RT = _prev_tb, _prev_dv        # 交还原处，不留悬空引用
+        check("D9 临时工作区用完就把内核全局交还原处（后面几节不许对着死目录干活）",
+              toolbox._RT is _prev_tb and _devtools._RT is _prev_dv,
+              f"toolbox._RT={getattr(toolbox._RT, 'root', None)!r}")
         shutil.rmtree(tmp6, ignore_errors=True)
 
     # E 段：事件日志必须有**上界**。
