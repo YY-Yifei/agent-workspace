@@ -11,6 +11,7 @@ import asyncio
 import enum
 import inspect
 import json
+import queue
 import re
 import shutil
 import sys
@@ -1273,34 +1274,107 @@ def _run() -> int:
           "selectionchange" in html_src and "threadDirty = false" in html_src, "")
 
     # 真代码路径 + 假 WebView2：不猜「应该会设上」，而是调一次看它设了什么
+    #
+    # 替身必须**带线程亲和性**。真实控件是 WinForms 控件，从别的线程碰它就是跨线程 COM；
+    # 旧的替身只有 CoreWebView2.Settings 三个字段，没有 InvokeRequired / BeginInvoke ——
+    # 于是「在非 UI 线程上直接碰控件」这件事在测试里**根本不存在**，[19] 全绿说明不了任何事。
+    # 这一版让替身自己跑一条消息循环：BeginInvoke 的活真的由另一条线程执行。
+    class _FakeUi:
+        """一条真的在跑消息循环的线程（模拟 WinForms 的 UI 线程）。"""
+
+        def __init__(self, responsive: bool = True) -> None:
+            self.responsive = responsive
+            self.q: queue.Queue = queue.Queue()
+            self.thread = threading.Thread(target=self._loop, name="fake-ui", daemon=True)
+            self.thread.start()
+
+        def _loop(self) -> None:
+            while True:
+                job = self.q.get()
+                if job is None:
+                    return
+                job()
+
+        def post(self, job) -> None:
+            if self.responsive:      # 不响应 = 消息循环卡着，投递进去石沉大海
+                self.q.put(job)
+
+        def call(self, fn):
+            """在 UI 线程上跑 fn，并把结果/异常带回调用者（模拟「人点了一下」）。"""
+            box: dict = {}
+            done = threading.Event()
+
+            def _job() -> None:
+                try:
+                    box["v"] = fn()
+                except BaseException as exc:   # noqa: BLE001 —— 要原样带回给调用者
+                    box["e"] = exc
+                finally:
+                    done.set()
+
+            self.q.put(_job)
+            done.wait(5)
+            if "e" in box:
+                raise box["e"]
+            return box.get("v")
+
     class _Settings:
         """字段名与 ``CoreWebView2.Settings`` **逐字一致**。
 
         为什么要专门写这句：第一次写成了 ctx/acc/dev，``open_copy_doors`` 照样返回
         True（Python 允许给任意对象加属性），断言却全是 None —— 那是一份假绿。
         替身的字段名错一个字母，这节测试就变成了空转。
+
+        每个写入都记下**是哪条线程写的** —— 这一轮的全部判据都在那一列上。
         """
 
         def __init__(self) -> None:
-            self.AreDefaultContextMenusEnabled = None
-            self.AreBrowserAcceleratorKeysEnabled = None
-            self.AreDevToolsEnabled = None
+            # 全部走 object.__setattr__：初始化**不是**被测代码的写入，不许进 log。
+            object.__setattr__(self, "log", [])
+            object.__setattr__(self, "AreDefaultContextMenusEnabled", None)
+            object.__setattr__(self, "AreBrowserAcceleratorKeysEnabled", None)
+            object.__setattr__(self, "AreDevToolsEnabled", None)
+
+        def __setattr__(self, name: str, value: object) -> None:
+            self.log.append((name, value, threading.current_thread().name))
+            object.__setattr__(self, name, value)
+
+        def writers(self) -> set:
+            return {t for _, _, t in self.log}
 
     class _Core:
         def __init__(self) -> None:
             self.Settings = _Settings()
 
     class _WV:
+        """像 WinForms 控件那样如实回答「你现在是不是在我的线程上」。"""
+
+        def __init__(self, ui: "_FakeUi | None" = None, responsive: bool = True) -> None:
+            self.CoreWebView2 = _Core()
+            self.ui = ui if ui is not None else _FakeUi(responsive)
+            self.posted = 0
+
+        @property
+        def InvokeRequired(self) -> bool:
+            return threading.current_thread() is not self.ui.thread
+
+        def BeginInvoke(self, action) -> None:
+            self.posted += 1
+            self.ui.post(action)
+
+    class _WVNoAffinity:
+        """不像 WinForms：问不到线程亲和性。"""
+
         def __init__(self) -> None:
             self.CoreWebView2 = _Core()
 
     class _Native:
-        def __init__(self) -> None:
-            self.webview = _WV()
+        def __init__(self, wv) -> None:
+            self.webview = wv
 
     class _Win:
-        def __init__(self) -> None:
-            self.native = _Native()
+        def __init__(self, wv=None) -> None:
+            self.native = _Native(wv if wv is not None else _WV())
 
     _w1 = _Win()
     _okc, _why = sh.open_copy_doors(_w1, debug=False)
@@ -1317,6 +1391,46 @@ def _run() -> int:
     check("debug=True 时才放 DevTools 出去",
           _w2.native.webview.CoreWebView2.Settings.AreDevToolsEnabled is True, "")
 
+    # ---- 线程：这个回归的全部内容
+    _w3 = _Win()
+    _caller = threading.current_thread().name
+    _ok3n, _why3n = sh.open_copy_doors(_w3, debug=False)
+    _s3 = _w3.native.webview.CoreWebView2.Settings
+    check("不在 UI 线程时：设置**确实被投递**过去（BeginInvoke 一次，不多不少）",
+          _ok3n and _w3.native.webview.posted == 1,
+          f"{_ok3n} {_why3n} posted={_w3.native.webview.posted}")
+    check("不在 UI 线程时：三个字段都由 UI 线程写，调用线程一个都没碰",
+          _s3.writers() == {"fake-ui"} and _caller != "fake-ui",
+          f"writers={_s3.writers()} caller={_caller}")
+
+    _w4 = _Win()
+    _ok4n = _w4.native.webview.ui.call(lambda: sh.open_copy_doors(_w4, debug=False))
+    check("已经在 UI 线程时：就地设，**不投递给自己**（投递自己 = 自己等自己）",
+          _w4.native.webview.posted == 0
+          and _w4.native.webview.CoreWebView2.Settings.AreDefaultContextMenusEnabled is True,
+          f"posted={_w4.native.webview.posted} result={_ok4n}")
+
+    _w5 = _Win(_WV(responsive=False))
+    _t5 = time.perf_counter()
+    try:
+        _ok5n, _why5n = sh.open_copy_doors(_w5, debug=False, timeout=0.3)
+    except TypeError as _exc5:
+        # 旧实现连这个参数都没有 —— 那是「红」，不许升级成「炸」（整节被别人带走）。
+        _ok5n, _why5n = True, f"TypeError: {_exc5}"
+    _dt5 = time.perf_counter() - _t5
+    check("UI 线程不响应时：有界放弃，不把外壳的启动拖住",
+          _ok5n is False and _dt5 < 2.0 and "0.3" in _why5n,
+          f"{_dt5*1000:.0f}ms {_why5n}")
+    check("UI 线程不响应时：一个字段都没被写（不留半开状态）",
+          _w5.native.webview.CoreWebView2.Settings.log == [],
+          str(_w5.native.webview.CoreWebView2.Settings.log))
+
+    _w6 = _Win(_WVNoAffinity())
+    _ok6n, _why6n = sh.open_copy_doors(_w6, debug=False)
+    check("问不到线程亲和性时：宁可不设，也不在未知线程上碰 COM",
+          _ok6n is False and bool(_why6n)
+          and _w6.native.webview.CoreWebView2.Settings.log == [], str(_why6n))
+
     class _Broken:
         @property
         def native(self):
@@ -1325,6 +1439,31 @@ def _run() -> int:
     _okc3, _why3 = sh.open_copy_doors(_Broken(), debug=False)
     check("拿不到 native 不抛异常（页面里还有兜底）",
           _okc3 is False and bool(_why3), str(_why3)[:80])
+
+    # ---- 源码判据：把「为什么必须投递」钉在 pywebview 自己的代码上，而不是我的复述
+    try:
+        _ev_src = (_wvdir / "event.py").read_text(encoding="utf-8")
+        _edge_src = (_wvdir / "platforms" / "edgechromium.py").read_text(encoding="utf-8")
+        check("pywebview 的 loaded 事件没开 should_lock（closing 开了，对照）",
+              "self.events.loaded = Event(self)" in _win_src
+              and "self.events.closing = Event(self, True)" in _win_src, "")
+        check("should_lock=False 时 Event.set 起一条**新线程**跑 handler",
+              "def __init__(self, window, should_lock: bool = False)" in _ev_src
+              and "t = threading.Thread(target=execute)" in _ev_src, "")
+        check("pywebview 自己只在 on_webview_ready（UI 线程）里设这批 settings",
+              "def on_webview_ready" in _edge_src
+              and "settings.AreDefaultContextMenusEnabled = _state['debug']" in _edge_src, "")
+        check("它从别的线程碰控件时一律 Invoke 投递（我们与它同一手法）",
+              "self.webview.Invoke(" in _edge_src
+              and "must be accessed in the main thread" in _edge_src, "")
+    except Exception as exc:
+        check("pywebview 源码可读（读不到就跳过源码判据）", True, f"跳过：{exc}")
+
+    # ---- 顺序：开门是装潢，不许决定「窗口成没成」
+    _i_loaded = sh_src.find("loaded.set()")
+    _i_doors = sh_src.find("open_copy_doors(window, debug)")
+    check("loaded.set() 在开门之前（开门出事也不能让外壳判成白屏）",
+          0 <= _i_loaded < _i_doors, f"loaded@{_i_loaded} doors@{_i_doors}")
 
     print("\n[20] schema 构造：一种注解只该长出**一份** schema（协议、表单、校验同源）")
     _s604 = kernel.build_schema(_probe_pep604)

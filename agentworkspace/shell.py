@@ -37,6 +37,25 @@ pywebview 默认把「选中文字」这件事关掉了 —— ``create_window``
 这里同时做兼容：老版本 pywebview 不认 ``text_select`` 参数（会 TypeError），
 那就退回不传 —— 页面里还有一层 ``user-select:text`` 与 Ctrl+C 兜底，
 不至于因为版本差一个参数就整页复制不了。
+
+**为什么那几项设置必须投递到 UI 线程**（第三十五轮的账 —— 一次真正的回归）：
+
+pywebview 的事件**不在 UI 线程上跑**。``window.events.loaded = Event(self)``
+（6.2.1 ``window.py:164``）没传 ``should_lock``，而 ``should_lock=False`` 时
+``Event.set`` 是 ``threading.Thread(target=execute).start()``（``event.py``）——
+handler 永远落在一条**新线程**里，``set()`` 的调用者是谁都不影响。
+所以「在 loaded 的 handler 里直接碰 ``CoreWebView2.Settings``」这件事，
+从头到尾就是一次**跨线程 COM 调用**。
+
+pywebview 自己从不这么干：这批 settings 它只在 ``on_webview_ready``
+（CoreWebView2InitializationCompleted，UI 线程）里设（``edgechromium.py:286-296``），
+别处一律 ``self.webview.Invoke(...)`` 投递过去（同文件 :152、:175），
+并在注释里引了 WebView2Feedback#1976：
+「cookies must be accessed in the main thread, otherwise an exception is thrown」。
+
+所以这里也照办：``_on_ui_thread`` 先问 ``InvokeRequired``，已经在 UI 线程就就地做，
+否则 ``BeginInvoke`` 投递并**有界**地等。有界是底线 —— 这几项设置只是装潢，
+不该有任何一条路径能让外壳的启动卡住。
 """
 
 from __future__ import annotations
@@ -47,6 +66,7 @@ from pathlib import Path
 TITLE = "我的工作区"
 LOAD_TIMEOUT = 12.0          # 页面 12 秒还没 loaded，就判定为白屏
 MARGIN = 40                  # 窗口离工作区边缘留一点，别贴着任务栏
+UI_WAIT = 2.0                # 投递到 UI 线程后最多等这么久（有界，绝不无限等）
 
 
 def work_area() -> tuple[int, int, int, int]:
@@ -76,23 +96,85 @@ def fit(width: int, height: int, area: tuple[int, int, int, int] | None = None
     return ax + max(0, (aw - w) // 2), ay + max(0, (ah - h) // 2), w, h
 
 
-def open_copy_doors(window, debug: bool = False) -> tuple[bool, str]:
+def _on_ui_thread(control, func, timeout: float = UI_WAIT) -> tuple[bool, str]:
+    """在 ``control`` 所属的那条线程上执行 ``func``；**有界**等待，绝不无限挂。
+
+    返回 (是否真的执行完, 说明)。说明只给日志与测试看 —— 失败不是错误：
+    这几项设置只是装潢，改不到还有页面侧兜底。
+
+    三条判据，缺一条就退化成本轮要修的那个 bug：
+      1. ``InvokeRequired`` 先问。已经在 UI 线程就地做 —— 投递给**自己**
+         就是自己等自己，那才是最经典的那种死锁。
+      2. 拿不到 ``InvokeRequired``（不是 WinForms 控件 / 平台不同）就**什么都不碰**：
+         无法确认线程亲和性时碰 COM 是拿启动去赌。
+      3. 投递之后只等 ``timeout``，不等它一辈子。``Control.Invoke``（同步版）
+         没有超时重载，所以这里用 ``BeginInvoke`` + 自己等。
+    """
+    try:
+        need = bool(control.InvokeRequired)
+    except Exception as exc:            # 没有线程亲和性可问
+        return False, f"{type(exc).__name__}: 拿不到线程亲和性，不碰控件"
+
+    if not need:                        # 已经在这条线程上
+        try:
+            func()
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+        return True, "inline"
+
+    done = threading.Event()
+    box: dict[str, BaseException] = {}
+
+    def _run() -> None:                 # 这一段在 UI 线程上跑
+        try:
+            func()
+        except BaseException as exc:
+            box["err"] = exc
+        finally:
+            done.set()
+
+    try:
+        try:
+            from System import Action       # pythonnet：控件要的是 Delegate，不是 callable
+            delegate = Action(_run)
+        except Exception:
+            delegate = _run
+        control.BeginInvoke(delegate)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+    if not done.wait(timeout):
+        return False, f"UI 线程 {timeout:g}s 内没有执行，已放弃"
+    err = box.get("err")
+    if err is not None:
+        return False, f"{type(err).__name__}: {err}"
+    return True, "ui-thread"
+
+
+def open_copy_doors(window, debug: bool = False, timeout: float = UI_WAIT) -> tuple[bool, str]:
     """把「选中 → 复制」那两道被 pywebview 关掉的闸打开。
 
     返回 (是否真的改到了, 说明) —— 这个返回值只给测试与日志用：
     改不到**不是错误**（别的平台没有 CoreWebView2），页面侧还有兜底。
 
     DevTools 仍然跟随 ``debug``：不因为要能复制就把 F12 一起送出去。
+
+    整个 COM 访问都发生在 UI 线程的闭包里：``window.native`` 是 Python 属性
+    （读它不碰 COM），``.webview`` 是 .NET 对象（同进程直接拿），
+    ``CoreWebView2.Settings`` 才是第一处**必须**在 UI 线程上碰的东西。
     """
     try:
-        core = window.native.webview.CoreWebView2
-        s = core.Settings
+        control = window.native.webview          # 只是拿引用，还没碰 COM
+    except Exception as exc:                    # 拿不到 native / 不是 WebView2
+        return False, f"{type(exc).__name__}: {exc}"
+
+    def _apply() -> None:                       # ← 这一整段都在 UI 线程上跑
+        s = control.CoreWebView2.Settings
         s.AreDefaultContextMenusEnabled = True      # 右键 → 复制
         s.AreBrowserAcceleratorKeysEnabled = True  # Ctrl+C / Ctrl+A
         s.AreDevToolsEnabled = bool(debug)         # 仍然不给调试器
-        return True, "webview2 settings applied"
-    except Exception as exc:                        # 拿不到 native / 不是 WebView2
-        return False, f"{type(exc).__name__}: {exc}"
+
+    return _on_ui_thread(control, _apply, timeout)
 
 
 def run(url: str, *, title: str = TITLE, width: int = 1180, height: int = 800,
@@ -120,10 +202,13 @@ def run(url: str, *, title: str = TITLE, width: int = 1180, height: int = 800,
                                            **common)
 
         def _on_loaded() -> None:          # 页面真的渲染出来了
-            # 这两项设置只在 WebView2 上存在，而且必须等 CoreWebView2 就绪
-            # （正是 loaded 的这一刻）。改不到就算了 —— 页面里有兜底。
-            open_copy_doors(window, debug)
+            # 先把自己这件事办完：这个 handler 跑在 pywebview 新起的线程上，
+            # 下面的开门是要投递到 UI 线程去的 —— 万一它卡住/超时，
+            # 也**不能**连累「窗口到底成没成」这个判定（那是白屏判据，不是装潢）。
             loaded.set()
+            # 这两项设置只在 WebView2 上存在，而且必须等 CoreWebView2 就绪
+            # （正是 loaded 的这一刻），并且**必须回到 UI 线程**去设。改不到就算了。
+            open_copy_doors(window, debug)
 
         # pywebview 的事件是**可 += 的对象**，不是装饰器。
         # 写成 @window.events.loaded 会直接抛 TypeError，外面看见的就是「不可用」——
