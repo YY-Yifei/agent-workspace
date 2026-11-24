@@ -648,6 +648,13 @@ class Runtime:
         # 或者拿到半新半旧的能力面（version 与实际能力不一致）。
         # 先在副本上做完，最后整体换掉 —— 读侧要么看到旧的整份，要么看到新的整份。
         plugins = dict(self.plugins)
+        # wire 重名必须在装载时判（理由见 _collect_caps）。注意 self.plugins
+        # 在整轮扫描里是不动的（要整体换掉），所以「本次扫描里先装好的那个」
+        # 只能从这张局部表里看见 —— 少了它，两个新插件互相撞名谁都判不出来。
+        taken: dict[str, Capability] = {c.wire: c for c in self.builtins.values()}
+        for q in plugins.values():
+            for c in q.caps.values():
+                taken[c.wire] = c
         rejected: dict[str, str] = {}
         if self.plugins_dir.is_dir():
             for d in sorted(self.plugins_dir.iterdir()):
@@ -667,9 +674,10 @@ class Runtime:
                 if old is not None and getattr(old, "_stamp", None) == stamp:
                     continue
                 p = Plugin(d)
-                self._load(p)
+                self._load(p, taken)
                 p._stamp = stamp                            # type: ignore[attr-defined]
                 plugins[d.name] = p
+                taken.update({c.wire: c for c in p.caps.values()})
                 changed = True
                 self.publish("plugin.loaded", pid=d.name,
                              data={"title": p.title, "functions": [c.wire for c in p.caps.values()],
@@ -689,7 +697,7 @@ class Runtime:
         files = sorted(d.glob("backend.py")) + sorted(d.glob("plugin.json"))
         return tuple((f.name, f.stat().st_mtime_ns) for f in files if f.exists())
 
-    def _load(self, p: Plugin) -> None:
+    def _load(self, p: Plugin, taken: dict[str, Capability] | None = None) -> None:
         if p.pid in RESERVED_PIDS:
             p.error = reserved_reason(p.pid)
             self.publish("plugin.error", pid=p.pid, data={"error": p.error})
@@ -715,9 +723,12 @@ class Runtime:
             return
         p.module = mod
         p.caps, problems = self._collect_caps(
-            mod, p.pid, int(p.manifest.get("timeoutMs", 15_000)))
+            mod, p.pid, int(p.manifest.get("timeoutMs", 15_000)), taken)
         if problems:
             p.error = ((p.error + "；") if p.error else "") + "；".join(problems)
+            # 与保留名那条同形：拒收要发事件，而不是只在 p.error 里留一句
+            # 等着谁翻 plugin.loaded 的 data。人看不见的错误等于没发生。
+            self.publish("plugin.error", pid=p.pid, data={"error": p.error})
 
     # -- 能力面 -------------------------------------------------------
     def _registry(self) -> dict[str, Capability]:
@@ -840,7 +851,8 @@ class Runtime:
         return self.plugins.get(pid) or self.programs.get(pid)
 
     @staticmethod
-    def _collect_caps(mod, pid: str, timeout_ms: int
+    def _collect_caps(mod, pid: str, timeout_ms: int,
+                      taken: dict[str, Capability] | None = None
                       ) -> tuple[dict[str, Capability], list[str]]:
         """一个模块 → 一套能力，以及**没能变成能力的原因**。
 
@@ -855,6 +867,15 @@ class Runtime:
           * 是函数（模块里的常量、类、导入的对象都不是）
           * ``__module__`` 就是这个模块（``import time`` 进来的不是能力）
           * ``<pid>_<fn>`` 匹配 aaas 的 function 名约束（大写开头会掉队）
+          * 这个名字**还没有主**（见 ``taken``）
+
+        最后一条是后补的：pid 与函数名是**两段独立取值**，拼起来的 wire 会撞 ——
+        插件目录叫 ``assistant_plugin``、函数叫 ``delete``，就与内置小助理的
+        ``plugin_delete`` 撞成同一个 ``assistant_plugin_delete``。而 ``_registry()``
+        里插件是覆盖内置的，于是模型看到的声明来自内置、跑起来的函数来自插件，
+        调用还会因为 pid 不匹配被拒（"「assistant」没有能力 plugin_delete"）——
+        一条能力凭空消失，三处都说不出来是谁干的。所以判在装载处：
+        ``taken`` 里有主就拒收这一个函数，别的函数照常装。
         """
         caps: dict[str, Capability] = {}
         problems: list[str] = []
@@ -867,6 +888,10 @@ class Runtime:
             wire = f"{pid}_{fn_name}"
             if not WIRE_NAME_RE.match(wire):
                 problems.append(f"{wire} 不是合法能力名")
+                continue
+            owner = (taken or {}).get(wire)
+            if owner is not None and owner.pid != pid:      # 自己重装自己不算撞
+                problems.append(f"{wire} 已被「{owner.pid}」的 {owner.fn} 占用，本次不装载")
                 continue
             doc = inspect.getdoc(obj) or ""
             caps[fn_name] = Capability(
@@ -886,7 +911,7 @@ class Runtime:
         prog = self.programs.get(pid) or BuiltinProgram(pid, program or {})
         if program:
             prog.meta.update(program)
-        caps, problems = self._collect_caps(mod, pid, timeout_ms)
+        caps, problems = self._collect_caps(mod, pid, timeout_ms, self._registry())
         for fn_name, cap in caps.items():
             prog.caps[fn_name] = cap
             self.builtins[(pid, fn_name)] = cap
@@ -913,7 +938,7 @@ class Runtime:
         多出来的一双手，不是用户多出来的一个应用 —— 摆进左侧栏就是在说
         「你还有个叫开发者的程序」，那是谎话。
         """
-        caps, problems = self._collect_caps(mod, DEV_PID, timeout_ms)
+        caps, problems = self._collect_caps(mod, DEV_PID, timeout_ms, self._registry())
         self.devtools.update(caps)
         added = [c.wire for c in caps.values()]
         if problems:
