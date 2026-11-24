@@ -147,16 +147,24 @@ def read(path: str, offset: int = 1, limit: int = SHOW_LIMIT) -> dict:
     return toolbox.read(path, offset=offset, limit=min(int(limit or SHOW_LIMIT), SHOW_MAX))
 
 
-def search(pattern: str, path: str = ".", limit: int = 30) -> dict:
+def search(pattern: str, path: str = ".", limit: int = 30, regex: bool = False,
+           ignore_case: bool = False, glob: str = "", context: int = 0) -> dict:
     """在工作区里按文本检索，返回「文件:行号: 内容」。
 
-    pattern: 要找的文本
+    pattern: 要找的文本（regex=True 时是正则）
     path: 检索起点（相对工作区），默认整个工作区
-    limit: 最多返回多少条
+    limit: 最多返回多少条命中
+    regex: 按正则解释 pattern（默认纯文本子串）
+    ignore_case: 忽略大小写
+    glob: 只看文件名匹配它的，如 *.py / plugins/*/backend.py
+    context: 每条命中额外带几行上下文（0~5）
+
+    和 ``dev_read`` 一样是**只读**的；返回里的 truncated 说明「到 limit 就停了」，
+    别把「给了 30 条」当成「一共 30 条」。
     """
     from . import toolbox
 
-    return toolbox.search(pattern, path, limit)
+    return toolbox.search(pattern, path, limit, regex, ignore_case, glob, context)
 
 
 # ------------------------------------------------------------------ 史

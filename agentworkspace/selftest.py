@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Literal, Optional
 from urllib.request import Request, urlopen
 
-from . import fixtures, kernel, server
+from . import fixtures, kernel, server, toolbox
 from .link import Hub, Link
 from .server import App, serve
 
@@ -1375,6 +1375,163 @@ def _run() -> int:
                 if not s.get("type") and "enum" not in s]
     check(f"真实能力面 {len(rt.capabilities())} 项里没有「无 type 无 enum」的参数",
           not _untyped, str(_untyped[:4]))
+
+    print("\n[21] 两把老手（search / shell）：不许**静默**地少给、错给、或把我们自己干的当成命令的失败")
+    from types import SimpleNamespace
+
+    tmp2 = Path(tempfile.mkdtemp(prefix="aw-21-"))
+    prev_rt = toolbox._RT
+    toolbox._install(SimpleNamespace(root=tmp2))
+
+    def _try(fn, /, *a, **kw) -> tuple[object, str]:
+        """调一次，把异常变成字符串 —— 断言要红，不能把整节带走。"""
+        try:
+            return fn(*a, **kw), ""
+        except Exception as exc:                        # noqa: BLE001
+            return None, f"{type(exc).__name__}: {exc}"
+
+    def _g(r, k, d=None):
+        """只从 dict 里取，缺键给默认 —— 病还在的时候要**红**，不许 KeyError 炸掉整节。"""
+        return r.get(k, d) if isinstance(r, dict) else d
+
+    try:
+        (tmp2 / "a.txt").write_text("alpha\nbeta\nGamma\n", encoding="utf-8")
+        (tmp2 / "s.py").write_text("TODO-1\n", encoding="utf-8")
+        (tmp2 / "s.js").write_text("TODO-2\n", encoding="utf-8")
+
+        # ---------------- search：错给与少给
+        _r, _e = _try(toolbox.search, "")
+        check("空 pattern 报错（空串命中每一行，那不是检索）", _e != "", f"返回了：{_r}")
+
+        _r, _e = _try(toolbox.search, "Gamma", ".", 30, False, True)
+        check("ignore_case：小写 pattern 能命中大写内容",
+              _e == "" and _g(_r, "count") == 1, _e or str(_r)[:120])
+
+        _r, _e = _try(toolbox.search, "G.mm.", ".", 30, True)
+        check("regex：按正则解释 pattern",
+              _e == "" and _g(_r, "count") == 1, _e or str(_r)[:120])
+
+        _r, _e = _try(toolbox.search, "[", ".", 30, True)
+        check("regex 写错时给得出人话（而不是 re.error 原样冒出来），且指名 pattern",
+              _e != "" and "正则" in _e, _e)
+
+        _r, _e = _try(toolbox.search, "TODO", ".", 30, False, False, "*.py")
+        _txt = _g(_r, "text", "")
+        check("glob：只看匹配的文件名（*.py 不该把 s.js 算进来）",
+              _e == "" and _g(_r, "count") == 1 and "s.py" in _txt and "s.js" not in _txt,
+              _e or _txt[:160])
+
+        (tmp2 / "ctx.txt").write_text("one\nTODO-3\nthree\n", encoding="utf-8")
+        _r, _e = _try(toolbox.search, "TODO-3", ".", 30, False, False, "", 1)
+        _ctx = _g(_r, "text", "")
+        check("context：命中前后各带一行（grep -C：`:` 是命中、`-` 是上下文）",
+              _e == "" and ":1- one" in _ctx and ":3- three" in _ctx
+              and ":2: TODO-3" in _ctx, _e or _ctx[:200])
+
+        # ---------------- search：不许把二进制 / 超大 / data 的静默当「没有命中」
+        (tmp2 / "bin.dat").write_bytes(b"\x00\x01TODO\xff" + b"\x00" * 64)
+        _r, _e = _try(toolbox.search, "TODO", "bin.dat")
+        check("二进制文件不当文本搜（NUL 就没有「行」这回事）",
+              _e == "" and _g(_r, "count") == 0, _e or str(_r)[:120])
+
+        big = tmp2 / "big.txt"
+        big.write_text(("x" * 100 + "\n") * 5000 + "NEEDLE\n", encoding="utf-8")
+        _r, _e = _try(toolbox.search, "NEEDLE", "big.txt")
+        check("超 400KB 的文件跳过时**说明**跳过了（不许一句「没有命中」了事）",
+              _e == "" and _g(_r, "count") == 0
+              and any("KB" in n for n in (_g(_r, "notes") or [])), _e or str(_r)[:160])
+
+        deep = tmp2 / "x" / "data" / "s" / "t" / "u"
+        deep.mkdir(parents=True)
+        (deep / "k.txt").write_text("DEEPNEEDLE\n", encoding="utf-8")
+        _r, _e = _try(toolbox.search, "DEEPNEEDLE", ".")
+        check("data/ 深处也不搜（旧判据只看末 4 段，深一层就漏）",
+              _e == "" and _g(_r, "count") == 0, _e or str(_r)[:120])
+        _r, _e = _try(toolbox.search, "DEEPNEEDLE", "x/data")
+        check("把 data 目录自己作为 path 是合法出口（跳过规则只该管起点之下）",
+              _e == "" and _g(_r, "count") == 1, _e or str(_r)[:120])
+
+        for i in range(40):
+            (tmp2 / f"n{i}.txt").write_text("HITME\n", encoding="utf-8")
+        _r, _e = _try(toolbox.search, "HITME", ".", 5)
+        check("到 limit 就停时自证「可能还有」（旧版给 5 条，与「一共只有 5 条」无从分辨）",
+              _e == "" and _g(_r, "count") == 5 and _g(_r, "truncated") is True
+              and "limit" in _g(_r, "text", ""), _e or str(_r)[:200])
+
+        # ---------------- shell：编码 / 超时 / 杀掉的是谁 / 截断
+        _r, _e = _try(toolbox.shell,
+                      'python -c "import sys;sys.stdout.buffer.write(\'中文\'.encode(\'gbk\'))"')
+        check("子进程吐 GBK 字节也能解对（UTF-8 硬解会变成 U+FFFD，且不报错）",
+              _e == "" and "中文" in _g(_r, "text", "")
+              and "\ufffd" not in _g(_r, "text", ""), _e or str(_r)[:160])
+        check("返回里自证用了哪种编码解的",
+              isinstance(_r, dict) and bool(_g(_r, "encoding")), str(_r)[:120])
+
+        _r, _e = _try(toolbox.shell, 'python -c "print(chr(20013)+chr(25991))"')
+        check("本机 python 子进程的中文不乱码（本机是 cp936 输出才红）",
+              _e == "" and "中文" in _g(_r, "text", "")
+              and "\ufffd" not in _g(_r, "text", ""), _e or str(_r)[:160])
+
+        _t0 = time.time()
+        # 为什么是 `-u`：管道的 stdout 默认**块缓冲**，子进程的 print 会憋在它自己的
+        # 缓冲区里 —— 那种输出我们收不到，也不是我们的错。这条要验的是「已经写出来
+        # 的那部分不许丢」，所以让子进程别缓冲。
+        _r, _e = _try(toolbox.shell,
+                      'python -u -c "import time;print(\'BEFORE\');time.sleep(8)"', "", 2)
+        _dt = time.time() - _t0
+        check("timeout 参数生效（旧版写死 30 秒，长命令必卡）", _dt < 8, f"{_dt:.1f}s {_e}")
+        check("超时**不丢**已产出的输出（前半截往往就是诊断本身）",
+              _e == "" and "BEFORE" in _g(_r, "text", ""), _e or str(_r)[:160])
+        check("超时时 exit 是 None 且 killed=timeout（别把我们杀的看成命令自己失败）",
+              _e == "" and _g(_r, "exit", "缺键") is None
+              and _g(_r, "killed") == "timeout", _e or str(_r)[:200])
+
+        gc = tmp2 / "gc.txt"
+        _cmd = ('python -c "import time;time.sleep(4);'
+                f"open(r'{gc.as_posix()}','w').write('alive')\"")
+        _r, _e = _try(toolbox.shell, _cmd, "", 1)
+        time.sleep(7)
+        check("超时杀的是**整棵进程树**（只 kill cmd.exe 的话，孙子 4 秒后照样写出文件）",
+              not gc.exists(), f"孙子进程活下来了：{gc}")
+
+        _r, _e = _try(toolbox.shell, 'python -c "print(chr(66)*100000)"')
+        check("输出超限被杀时标明 killed=output-limit（旧版 exit=1，看着像命令自己失败）",
+              _e == "" and _g(_r, "killed") == "output-limit"
+              and _g(_r, "exit", "缺键") is None, _e or str(_r)[:200])
+
+        _r, _e = _try(toolbox.shell, 'python -c "print(chr(65)*30000)"')
+        _spill = _g(_r, "spill", "")
+        _full = (tmp2 / _spill) if _spill else None
+        check("长输出截断时自证，并把全文落盘给路径（旧版 30000 只给 6000，一声不响）",
+              _e == "" and _g(_r, "truncated") is True
+              and len(_g(_r, "text", "")) <= 7000 and bool(_spill), _e or str(_r)[:200])
+        check("落盘的那份是**完整的**（截断给的是路径，不是又一份残片）",
+              _full is not None and _full.exists() and _full.stat().st_size > 25000,
+              f"{_spill} {_full.stat().st_size if _full and _full.exists() else 'no file'}")
+
+        (tmp2 / "sub").mkdir(exist_ok=True)
+        (tmp2 / "sub" / "m.txt").write_text("SUBFILE\n", encoding="utf-8")
+        _r, _e = _try(toolbox.shell, "dir /b" if sys.platform == "win32" else "ls", "sub")
+        check("cwd 参数：能在子目录里跑（不用 `cd x && ...` 拼命令）",
+              _e == "" and "m.txt" in _g(_r, "text", ""), _e or str(_r)[:160])
+        _r, _e = _try(toolbox.shell, "echo hi", "../..")
+        check("cwd 越界被拒（跟路径一样锁在工作区内）", _e != "" and "越界" in _e, _e)
+
+        _r, _e = _try(toolbox.shell, "   ")
+        check("空命令报错（别起一个什么都不干的 shell）", _e != "", f"返回了：{_r}")
+
+        # ---------------- 能力面：参数只增不减，旧调用仍然合法
+        _sp = kernel.build_schema(toolbox.search)["properties"]
+        _sh = kernel.build_schema(toolbox.shell)["properties"]
+        check("search 的旧参数一个没少（pattern / path / limit）",
+              {"pattern", "path", "limit"} <= set(_sp), str(sorted(_sp)))
+        check("search 新参数都在声明里（regex / ignore_case / glob / context）",
+              {"regex", "ignore_case", "glob", "context"} <= set(_sp), str(sorted(_sp)))
+        check("shell 的旧参数没少（command），新参数在（cwd / timeout）",
+              {"command", "cwd", "timeout"} <= set(_sh), str(sorted(_sh)))
+    finally:
+        toolbox._install(prev_rt)
+        shutil.rmtree(tmp2, ignore_errors=True)
 
     httpd.shutdown()
     if getattr(App, "native", None):

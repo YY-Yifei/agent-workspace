@@ -14,12 +14,15 @@
 安全边界（本机单用户，只做「不该发生的事」不让它发生，不做沙箱）：
     - 一切路径锁在 workspace 内；插件只能写 plugin.json / backend.py / ui/**
     - **永远不许写 data/** —— 那是用户攒下来的东西，agent 改代码不许碰它
-    - 跑命令限 cwd=workspace、30 秒、输出截断
+    - 跑命令限 cwd=workspace（可给子目录）、30 秒（可调 1~600）、
+      超时/输出超限时**连子孙进程**一起杀，且已产出的输出一定带回来
 """
 
 from __future__ import annotations
 
+import fnmatch
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -132,32 +135,151 @@ def read(path: str, offset: int = 1, limit: int = 0) -> dict:
     return out
 
 
-def search(pattern: str, path: str = ".", limit: int = 30) -> dict:
+MAX_SEARCH_BYTES = 400_000        # 单文件上限：超过就跳过，但**要说**（静默跳过 = 假「没有命中」）
+MAX_SEARCH_FILES = 20_000         # 一次最多看多少个文件（预算）
+SEARCH_SECONDS = 8.0              # 一次检索的墙钟预算（网络盘 / 大目录不许把调用挂住）
+SEARCH_LIMIT_MAX = 500            # limit 的硬顶
+SEARCH_CTX_MAX = 5                # context 的硬顶
+SKIP_PARTS = {"data", "logs", "node_modules", "__pycache__", ".git", ".dev-cache"}
+
+
+def _decode(data: bytes) -> tuple[str, str]:
+    """把字节解成文本，返回 (文本, 用了哪种编码)。
+
+    为什么不能硬写 utf-8：Windows 上**同一台机器**有两种输出编码 ——
+    cmd 内建命令按控制台代码页（本机 65001 → UTF-8），而 python / node 这类
+    程序按 locale（本机 cp936 → GBK）。硬解一种，另一种就变成 U+FFFD，
+    而且**不报错**，只是中文变成问号（实测见 _tmp/diag_search_shell.py [8]）。
+    """
+    for enc in ("utf-8", "utf-8-sig", "cp936", "gbk"):
+        try:
+            return data.decode(enc), enc
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace"), "utf-8/replace"
+
+
+def _is_binary(data: bytes) -> bool:
+    """前 8KB 里有 NUL 就当二进制 —— 别把 .pyc / 图片当文本搜出一堆乱码行。"""
+    return b"\x00" in data[:8192]
+
+
+def _skip_part(parts: tuple[str, ...]) -> bool:
+    """路径里有没有「不该被搜」的一段（点开头 / 双下划线 / data 之类）。"""
+    return any(p.startswith((".", "__")) or p in SKIP_PARTS for p in parts)
+
+
+def search(pattern: str, path: str = ".", limit: int = 30, regex: bool = False,
+           ignore_case: bool = False, glob: str = "", context: int = 0) -> dict:
     """在工作区里按文本检索，返回「文件:行号: 内容」。
 
-    pattern: 要找的文本
-    path: 检索起点（相对工作区），默认整个工作区
-    limit: 最多返回多少条
+    pattern: 要找的文本（regex=True 时是正则）
+    path: 检索起点（相对工作区），默认整个工作区；也可以直接给一个文件
+    limit: 最多返回多少**条命中**（硬顶 500）
+    regex: 按正则解释 pattern（默认按纯文本子串）
+    ignore_case: 忽略大小写
+    glob: 只看文件名匹配它的，如 *.py / plugins/*/backend.py
+    context: 每条命中额外带几行上下文（0~5，grep 的 -C）
+
+    返回里 count 是命中条数；truncated 为真表示「到 limit 就停了，可能还有」；
+    files_scanned 是实际看了多少个文件。跳过的（太大 / 二进制 / 在 data 里）
+    会写在正文末尾 —— **不静默**：说「没有命中」而其实跳过了，比报错更坏。
     """
+    if not str(pattern or ""):
+        raise ValueError("pattern 不能为空：空串会命中每一行，那不是检索")
+    want = max(1, min(int(limit or 30), SEARCH_LIMIT_MAX))
+    ctx = max(0, min(int(context or 0), SEARCH_CTX_MAX))
     base = _safe(path, must_exist=True)
-    hits: list[str] = []
+    root = _ws()
+
+    if regex:
+        try:
+            rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+        except re.error as exc:
+            raise ValueError(f"正则写错了：{exc}（pattern={pattern!r}）") from None
+        match = rx.search
+    elif ignore_case:
+        low = pattern.lower()
+        match = lambda s: low in s.lower()          # noqa: E731
+    else:
+        match = lambda s: pattern in s               # noqa: E731
+
+    base_rel = base.relative_to(root)
     files = [base] if base.is_file() else sorted(base.rglob("*"))
+    hits: list[str] = []
+    count = 0
+    scanned = 0
+    skipped_big = skipped_bin = skipped_dir = 0
+    budget = ""
+    t0 = time.time()
+
     for f in files:
-        if not f.is_file() or f.stat().st_size > 400_000:
+        if count >= want:
+            break
+        if time.time() - t0 > SEARCH_SECONDS:
+            budget = f"时间预算 {SEARCH_SECONDS:.0f} 秒用完"
+            break
+        if scanned >= MAX_SEARCH_FILES:
+            budget = f"文件预算 {MAX_SEARCH_FILES} 个用完"
+            break
+        try:
+            if not f.is_file():
+                continue
+            rel = f.relative_to(root)
+            sub = rel.relative_to(base_rel) if base_rel.parts else rel
+        except (OSError, ValueError):
             continue
-        if any(part.startswith((".", "__")) or part == "data" for part in f.parts[-4:]):
+        # 跳过规则按**相对起点**判：于是「把 data/ 自己作为 path 传进来」是合法出口
+        if _skip_part(sub.parts):
+            skipped_dir += 1
+            continue
+        if glob and not fnmatch.fnmatch(rel.as_posix(), glob):
             continue
         try:
-            for i, ln in enumerate(f.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
-                if pattern in ln:
-                    hits.append(f"{f.relative_to(_ws()).as_posix()}:{i}: {ln.strip()[:200]}")
-                    if len(hits) >= limit:
-                        break
+            if f.stat().st_size > MAX_SEARCH_BYTES:
+                skipped_big += 1
+                continue
+            data = f.read_bytes()
         except OSError:
             continue
-        if len(hits) >= limit:
-            break
-    return {"text": "\n".join(hits) or "没有命中", "count": len(hits)}
+        scanned += 1
+        if _is_binary(data):
+            skipped_bin += 1
+            continue
+        lines = _decode(data)[0].splitlines()
+        for i, ln in enumerate(lines, 1):
+            if not match(ln):
+                continue
+            count += 1
+            name = rel.as_posix()
+            if ctx:
+                for j in range(max(1, i - ctx), i):
+                    hits.append(f"{name}:{j}- {lines[j - 1].strip()[:200]}")
+            hits.append(f"{name}:{i}: {ln.strip()[:200]}")
+            if ctx:
+                for j in range(i + 1, min(len(lines), i + ctx) + 1):
+                    hits.append(f"{name}:{j}- {lines[j - 1].strip()[:200]}")
+            if count >= want:
+                break
+
+    notes: list[str] = []
+    if count >= want:
+        notes.append(f"到 limit={want} 就停了（**可能还有**）：用 glob/path 缩小范围，或加大 limit")
+    if budget:
+        notes.append(f"提前收工：{budget}")
+    if skipped_big:
+        notes.append(f"{skipped_big} 个文件超过 {MAX_SEARCH_BYTES // 1000}KB 没搜（大文件用 read 分页看）")
+    if skipped_bin:
+        notes.append(f"{skipped_bin} 个二进制文件没搜")
+    if skipped_dir:
+        notes.append(f"{skipped_dir} 个文件在 data/ 或隐藏目录里没搜（要搜就把它作为 path 传进来）")
+    text = "\n".join(hits) or "没有命中"
+    if notes:
+        text += "\n\n" + "\n".join("· " + n for n in notes)
+    return {"text": text, "count": count, "truncated": bool(count >= want or budget),
+            "files_scanned": scanned, "notes": notes}
+
+
 
 
 # ------------------------------------------------------------------ 写
@@ -212,47 +334,176 @@ def write(path: str, content: str) -> dict:
             "path": p.relative_to(_ws()).as_posix()}
 
 
-def shell(command: str) -> dict:
-    """在工作区目录里跑一条命令（超时 30 秒），用来看测试结果、列目录等。
+SHELL_TIMEOUT = 30            # 默认超时（秒）
+SHELL_TIMEOUT_MAX = 600       # 硬顶：再长就该拿别的办法
+SHELL_READ_LIMIT = 60_000     # 边读边限：超过就杀（`yes` 在 30 秒里能吐几个 GB）
+SHELL_SHOW = 6000             # 进上下文的字符数（其余落盘给路径）
+SHELL_SPILL_KEEP = 20         # logs/shell/ 里最多留几份
 
-    command: 要执行的命令
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """连同**子孙进程**一起杀 —— 只 kill shell 本身是没用的。
+
+    为什么：``shell=True`` 起的是 cmd.exe，真正干活的是它的子进程。杀掉 cmd 之后
+    python / node / python -m pytest 还在跑：继续占着工作区文件锁、继续写半成品，
+    而 agent 已经收到「已终止」这条消息。实测（_tmp/diag_search_shell.py [11]）：
+    kill() 之后 6 秒，孙子进程照样把标记文件写了出来。
     """
-    # 边读边限：`capture_output` 把整份输出攒进内存，落临时文件又会把磁盘写满
-    # （`yes` 在 30 秒里能做几个 GB）。所以起一个读线程，超过 60000 字符就杀掉进程。
-    LIMIT = 60000
-    buf: list[str] = []
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        import signal
+
+        try:
+            os.killpg(os.getpgid(proc.pid), getattr(signal, "SIGKILL", signal.SIGTERM))
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _spill_shell(text: str) -> str:
+    """超长输出落盘，返回**工作区内**的相对路径 —— 拿它去 read 接着看。
+
+    落在 ``logs/shell/``：``tree`` 与 ``search`` 都跳过 logs/，于是这份缓存
+    既不会被搜到、也不会污染工作区结构；丢了也不影响正确性（读不到就报错）。
+    """
+    root = _ws()
+    d = root / "logs" / "shell"
+    d.mkdir(parents=True, exist_ok=True)
+    name = (time.strftime("%Y%m%d-%H%M%S")
+            + f"-{os.getpid()}-{int(time.time() * 1000) % 1000:03d}.txt")
+    (d / name).write_text(text, encoding="utf-8")
+    try:
+        rows = sorted(d.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in rows[SHELL_SPILL_KEEP:]:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return (d / name).relative_to(root).as_posix()
+
+
+def shell(command: str, cwd: str = "", timeout: int = SHELL_TIMEOUT) -> dict:
+    """在工作区里跑一条命令，把输出带回来。用来看测试结果、列目录、跑脚本。
+
+    command: 要执行的命令（走系统 shell：Windows 是 cmd.exe）
+    cwd: 在哪个子目录里跑（相对工作区，默认工作区根；越界会被拒）
+    timeout: 最多等多少秒（1~600，默认 30）；到点会**连同子进程**一起杀掉
+
+    返回里一定有 exit / seconds / cwd / encoding。三条约定：
+        - **被我们杀掉时 exit 是 None**，另有 killed="timeout" | "output-limit"。
+          别把「我们杀的」看成「命令自己失败了」——旧版正是这么误导的。
+        - 超时**不丢已产出的输出**：前半截往往是诊断的关键（测试跑到第 30 秒时
+          前面已经报了三个 error）。所以超时也把输出带回来，而不是抛个只有
+          一句话的错。
+        - 输出超过 6000 字符会落盘，返回里给 truncated 与 spill 路径，
+          用 read 接着看 —— 「能不能自证完整」比多给几千字符重要。
+    """
+    cmd = str(command or "").strip()
+    if not cmd:
+        raise ValueError("command 不能为空")
+    secs = max(1, min(int(timeout or SHELL_TIMEOUT), SHELL_TIMEOUT_MAX))
+    where = _safe(cwd, must_exist=True) if str(cwd or "").strip() else _ws()
+    if not where.is_dir():
+        raise ValueError(f"cwd 不是目录：{cwd}")
+
+    env = dict(os.environ)
+    # 只动子进程的 **stdio** 编码（python 于是吐 UTF-8）；不动 open() 的默认编码 ——
+    # 那会改插件写文件的行为，属于「顺手改别人的语义」。
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+
+    buf: list[bytes] = []
     total = 0
-    proc = subprocess.Popen(command, shell=True, cwd=str(_ws()),
+    killed = ""
+
+    proc = subprocess.Popen(cmd, shell=True, cwd=str(where),
+                            # stdin 给 DEVNULL：交互命令（pause / more / git commit 没 -m）
+                            # 立刻拿到 EOF 就退出，而不是**卡满超时**等人按键 ——
+                            # 宿主从 cmd 或资源管理器启动时会继承控制台，实测就是卡死
+                            #（_tmp/diag2_shell.py [B]：卡满 30.1 秒）。
+                            stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, encoding="utf-8", errors="replace")
+                            env=env)
     t0 = time.time()
 
     def _reader() -> None:
-        nonlocal total
+        nonlocal total, killed
         assert proc.stdout is not None
         while True:
-            chunk = proc.stdout.read(8192)
+            try:
+                chunk = proc.stdout.read(8192)
+            except (OSError, ValueError):
+                return
             if not chunk:
                 return
-            if total < LIMIT:
-                buf.append(chunk[: LIMIT - total])
-                total += len(chunk)
-            if total >= LIMIT and proc.poll() is None:
-                proc.kill()                    # 话太多就不听了：别让它继续占着管道
+            if total < SHELL_READ_LIMIT:
+                take = chunk[: SHELL_READ_LIMIT - total]
+                buf.append(take)
+                total += len(take)
+            if total >= SHELL_READ_LIMIT and proc.poll() is None:
+                killed = "output-limit"        # 话太多就不听了：别让它继续占着管道
+                _kill_tree(proc)
                 return
 
     th = threading.Thread(target=_reader, name="toolbox-shell", daemon=True)
     th.start()
     try:
-        proc.wait(timeout=30)
+        proc.wait(timeout=secs)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        raise ValueError("命令超过 30 秒未结束，已终止")
+        killed = "timeout"
+        _kill_tree(proc)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
     th.join(timeout=5)
-    out = "".join(buf).strip()
-    return {"text": out[:6000] or f"（无输出，退出码 {proc.returncode}）",
-            "exit": proc.returncode, "seconds": round(time.time() - t0, 2)}
+    try:
+        if proc.stdout is not None:
+            proc.stdout.close()
+    except OSError:
+        pass
+
+    text, enc = _decode(b"".join(buf))
+    text = text.strip()
+    truncated = len(text) > SHELL_SHOW
+    spill = ""
+    shown = text
+    if truncated:
+        spill = _spill_shell(text)
+        head = SHELL_SHOW * 2 // 3
+        tail = SHELL_SHOW - head
+        shown = (text[:head]
+                 + f"\n…（中间 {len(text) - SHELL_SHOW} 字符省略，全文见 {spill}）\n"
+                 + text[-tail:])
+
+    rel_cwd = where.relative_to(_ws()).as_posix() or "."
+    if killed == "timeout":
+        head_text = f"（命令超过 {secs} 秒没结束，已连同子进程一起终止）"
+    elif killed == "output-limit":
+        head_text = f"（输出超过 {SHELL_READ_LIMIT} 字符，进程已终止）"
+    else:
+        head_text = ""
+    body = shown or f"（无输出，退出码 {proc.returncode}）"
+    out = {"text": (head_text + "\n" + body) if head_text else body,
+           "exit": None if killed else proc.returncode,
+           "seconds": round(time.time() - t0, 2),
+           "cwd": rel_cwd, "encoding": enc,
+           "truncated": truncated, "chars": len(text)}
+    if killed:
+        out["killed"] = killed
+    if spill:
+        out["spill"] = spill
+    return out
+
+
 
 
 # ------------------------------------------------------------------ 造
