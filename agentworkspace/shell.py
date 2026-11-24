@@ -60,6 +60,7 @@ pywebview 自己从不这么干：这批 settings 它只在 ``on_webview_ready``
 
 from __future__ import annotations
 
+import logging
 import threading
 from pathlib import Path
 
@@ -67,6 +68,24 @@ TITLE = "我的工作区"
 LOAD_TIMEOUT = 12.0          # 页面 12 秒还没 loaded，就判定为白屏
 MARGIN = 40                  # 窗口离工作区边缘留一点，别贴着任务栏
 UI_WAIT = 2.0                # 投递到 UI 线程后最多等这么久（有界，绝不无限等）
+
+_LOG = logging.getLogger("agentworkspace.shell")
+
+
+def _trace(debug: bool, ok: bool, why: str) -> None:
+    """把「门到底开没开」留一行痕。
+
+    为什么补这一条：``open_copy_doors`` 的返回值在 ``_on_loaded`` 里一直被直接丢掉，
+    于是两种失败（UI 线程超时 / 拿不到线程亲和性）在日志里一个字都没有。人看到的
+    只是「右键复制不好使」，现场什么都没留下 —— 而这恰好是最难复现的那类问题。
+
+    分寸：改不到**不是错误**（别的平台没有 CoreWebView2，页面侧还有兜底），所以
+    ``debug=False`` 时连 info 都不刷（只在 DEBUG 级留一行，默认看不见）；
+    ``debug=True`` 的人正好是想查这件事的人，那时把原因明确写出来。
+    """
+    _LOG.debug("复制开关 %s：%s", "已打开" if ok else "没打开", why)
+    if debug and not ok:
+        _LOG.warning("复制开关没打开（右键/快捷键可能用不了）：%s", why)
 
 
 def work_area() -> tuple[int, int, int, int]:
@@ -151,8 +170,9 @@ def _on_ui_thread(control, func, timeout: float = UI_WAIT) -> tuple[bool, str]:
     return True, "ui-thread"
 
 
-def open_copy_doors(window, debug: bool = False, timeout: float = UI_WAIT) -> tuple[bool, str]:
-    """把「选中 → 复制」那两道被 pywebview 关掉的闸打开。
+def _open_copy_doors(window, debug: bool = False,
+                     timeout: float = UI_WAIT) -> tuple[bool, str]:
+    """把「选中 → 复制」那两道被 pywebview 关掉的闸打开（执行体，不留痕）。
 
     返回 (是否真的改到了, 说明) —— 这个返回值只给测试与日志用：
     改不到**不是错误**（别的平台没有 CoreWebView2），页面侧还有兜底。
@@ -175,6 +195,17 @@ def open_copy_doors(window, debug: bool = False, timeout: float = UI_WAIT) -> tu
         s.AreDevToolsEnabled = bool(debug)         # 仍然不给调试器
 
     return _on_ui_thread(control, _apply, timeout)
+
+
+def open_copy_doors(window, debug: bool = False, timeout: float = UI_WAIT) -> tuple[bool, str]:
+    """把闸打开，并且**无论谁调都留痕**。
+
+    留痕放在这里而不是 ``_on_loaded`` 里，是因为「失败现场」属于这个函数：
+    换一个调用方（测试、以后的别处）就不该悄悄丢掉原因。
+    """
+    ok, why = _open_copy_doors(window, debug, timeout)
+    _trace(debug, ok, why)
+    return ok, why
 
 
 def run(url: str, *, title: str = TITLE, width: int = 1180, height: int = 800,

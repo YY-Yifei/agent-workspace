@@ -1444,6 +1444,52 @@ def _run() -> int:
           and _w6.native.webview.CoreWebView2.Settings.log == [],
           f"{_why6n} touched={_touched6}")
 
+    # ---- 失败要留痕：以前 open_copy_doors 的返回值在 _on_loaded 里被直接丢掉，
+    # 于是两种失败（UI 线程超时 / 拿不到线程亲和性）在日志里一个字都没有。
+    # 人看到的只是「右键复制不好使」，现场什么都没留下。
+    import logging as _logging
+
+    class _Cap(_logging.Handler):
+        """抓 agentworkspace.shell 的日志，连级别一起记。"""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.rows: list[tuple[int, str]] = []
+
+        def emit(self, record) -> None:            # noqa: ANN001
+            self.rows.append((record.levelno, record.getMessage()))
+
+    def _capture(fn) -> list[tuple[int, str]]:
+        lg = _logging.getLogger("agentworkspace.shell")
+        cap = _Cap()
+        old_level, old_prop = lg.level, lg.propagate
+        lg.addHandler(cap)
+        lg.setLevel(_logging.DEBUG)
+        lg.propagate = False                       # 别让 root handler 把 selftest 刷花
+        try:
+            fn()
+        finally:
+            lg.removeHandler(cap)
+            lg.setLevel(old_level)
+            lg.propagate = old_prop
+        return cap.rows
+
+    def _open_quiet(w, **kw) -> None:
+        try:
+            sh.open_copy_doors(w, **kw)
+        except TypeError:                          # 旧实现没有 timeout= 这个参数
+            pass
+
+    _rows_bad = _capture(lambda: _open_quiet(_Win(_WV(responsive=False)),
+                                             debug=True, timeout=0.3))
+    check("开不了门时 debug 模式至少留一行，且说得出是超时",
+          any(lv >= _logging.WARNING and "0.3" in msg and "没有执行" in msg
+              for lv, msg in _rows_bad), f"{_rows_bad}")
+    _rows_quiet = _capture(lambda: _open_quiet(_Win(_WV(responsive=False)),
+                                               debug=False, timeout=0.3))
+    check("debug=False 时不刷告警（改不到不是错误，别把每次启动都记成问题）",
+          not any(lv >= _logging.WARNING for lv, _ in _rows_quiet), f"{_rows_quiet}")
+
     class _Broken:
         @property
         def native(self):
