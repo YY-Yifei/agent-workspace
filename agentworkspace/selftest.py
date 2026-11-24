@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import enum
+import inspect
 import json
 import re
 import shutil
@@ -1532,6 +1534,81 @@ def _run() -> int:
     finally:
         toolbox._install(prev_rt)
         shutil.rmtree(tmp2, ignore_errors=True)
+
+    # ------------------------------------------------------------ [22] 执行侧边界
+    print("[22] 执行侧：工具在事件循环之外跑，仍然串行，deadline 才生效")
+    # aaas 在事件循环线程里**直接**调执行体（aaas/function.py:270）。同步执行体
+    # 一旦跑上几十秒（shell 默认 30 秒），冻住的不只是这次调用：心跳发不出去
+    # （websockets ping_interval=20）、取消帧收不到、连 0.9×deadline 的 wait_for
+    # 也永远等不到超时点。所以这一节验三件事：循环没被占、执行仍然串行、
+    # 超时真的会到点。
+    tmp3 = Path(tempfile.mkdtemp(prefix="aw-exec-"))
+    link_slow = None                  # finally 里要用；构造失败时它也得有名字
+    try:
+        class _SlowRT:
+            """只记两件事：跑了几次、同时跑了几次（串行性）。"""
+
+            def __init__(self, secs: float) -> None:
+                self.secs = secs
+                self.calls = 0
+                self.active = 0
+                self.peak = 0
+
+            def dispatch(self, pid, fn, args, source="agent", caller=None):
+                self.calls += 1
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+                try:
+                    time.sleep(self.secs)
+                    return kernel.Result(status="ok", text="done")
+                finally:
+                    self.active -= 1
+
+        rt_slow = _SlowRT(0.6)
+        link_slow = Link(rt_slow, tmp3, {}, "assistant")
+        run = link_slow._handler("assistant", "slow")
+        check("执行体是协程（aaas 才会 await 它，循环才有机会喘气）",
+              inspect.iscoroutinefunction(run),
+              f"是协程吗：{inspect.iscoroutinefunction(run)}")
+
+        async def _probe_exec():
+            ticks = 0
+
+            async def tick():
+                nonlocal ticks
+                while True:
+                    await asyncio.sleep(0.02)
+                    ticks += 1
+
+            t = asyncio.create_task(tick())
+            t0 = time.perf_counter()
+            await run()                                   # (a) 一次 0.6 秒的工具
+            dt = time.perf_counter() - t0
+            t0 = time.perf_counter()                      # (b) 0.2 秒 deadline
+            timed_out = False
+            try:
+                await asyncio.wait_for(run(), timeout=0.2)
+            except asyncio.TimeoutError:
+                timed_out = True
+            dt2 = time.perf_counter() - t0
+            await asyncio.gather(run(), run())            # (c) 并发两条 → 必须串行
+            t.cancel()
+            return ticks, dt, dt2, timed_out
+
+        ticks, dt, dt2, timed_out = asyncio.run(_probe_exec())
+        check("工具跑着时循环还在转（心跳/取消/别的事件不会被冻住）",
+              ticks >= 5, f"0.6 秒里只跳了 {ticks} 次")
+        check("工具真的跑满了 0.6 秒（不是提前返回的空壳）", dt >= 0.55, f"{dt:.2f}s")
+        check("0.2 秒的 deadline 能打断等待（旧版要干等工具跑完，超时形同虚设）",
+              timed_out and dt2 < 0.45, f"timed_out={timed_out} {dt2:.2f}s")
+        check("两条并发调用仍然串行（峰值并发=1，插件的读-改-写语义没被改掉）",
+              rt_slow.peak == 1, f"峰值 {rt_slow.peak}")
+        check("超时只是「不再等」，工具本身照旧跑完（线程杀不掉 —— 这是边界，不是缺陷）",
+              rt_slow.calls == 4, f"dispatch 调用 {rt_slow.calls} 次")
+    finally:
+        if link_slow is not None:
+            link_slow.stop()          # 收掉那条 daemon 执行线程
+        shutil.rmtree(tmp3, ignore_errors=True)
 
     httpd.shutdown()
     if getattr(App, "native", None):

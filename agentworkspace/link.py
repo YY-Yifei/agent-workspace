@@ -20,7 +20,9 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
+import queue
 import threading
 import time
 from pathlib import Path
@@ -84,6 +86,62 @@ def _read(path: Path) -> str:
         return ""
 
 
+class _SerialExecutor:
+    """一条 daemon 线程 + 一条队列：把**同步**执行体挪出事件循环，且保持串行。
+
+    为什么必须挪出去：aaas 的 ``Tool.invoke`` 就在事件循环线程里直接调执行体
+    （``aaas/function.py:270``）。一个跑 30 秒的 shell 冻住的不是一次调用，是
+    **整条链路** —— 心跳发不出去（websockets ``ping_interval=20``）、取消帧
+    收不到、连 aaas 自己的 ``wait_for(deadline*0.9)`` 也永远等不到超时点
+    （超时得靠循环转起来才触发）。症状是「模型调了工具之后，那个程序彻底不说话」。
+
+    为什么不用 ``asyncio.to_thread``：它用循环的默认执行器，那些线程是**非 daemon**
+    的，解释器退出时会 join 它们 —— 一个卡住的 30 秒 shell 会把「关窗口」也拖住
+    30 秒。今天执行体跑在 daemon 线程上，退出是立刻的，这个性质不能丢。
+
+    为什么不是多线程池：插件从来是串行执行的（一次 dispatch 做完才轮到下一次），
+    并发会改变它们的语义（读-改-写）。一个程序一条队列，顺序与今天逐字节一致。
+    """
+
+    def __init__(self, name: str) -> None:
+        self._q: queue.Queue = queue.Queue()
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self._q.get()
+            if item is None:                  # 收工信号
+                return
+            fut, fn = item
+            if not fut.set_running_or_notify_cancel():
+                continue                      # 还没开跑就被取消：那就别跑
+            try:
+                value = fn()
+            except BaseException as exc:      # noqa: BLE001 - 异常必须落到 Future 上
+                try:
+                    fut.set_exception(exc)
+                except Exception:             # 等待者已经走开
+                    pass
+            else:
+                try:
+                    fut.set_result(value)
+                except Exception:             # 同上：等待者已经走开，结果无人要
+                    pass
+
+    def submit(self, fn):
+        if self._closed:
+            raise RuntimeError("执行器已关闭")
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+        self._q.put((fut, fn))
+        return fut
+
+    def shutdown(self) -> None:
+        self._closed = True
+        self._q.put(None)
+
+
 class Link:
     """一条通往道的连接 —— 属于**某一个程序**。生命周期：易失。"""
 
@@ -116,6 +174,8 @@ class Link:
         # 对话的**唯一真相**在磁盘上（sessions.py）。self.history 只是它的展示镜像：
         # 切换会话时整份换掉，切完模型看到的就是这份 —— 没有第二份在别处长着。
         self.store = sessions.Store(self.root)
+        # 工具执行的一端：同步、串行、在循环之外（见 _SerialExecutor）
+        self._exec = _SerialExecutor(f"tool-{pid}")
         self.sid: str = self.store.latest(pid) or self.store.create(pid)
         self.history: list[dict] = self.store.messages(pid, self.sid)
         # 轮数与 token 累计：在内存里跟着长，避免 as_dict 每次都重读整份文件
@@ -257,11 +317,20 @@ class Link:
         return tools
 
     def _handler(self, pid: str, fn: str):
-        """一个能力的执行体：**只做一次转发**，落进内核的唯一入口。"""
-        def run(**kwargs):
+        """一个能力的执行体：**只做一次转发**，落进内核的唯一入口。
+
+        ``run`` 是协程，dispatch 仍然是同步的 —— 这一层是**边界**：
+        同步执行体在这个循环线程里跑，就会把心跳、取消、deadline 一起冻住
+        （见 ``_SerialExecutor`` 的说明）。所以这里只做两件事：
+        把 dispatch 交给那条串行队列，再把结果翻回协议要的形状。
+        """
+        async def run(**kwargs):
+            loop = asyncio.get_running_loop()
             # caller=self.pid：这道手可能属于别人（开发者模式借来的），
             # 但动手的是这个程序 —— 内核要能分清这两件事。
-            res = self.rt.dispatch(pid, fn, kwargs, source="agent", caller=self.pid)
+            fut = self._exec.submit(
+                lambda: self.rt.dispatch(pid, fn, kwargs, source="agent", caller=self.pid))
+            res = await asyncio.wrap_future(fut, loop=loop)
             return FunctionResult(status=res.status,
                                   parts=(Part.t(res.text or ""),),
                                   reason=res.reason)
@@ -535,6 +604,7 @@ class Link:
     # ------------------------------------------------------------------ 收尾
     def stop(self) -> None:
         self.status = "closed"
+        self._exec.shutdown()             # 队列收工：卡住的那一次照旧跑完，但不留线程
         if self._loop and self._caller:
             try:
                 asyncio.run_coroutine_threadsafe(self._caller.close(), self._loop).result(timeout=3)
