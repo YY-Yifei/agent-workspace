@@ -1957,6 +1957,22 @@ def _run() -> int:
           any(e.get("type") == "bus.dropped" for e in rt_bus.events),
           f"最近类型={[e.get('type') for e in rt_bus.events[-3:]]}")
 
+    # 读盘一律走这两个小工具：**坏实现应当让这一条红，不许把整轮带走**。
+    # 以前是裸的 read_text / st_size，实现一旦没写出文件就是 FileNotFoundError
+    # 冲出 _run()，后面几百条一条都跑不到 —— 那是最坏的一种「红」：说不清红在哪，
+    # 还把没跑的也一并吞了。
+    def _size_of(path: Path) -> int:
+        try:
+            return path.stat().st_size
+        except OSError:
+            return -1
+
+    def _names(d: Path) -> list[str]:
+        try:
+            return sorted(p.name for p in d.iterdir())
+        except OSError:
+            return []
+
     # C 段：Context.set 并发下必须不抛、不丢。
     # 旧实现的失败形态有两层：① tmp 文件名写死（两个线程在同一个 store.tmp 上
     # 互踩 os.replace → PermissionError）；② 读-改-写之间没有锁（后写的那份把
@@ -1983,15 +1999,20 @@ def _run() -> int:
             t.start()
         for t in threads:
             t.join(30)
-        store = json.loads((pdir / "data" / "store.json").read_text(encoding="utf-8"))
+        try:
+            store = json.loads((pdir / "data" / "store.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as _exc:
+            store, _store_why = {}, f"（读不到 store.json：{type(_exc).__name__}: {_exc}）"
+        else:
+            _store_why = ""
         check("C1 4 线程 × 50 次并发写：200 个键一条不丢（旧版丢更新）",
-              len(store) == 200, f"实际 {len(store)}/200")
+              len(store) == 200, f"实际 {len(store)}/200{_store_why}")
         check("C2 并发写不抛异常（旧版在固定 tmp 名上互踩 → PermissionError）",
               not errs, f"{len(errs)} 个异常，首个={errs[0]!r}" if errs else "")
         check("C3 落盘的仍是完整可解析的 JSON，值与写进去的一致",
               isinstance(store, dict)
               and all(store.get(f"t{t}_{i}") == i for t in range(4) for i in range(50)),
-              f"键数={len(store)}")
+              f"键数={len(store)}{_store_why}")
         check("C4 并发之后单键读回也一致", ctx.get("t3_49") == 49,
               f"get('t3_49')={ctx.get('t3_49')!r}")
     finally:
@@ -2095,8 +2116,13 @@ def _run() -> int:
             rt_log.publish("probe.tick", data={"i": i, "pad": "x" * 40})
         logs = tmp7 / "logs"
         cur = logs / "events.jsonl"
-        size = cur.stat().st_size
-        lines = [ln for ln in cur.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        size = _size_of(cur)
+        try:
+            lines = [ln for ln in cur.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        except OSError as _exc:
+            lines, _cur_why = [], f"（读不到 events.jsonl：{type(_exc).__name__}: {_exc}）"
+        else:
+            _cur_why = ""
         parsed_ok = True
         last_i = None
         for n, ln in enumerate(lines):
@@ -2109,12 +2135,11 @@ def _run() -> int:
                 last_i = (ev.get("data") or {}).get("i")
         check("E1 事件日志按大小轮转（旧版：只 append，单文件能长到 48MB）",
               (logs / "events.jsonl.1").exists() and size <= rt_log.log_max,
-              f"当前 {size}B / 上限 {rt_log.log_max}B，"
-              f"轮转出 {sorted(p.name for p in logs.iterdir())}")
+              f"当前 {size}B / 上限 {rt_log.log_max}B，轮转出 {_names(logs)}{_cur_why}")
         check("E2 轮转份数有上限（不许长成无限多个 events.jsonl.N）",
               (logs / "events.jsonl.2").exists()
               and not (logs / "events.jsonl.3").exists(),
-              f"{sorted(p.name for p in logs.iterdir())}")
+              f"{_names(logs)}")
         check("E3 最新的那条一定还在当前文件里（轮转不许把「现在」丢掉）",
               last_i == 299, f"末行 i={last_i!r}，共 {len(lines)} 行")
         check("E4 轮转之后每一行仍是完整的 JSON（半个事件比没有事件更坏）",
@@ -2125,14 +2150,18 @@ def _run() -> int:
         check("E5 没到阈值时不轮转（平时不该凭空多出文件）",
               (tmp8 / "logs" / "events.jsonl").is_file()
               and not (tmp8 / "logs" / "events.jsonl.1").exists(),
-              f"{sorted(p.name for p in (tmp8 / 'logs').iterdir())}")
+              f"{_names(tmp8 / 'logs')}")
 
         # 轮转与写入共用同一把锁：换文件那一刻不能有人在写，否则会写出半个事件、
         # 或者把行写进一个已经被 rename 走的文件里（谁都不知道它去哪了）。
         def _lines_of(d: Path) -> list[str]:
             out: list[str] = []
-            for f in sorted(d.iterdir()):
-                out += [ln for ln in f.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            for f in _names(d):
+                try:
+                    text = (d / f).read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                out += [ln for ln in text.splitlines() if ln.strip()]
             return out
 
         def _all_parse(lines: list[str]) -> bool:
@@ -2181,9 +2210,9 @@ def _run() -> int:
         cur2 = tmp9 / "race" / "logs" / "events.jsonl"
         check("E7 4 线程并发 publish（轮转途中）：不抛异常、不写半个事件、当前文件守住上界",
               not errs2 and _all_parse(lines2) and bool(lines2)
-              and cur2.stat().st_size <= rt_race2.log_max,
+              and 0 <= _size_of(cur2) <= rt_race2.log_max,
               f"{len(errs2)} 个异常，{len(lines2)} 行，可解析={_all_parse(lines2)}，"
-              f"当前 {cur2.stat().st_size}B / 上限 {rt_race2.log_max}B"
+              f"当前 {_size_of(cur2)}B / 上限 {rt_race2.log_max}B"
               + (f"，首个={errs2[0]!r}" if errs2 else ""))
         # E8-E12：轮转**失败**时会发生什么。
         # 旧实现是「先删最老的 .2 → 再把 .1 顶成 .2 → **最后**才挪当前文件」。
@@ -2216,19 +2245,29 @@ def _run() -> int:
             a1 = _blob(logs_f / "events.jsonl.1")
             a2 = _blob(logs_f / "events.jsonl.2")
             # 占住当前文件 = 让它挪不动（E8 的前提，不是假设，是探针实测过的）
-            hold = open(cur_f, "rb")
+            # 前提本身也可能不成立（实现根本没写出文件）—— 那时要**报红**，
+            # 不是让 open() 把整轮 selftest 带走。
+            _held = True
+            try:
+                hold = open(cur_f, "rb")
+            except OSError as _exc:
+                hold, _held = None, False
+                _held_why = f"（前提不成立：当前文件都写不出来 {type(_exc).__name__}: {_exc}）"
+            else:
+                _held_why = ""
             try:
                 for i in range(50):
                     rt_fail.publish("probe.fail2", data={"i": i})
                 a1b = _blob(logs_f / "events.jsonl.1")
                 a2b = _blob(logs_f / "events.jsonl.2")
                 size_told = rt_fail._log_size
-                cur_bytes = cur_f.read_bytes()
+                cur_bytes = _blob(cur_f)
             finally:
-                hold.close()
+                if hold is not None:
+                    hold.close()
             check("E8 轮转失败时归档一份都不许动（旧版：删 .2 → .1 顶成 .2 → 当前文件挪不动）",
-                  a1b == a1 and a2b == a2,
-                  f".1 {_delta(a1, a1b)}、.2 {_delta(a2, a2b)}")
+                  _held and a1b == a1 and a2b == a2,
+                  f".1 {_delta(a1, a1b)}、.2 {_delta(a2, a2b)}{_held_why}")
             check("E9 失败后 _log_size 与当前文件的真实字节数一致（不一致就让每次写都重试轮转）",
                   size_told == len(cur_bytes),
                   f"_log_size={size_told} 真实={len(cur_bytes)}")
@@ -2241,7 +2280,8 @@ def _run() -> int:
             rt_fail.publish("probe.fail3", data={"i": 99})
             a1c = _blob(logs_f / "events.jsonl.1")
             check("E12 句柄放开后下一次写就能正常轮转（失败状态不粘连）",
-                  a1c == cur_bytes, f".1 {len(a1c)}B vs 失败时的当前文件 {len(cur_bytes)}B")
+                  _held and a1c == cur_bytes,
+                  f".1 {len(a1c)}B vs 失败时的当前文件 {len(cur_bytes)}B{_held_why}")
 
             # 轮转中途崩掉会在磁盘上留一份 .staging —— 里面是「当时全部的当前事件」。
             # 把它当垃圾删掉 = 悄悄吃掉一段审计，所以重启时第一件事就是收拾它。
