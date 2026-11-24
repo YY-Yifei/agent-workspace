@@ -380,6 +380,18 @@ class BuiltinProgram:
 
 # --------------------------------------------------------------------- 运行时
 
+class _Sub(queue.Queue):
+    """一条订阅者的队列。``dropped`` 记着**它自己**丢过多少条。
+
+    为什么要这个类：``publish`` 在队列满时丢最老的、保最新的（见 ``_offer``），
+    而「丢了几条」如果只活在总线上，就永远说不清是哪个订阅者慢 —— 那又是静默。
+    """
+
+    def __init__(self, maxsize: int = 0) -> None:
+        super().__init__(maxsize)
+        self.dropped = 0
+
+
 class Runtime:
     """内核本体：扫描插件、生成能力面、唯一 dispatch、广播事件。
 
@@ -398,6 +410,7 @@ class Runtime:
         self.devtools: dict[str, Capability] = {}
         self.version = 0                                   # 能力面版本：变了就该重新 declare
         self._subs: list[queue.Queue] = []
+        self._dropped = 0                                  # 总线一共丢过多少条事件
         self._lock = threading.Lock()
         self.events: list[dict] = []                       # 最近事件（新前端进场先补一份）
         self.log_path = self.root / "logs" / "events.jsonl"
@@ -408,7 +421,7 @@ class Runtime:
 
     # -- 事件 ---------------------------------------------------------
     def subscribe(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue(maxsize=1000)
+        q: queue.Queue = _Sub(1000)
         with self._lock:
             self._subs.append(q)
         return q
@@ -422,6 +435,18 @@ class Runtime:
                 data: dict | None = None) -> None:
         ev = {"type": kind, "pid": pid, "fn": fn, "source": source,
               "ts": time.time(), "data": data or {}}
+        self._audit(ev)
+        with self._lock:
+            subs = list(self._subs)
+        for q in subs:
+            self._offer(q, ev)
+
+    def _audit(self, ev: dict) -> None:
+        """落审计：内存里最近 MAX_EVENT_LOG 条 + events.jsonl。**不扇出**。
+
+        单独拆出来是给「总线自己」用的：``_offer`` 丢事件时要留痕，而那条痕不能再走
+        publish —— 那会递归回一个已经满了的队列。审计是给人事后查的，不是给界面画的。
+        """
         self.events.append(ev)
         if len(self.events) > MAX_EVENT_LOG:
             del self.events[: len(self.events) - MAX_EVENT_LOG]
@@ -434,13 +459,43 @@ class Runtime:
                 fh.write(json.dumps(ev, ensure_ascii=False, default=str) + "\n")
         except (OSError, TypeError, ValueError):
             pass
+
+    def _offer(self, q: queue.Queue, ev: dict) -> None:
+        """投一条事件。队列满时**丢最老的、留最新的**，并且把丢了几条记下来。
+
+        为什么保最新：界面要的是「现在什么样」，不是「三分钟前什么样」。中间丢掉的
+        帧由 ``turn.completed``（带全文）兜底，所以丢老的最不伤。旧实现在 Full 处直接
+        ``pass`` —— 少画几帧、少几条状态，而没有任何一处说得出来。
+        """
+        try:
+            q.put_nowait(ev)
+            return
+        except queue.Full:
+            pass
+        try:
+            q.get_nowait()                                   # 丢最老的那一条
+        except queue.Empty:
+            pass                                             # 消费者刚好腾了一格
+        try:
+            q.put_nowait(ev)
+        except queue.Full:
+            pass                                             # 塞不进也算丢（下面记账）
+        first = getattr(q, "dropped", 0) == 0
+        try:
+            q.dropped += 1
+        except AttributeError:                               # 不是 _Sub：只记总线总数
+            pass
         with self._lock:
-            subs = list(self._subs)
-        for q in subs:
-            try:
-                q.put_nowait(ev)
-            except queue.Full:
-                pass
+            self._dropped += 1
+            total = self._dropped
+            subs = len(self._subs)
+        # 留痕：第一条 + 每 100 条。每条都记会把 events.jsonl 自己撑爆；
+        # 一条不记就等于没发生。
+        if first or total % 100 == 0:
+            self._audit({"type": "bus.dropped", "pid": "", "fn": "", "source": "system",
+                         "ts": time.time(),
+                         "data": {"dropped": 1, "total": total, "subscribers": subs,
+                                  "note": "队列满：已丢最老的一条，保住最新的"}})
 
     # -- 扫描与装载 ---------------------------------------------------
     def scan(self) -> str:
@@ -711,7 +766,10 @@ class Runtime:
                "functions": [{"name": c.wire, "fn": c.fn,
                               "description": c.description, "parameters": c.parameters}
                              for c in self.devtools.values()]}
-        return {"version": self.version, "programs": progs, "devtools": dev}
+        with self._lock:
+            bus = {"dropped": self._dropped, "subscribers": len(self._subs)}
+        return {"version": self.version, "programs": progs, "devtools": dev,
+                "events": bus}
 
     # -- 唯一执行入口 -------------------------------------------------
     def dispatch(self, pid: str, fn: str, args: dict | None, source: str = "human",

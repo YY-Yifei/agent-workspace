@@ -1775,6 +1775,29 @@ def _run() -> int:
         shutil.rmtree(tmp4, ignore_errors=True)
 
 
+    # B 段：事件队列满时 —— 丢最老、保最新、并且**说出来**。
+    # 旧实现在 queue.Full 处直接 pass：界面上少了几帧、state 里也没有任何字段，
+    # 谁也说不清少在哪。断言必须看三处：队列自己、state()、审计。
+    tmp4.mkdir(parents=True, exist_ok=True)
+    rt_bus = kernel.Runtime(tmp4)
+    q_bus = rt_bus.subscribe()
+    for i in range(1100):
+        rt_bus.publish("probe.tick", data={"i": i})
+    st_bus = rt_bus.state() or {}
+    ev_bus = st_bus.get("events") or {}
+    check("B1 订阅者队列自己记着丢了多少条（旧版：丢了也不说）",
+          getattr(q_bus, "dropped", None) == 100,
+          f"dropped={getattr(q_bus, 'dropped', None)!r}")
+    last = q_bus.queue[-1].get("data", {}) if getattr(q_bus, "queue", None) else {}
+    check("B2 丢的是最老的、留的是最新的（延迟的界面要的是「现在」）",
+          last.get("i") == 1099, f"队尾={last!r}")
+    check("B3 state() 报出丢弃总数与订阅者数",
+          ev_bus.get("dropped") == 100 and int(ev_bus.get("subscribers") or 0) >= 1,
+          f"{ev_bus!r}")
+    check("B4 丢弃在审计里留痕（events 里能看到 bus.dropped）",
+          any(e.get("type") == "bus.dropped" for e in rt_bus.events),
+          f"最近类型={[e.get('type') for e in rt_bus.events[-3:]]}")
+
     httpd.shutdown()
     if getattr(App, "native", None):
         App.native.shutdown()                       # 收尸：不留孤儿窗口
