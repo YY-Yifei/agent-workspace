@@ -10,4 +10,8 @@ recursive-include agentworkspace *.py
 # 原来这里一个 tests/ 都没有 —— 从 sdist 装的用户拿不到任何测试（而 wheel 里
 # 也没有，那是刻意的：wheel 是给人用的，sdist 是给改代码的人用的）。
 recursive-include tests *.js
+# *.py 同样要带：selftest_with_fixtures.py 与 tests/e2e_copy.py / e2e_browser_copy.py
+# 才是「怎么验」的正文。只带 .js 的话，从 sdist 拿到的人只有前端的规格，
+# 后端的验收线一条也看不见 —— 上一版就是这么缺的。
+recursive-include tests *.py
 global-exclude __pycache__ *.py[cod] *.log
