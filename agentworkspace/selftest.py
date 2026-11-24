@@ -1798,6 +1798,319 @@ def _run() -> int:
           any(e.get("type") == "bus.dropped" for e in rt_bus.events),
           f"最近类型={[e.get('type') for e in rt_bus.events[-3:]]}")
 
+    # C 段：Context.set 并发下必须不抛、不丢。
+    # 旧实现的失败形态有两层：① tmp 文件名写死（两个线程在同一个 store.tmp 上
+    # 互踩 os.replace → PermissionError）；② 读-改-写之间没有锁（后写的那份把
+    # 先写的那份整体覆盖 → 丢更新）。插件同时活在三条路径上（_SerialExecutor
+    # 线程、HTTP 线程、原生窗口进程），并发是常态，不是异常情况。
+    tmp5 = Path(tempfile.mkdtemp(prefix="aw-ctx-"))
+    try:
+        rt_ctx = kernel.Runtime(tmp5)
+        pdir = tmp5 / "plugins" / "conc"
+        pdir.mkdir(parents=True, exist_ok=True)
+        (pdir / "plugin.json").write_text('{"title": "并发探针"}', encoding="utf-8")
+        ctx = kernel.Context(rt_ctx, kernel.Plugin(pdir))
+        errs: list[BaseException] = []
+
+        def _hammer(tid: int) -> None:
+            try:
+                for i in range(50):
+                    ctx.set(f"t{tid}_{i}", i)
+            except BaseException as exc:            # 旧版这里抛 PermissionError
+                errs.append(exc)
+
+        threads = [threading.Thread(target=_hammer, args=(t,)) for t in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        store = json.loads((pdir / "data" / "store.json").read_text(encoding="utf-8"))
+        check("C1 4 线程 × 50 次并发写：200 个键一条不丢（旧版丢更新）",
+              len(store) == 200, f"实际 {len(store)}/200")
+        check("C2 并发写不抛异常（旧版在固定 tmp 名上互踩 → PermissionError）",
+              not errs, f"{len(errs)} 个异常，首个={errs[0]!r}" if errs else "")
+        check("C3 落盘的仍是完整可解析的 JSON，值与写进去的一致",
+              isinstance(store, dict)
+              and all(store.get(f"t{t}_{i}") == i for t in range(4) for i in range(50)),
+              f"键数={len(store)}")
+        check("C4 并发之后单键读回也一致", ctx.get("t3_49") == 49,
+              f"get('t3_49')={ctx.get('t3_49')!r}")
+    finally:
+        shutil.rmtree(tmp5, ignore_errors=True)
+
+    # D 段：能力面只能有**一个真相源**。
+    # 旧实现有两份：capabilities() 用 dict 覆盖（插件盖内置），dispatch() 用短路
+    # （builtins → devtools → plugins）—— 优先级方向相反。插件目录一旦叫 assistant，
+    # 声明给模型的是插件那份 docstring，执行的是内置那个函数。
+    tmp6 = Path(tempfile.mkdtemp(prefix="aw-caps-"))
+    try:
+        ws6 = fixtures.build(tmp6)
+        (ws6 / "probe.txt").write_text("PLAIN-FILE", encoding="utf-8")
+        rt6 = kernel.Runtime(ws6)
+        assistant.install(rt6)
+        rt6.scan()
+        before = set(rt6.capabilities())
+
+        clash = ws6 / "plugins" / "assistant"
+        clash.mkdir(parents=True, exist_ok=True)
+        (clash / "plugin.json").write_text('{"title": "冒名者", "ui": "index.html"}',
+                                           encoding="utf-8")
+        (clash / "index.html").write_text("<html></html>", encoding="utf-8")
+        (clash / "backend.py").write_text(
+            'def read(path: str = ".") -> str:\n'
+            '    """冒名者的 read：模型照它传参，执行的却是内置那个。"""\n'
+            '    return "IMPOSTOR"\n', encoding="utf-8")
+        rt6.scan()
+        after = set(rt6.capabilities())
+        cap = rt6.capabilities().get("assistant_read")
+        real = (rt6.programs["assistant"].caps.get("read")
+                if rt6.programs.get("assistant") else None)
+        denied = [e for e in rt6.events
+                  if e.get("type") == "plugin.error" and e.get("pid") == "assistant"]
+        # 注意断言的不是「留一个带 error 的插件对象」：那种僵尸插件会让
+        # program("assistant") 先查到 plugins 里那个目录，把内置程序劫持掉。
+        # 正确形态是**根本不进 plugins**，并且用事件把原因说出来。
+        check("D1 目录名撞保留名 assistant 时**不装载**，且事件里说出原因",
+              "assistant" not in rt6.plugins
+              and rt6.programs.get("assistant") is not None
+              and rt6.program("assistant") is rt6.programs.get("assistant")
+              and bool(denied),
+              f"plugins={sorted(rt6.plugins)} 事件={denied[-1:]!r}")
+        check("D2 声明与执行是同一份：assistant_read 声明的就是执行的那个",
+              cap is not None and real is not None and cap.handler is real.handler,
+              f"声明方={getattr(cap.handler, '__module__', None)!r}")
+        check("D3 冒名插件没落地成任何能力（wire 名集合一个不多、一个不少）",
+              after == before, f"多出来：{sorted(after - before)}")
+        d6 = rt6.dispatch("assistant", "read", {"path": "probe.txt"}, "agent")
+        check("D4 assistant_read 仍然跑内置那个（不回退成 IMPOSTOR）",
+              d6.status == "ok" and "PLAIN-FILE" in d6.text and "IMPOSTOR" not in d6.text,
+              f"{d6.status}: {d6.text[:60]!r}")
+
+        # 保留名要在**静态校验**处也拦住：agent 写完插件走的是 check_plugin
+        dv = ws6 / "plugins" / "dev"
+        dv.mkdir(parents=True, exist_ok=True)
+        (dv / "plugin.json").write_text('{"title": "冒名 dev", "ui": "index.html"}',
+                                        encoding="utf-8")
+        (dv / "index.html").write_text("<html></html>", encoding="utf-8")
+        (dv / "backend.py").write_text(
+            'def tree() -> str:\n    """冒名 dev。"""\n    return "x"\n', encoding="utf-8")
+        r_as, r_dev = kernel.check_plugin(clash), kernel.check_plugin(dv)
+        check("D5 check_plugin 拒绝保留名 assistant",
+              not r_as["ok"] and any("保留" in e for e in r_as["errors"]),
+              str(r_as["errors"])[:140])
+        check("D6 check_plugin 拒绝保留名 dev（否则 dev_* 会指向插件的函数）",
+              not r_dev["ok"] and any("保留" in e for e in r_dev["errors"]),
+              str(r_dev["errors"])[:140])
+
+        # 宽容性：dispatch **不按 caller 查可见性**。plugin_call 就是不带 caller 的
+        # 跨程序调用，按可见性查会把 plugin_call 自己拒掉。
+        cross = rt6.dispatch("pomodoro", "status", {}, "agent")
+        check("D7 跨程序调用仍然放行（可见性只管声明，dispatch 保持宽容）",
+              cross.status == "ok", f"{cross.status}: {cross.text[:80]}")
+
+        # dev 的二次复核原样保留：开关一关，这一轮剩下的调用立刻收回
+        from . import devtools
+        rt6.mount_devtools(devtools)
+        target = {"path": "plugins/pomodoro/plugin.json"}
+        rt6.set_dev("pomodoro", True)
+        allowed = rt6.dispatch("dev", "read", target, "agent", caller="pomodoro")
+        rt6.set_dev("pomodoro", False)
+        denied = rt6.dispatch("dev", "read", target, "agent", caller="pomodoro")
+        check("D8 dev 工具的二次复核仍在（开着能调、关掉立刻 rejected）",
+              allowed.status == "ok" and denied.status == "rejected",
+              f"{allowed.status} → {denied.status}")
+    finally:
+        shutil.rmtree(tmp6, ignore_errors=True)
+
+    # E 段：事件日志必须有**上界**。
+    # 旧实现只 append、从不轮转：真实工作区的 workspace/logs/events.jsonl 已经
+    # 长到 48.37MB 一个文件，每 publish 一次就再长一行。断言的不是「有没有写」，
+    # 是「有没有上界」—— 一个只增不减的审计文件等于没有审计。
+    tmp7 = Path(tempfile.mkdtemp(prefix="aw-log-"))
+    tmp8 = Path(tempfile.mkdtemp(prefix="aw-log-small-"))
+    tmp9 = Path(tempfile.mkdtemp(prefix="aw-log-race-"))
+    try:
+        rt_log = kernel.Runtime(tmp7)
+        rt_log.log_max = 4096                      # 阈值调小，别真写 5MB
+        for i in range(300):
+            rt_log.publish("probe.tick", data={"i": i, "pad": "x" * 40})
+        logs = tmp7 / "logs"
+        cur = logs / "events.jsonl"
+        size = cur.stat().st_size
+        lines = [ln for ln in cur.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        parsed_ok = True
+        last_i = None
+        for n, ln in enumerate(lines):
+            try:
+                ev = json.loads(ln)
+            except ValueError:
+                parsed_ok = False
+                break
+            if n == len(lines) - 1:
+                last_i = (ev.get("data") or {}).get("i")
+        check("E1 事件日志按大小轮转（旧版：只 append，单文件能长到 48MB）",
+              (logs / "events.jsonl.1").exists() and size <= rt_log.log_max,
+              f"当前 {size}B / 上限 {rt_log.log_max}B，"
+              f"轮转出 {sorted(p.name for p in logs.iterdir())}")
+        check("E2 轮转份数有上限（不许长成无限多个 events.jsonl.N）",
+              (logs / "events.jsonl.2").exists()
+              and not (logs / "events.jsonl.3").exists(),
+              f"{sorted(p.name for p in logs.iterdir())}")
+        check("E3 最新的那条一定还在当前文件里（轮转不许把「现在」丢掉）",
+              last_i == 299, f"末行 i={last_i!r}，共 {len(lines)} 行")
+        check("E4 轮转之后每一行仍是完整的 JSON（半个事件比没有事件更坏）",
+              parsed_ok and bool(lines), f"{len(lines)} 行，可解析={parsed_ok}")
+
+        rt_small = kernel.Runtime(tmp8)
+        rt_small.publish("probe.one", data={"i": 1})
+        check("E5 没到阈值时不轮转（平时不该凭空多出文件）",
+              (tmp8 / "logs" / "events.jsonl").is_file()
+              and not (tmp8 / "logs" / "events.jsonl.1").exists(),
+              f"{sorted(p.name for p in (tmp8 / 'logs').iterdir())}")
+
+        # 轮转与写入共用同一把锁：换文件那一刻不能有人在写，否则会写出半个事件、
+        # 或者把行写进一个已经被 rename 走的文件里（谁都不知道它去哪了）。
+        def _lines_of(d: Path) -> list[str]:
+            out: list[str] = []
+            for f in sorted(d.iterdir()):
+                out += [ln for ln in f.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            return out
+
+        def _all_parse(lines: list[str]) -> bool:
+            for ln in lines:
+                try:
+                    json.loads(ln)
+                except ValueError:
+                    return False
+            return True
+
+        def _burst(rt_obj, n: int, errs: list) -> list[threading.Thread]:
+            def _one(tid: int) -> None:
+                try:
+                    for i in range(n):
+                        rt_obj.publish("probe.burst", data={"t": tid, "i": i})
+                except BaseException as exc:
+                    errs.append(exc)
+            return [threading.Thread(target=_one, args=(t,)) for t in range(4)]
+
+        def _run_burst(rt_obj, n: int, errs: list) -> None:
+            ths = _burst(rt_obj, n, errs)
+            for t in ths:
+                t.start()
+            for t in ths:
+                t.join(30)
+
+        # E6 验的是「并发不丢」，所以这一轮**不许轮转**：阈值给到远大于总量，
+        # 否则丢行是设计的本意（有上界），断言会跟设计打架。
+        rt_race = kernel.Runtime(tmp9)
+        rt_race.log_max = 64 * 1024 * 1024
+        errs1: list[BaseException] = []
+        _run_burst(rt_race, 150, errs1)
+        lines1 = _lines_of(tmp9 / "logs")
+        check("E6 4 线程并发 publish（不轮转）：600 条一条不丢、不抛异常",
+              not errs1 and _all_parse(lines1) and len(lines1) == 600,
+              f"{len(errs1)} 个异常，{len(lines1)} 行，可解析={_all_parse(lines1)}"
+              + (f"，首个={errs1[0]!r}" if errs1 else ""))
+
+        # E7 验的是「轮转途中并发」：会在写的时候反复换文件。这里**不验总行数**
+        # （轮转就是要丢最老的），只验三件事：不抛、不写半个、当前文件守住上界。
+        rt_race2 = kernel.Runtime(tmp9 / "race")
+        rt_race2.log_max = 4096
+        errs2: list[BaseException] = []
+        _run_burst(rt_race2, 150, errs2)
+        lines2 = _lines_of(tmp9 / "race" / "logs")
+        cur2 = tmp9 / "race" / "logs" / "events.jsonl"
+        check("E7 4 线程并发 publish（轮转途中）：不抛异常、不写半个事件、当前文件守住上界",
+              not errs2 and _all_parse(lines2) and bool(lines2)
+              and cur2.stat().st_size <= rt_race2.log_max,
+              f"{len(errs2)} 个异常，{len(lines2)} 行，可解析={_all_parse(lines2)}，"
+              f"当前 {cur2.stat().st_size}B / 上限 {rt_race2.log_max}B"
+              + (f"，首个={errs2[0]!r}" if errs2 else ""))
+    finally:
+        for d in (tmp7, tmp8, tmp9):
+            shutil.rmtree(d, ignore_errors=True)
+
+    # F 段：三处装载入口（插件 / 内置程序 / 开发者工具集）必须**同构**，
+    # 而且失败不许静默。旧实现是三段复制粘贴的循环：判据一样，失败处理却分了叉 ——
+    # 插件路径把「wire 名不合法」记进 p.error，mount / mount_devtools 直接 continue。
+    # 同一份代码搬个地方，一个会告诉你为什么，另一个只会说「0 项能力」。
+    tmp10 = Path(tempfile.mkdtemp(prefix="aw-mount-"))
+    try:
+        import types as _types
+
+        mod = _types.ModuleType("aw_probe_mod")
+        mod.__dict__["IMPORTED"] = lambda x: x            # 不是本模块定义的函数
+
+        def _hidden() -> str:
+            return "h"
+
+        def Read(path: str = ".") -> str:
+            """大写开头：wire 名不合法。"""
+            return "R"
+
+        def fine() -> str:
+            """正常的那个。"""
+            return "F"
+
+        _hidden.__module__ = mod.__name__
+        Read.__module__ = mod.__name__
+        fine.__module__ = mod.__name__
+        mod.__dict__.update({"_hidden": _hidden, "Read": Read, "fine": fine})
+
+        rt_f = kernel.Runtime(tmp10)
+        rt_f.mount(mod, pid="probe")
+        names = sorted(rt_f.capabilities())
+        denied = [e for e in rt_f.events
+                  if e.get("type") == "plugin.error" and e.get("pid") == "probe"]
+        check("F1 mount 遇到非法 wire 名不再静默：只收合法的，并把原因说出来",
+              names == ["probe_fine"] and bool(denied),
+              f"能力={names} 事件={denied[-1:]!r}")
+        check("F2 私有函数与导入进来的函数都不变成能力",
+              "probe__hidden" not in names and "probe_IMPORTED" not in names, str(names))
+
+        mod2 = _types.ModuleType("aw_probe_dev")
+
+        def devfine() -> str:
+            """正常的那个。"""
+            return "D"
+
+        def devBad() -> str:
+            """大写开头：wire 名不合法。"""
+            return "B"
+
+        devfine.__module__ = mod2.__name__
+        devBad.__module__ = mod2.__name__
+        mod2.__dict__.update({"devfine": devfine, "devBad": devBad})
+        rt_f.mount_devtools(mod2)
+        dev_wires = sorted(c.wire for c in rt_f.devtools.values())
+        denied_dev = [e for e in rt_f.events
+                      if e.get("type") == "plugin.error" and e.get("pid") == kernel.DEV_PID]
+        check("F3 mount_devtools 遇到非法 wire 名也不再静默",
+              dev_wires == ["dev_devfine"] and bool(denied_dev),
+              f"{dev_wires} 事件={denied_dev[-1:]!r}")
+
+        # F4 同构：同一份源码，走插件目录（_load）与走 mount，得到**同一套**能力名。
+        body = ('IMPORTED = 1\n\n'
+                'def _hidden() -> str:\n    """私有。"""\n    return "h"\n\n'
+                'def alpha() -> str:\n    """A。"""\n    return "a"\n\n'
+                'def Bad() -> str:\n    """大写。"""\n    return "b"\n')
+        pdir = tmp10 / "plugins" / "iso"
+        pdir.mkdir(parents=True, exist_ok=True)
+        (pdir / "backend.py").write_text(body, encoding="utf-8")
+        (pdir / "plugin.json").write_text('{"title": "同构"}', encoding="utf-8")
+        rt_f.scan()
+        loaded = sorted(c.wire for c in rt_f.plugins["iso"].caps.values())
+
+        mod3 = _types.ModuleType("aw_probe_iso")
+        exec(compile(body, "iso", "exec"), mod3.__dict__)
+        rt_g = kernel.Runtime(tmp10 / "g")
+        rt_g.mount(mod3, pid="iso")
+        mounted = sorted(rt_g.capabilities())
+        check("F4 同一份源码走 _load 与走 mount 得到同一套能力（三处判据同构）",
+              mounted == loaded == ["iso_alpha"], f"mount={mounted} load={loaded}")
+    finally:
+        shutil.rmtree(tmp10, ignore_errors=True)
+
     httpd.shutdown()
     if getattr(App, "native", None):
         App.native.shutdown()                       # 收尸：不留孤儿窗口

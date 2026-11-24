@@ -32,6 +32,7 @@ import enum
 import importlib.util
 import inspect
 import json
+import os
 import queue
 import re
 import threading
@@ -81,7 +82,24 @@ def _json_safe(value):
 
 WIRE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")   # aaas §3.2 function 名约束
 MAX_EVENT_LOG = 500
+# 审计文件的**上界**。一个只 append 不轮转的日志会一直长 —— 真实工作区里
+# events.jsonl 已经到 48MB，打开它的人要读 48MB 才看得到今天发生了什么。
+LOG_MAX_BYTES = 5 * 1024 * 1024      # 单个文件 5MB
+LOG_KEEP = 2                         # 保留 .1 / .2 两份（合计上限 ≈ 15MB）
 DEV_PID = "dev"      # 开发者工具集的 wire 前缀。它**不是程序**：不进左侧栏、没有界面
+
+# 不能当插件目录名的两个词。为什么必须在**装载处**拦，而不只在提示词里劝：
+# 能力面按 wire name（``<pid>_<fn>``）索引，而 ``assistant`` 是内置程序的 pid、
+# ``dev`` 是开发者工具集的 wire 前缀 —— 一个同名插件目录就能让「声明给模型的
+# 那份」和「真正被执行的那份」指向两个不同的函数。让这个局面从源头不可能出现，
+# 比在 dispatch 里猜「谁该赢」便宜得多。
+RESERVED_PIDS = {"assistant", DEV_PID}
+
+
+def reserved_reason(pid: str) -> str:
+    """保留名的一句话理由（装载处、静态校验处共用同一句）。"""
+    what = "内置程序小助理的 pid" if pid == "assistant" else "开发者工具集的 wire 前缀"
+    return f"{pid!r} 是保留名（{what}）：换个目录名，否则声明与执行会指向两个不同的函数"
 
 
 # --------------------------------------------------------------------- schema
@@ -275,17 +293,43 @@ class Context:
         except (OSError, ValueError):
             return {}
 
+    def _store_lock(self) -> threading.Lock:
+        """这个程序的数据文件锁（唯一一把，按 pid）。"""
+        with self._rt._lock:
+            lk = self._rt._store_locks.get(self._pid)
+            if lk is None:
+                lk = self._rt._store_locks[self._pid] = threading.Lock()
+            return lk
+
     def get(self, key: str, default=None):
-        return self._read().get(key, default)
+        # 读也要进锁，不只是为了「读到一致的整份」：Windows 上 os.replace 撞上
+        # 目标文件正被别的线程打开时会直接 PermissionError —— 读侧不加锁，写侧就
+        # 会随机失败。POSIX 上原子替换本来就保证读到的不会半截，但代价一样地小。
+        with self._store_lock():
+            return self._read().get(key, default)
 
     def set(self, key: str, value) -> None:
-        data = self._read()
-        data[key] = value
+        # 插件同时活在三条路径上：_SerialExecutor 线程（agent 的工具调用）、
+        # HTTP 线程（人在界面上点）、原生窗口进程（走 HTTP 回来）。所以
+        # 读-改-写必须是**一次临界区**，否则后写的那份把先写的那份整体覆盖。
+        #
+        # 临时文件名也必须唯一：写死 store.tmp 时两个线程在同一条路径上互踩
+        # os.replace —— Windows 抛 PermissionError，POSIX 静默丢更新。
         p = self._store
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(p)                                     # 原子替换：半截文件不该被读到
+        with self._store_lock():
+            data = self._read()
+            data[key] = value
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.parent / f".{p.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+            try:
+                tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                               encoding="utf-8")
+                tmp.replace(p)                             # 原子替换：半截文件不该被读到
+            finally:
+                try:
+                    tmp.unlink()                           # 替换成功后它已不存在；失败时别留垃圾
+                except OSError:
+                    pass
 
     # -- 广播：插件自己也能喊一声
     def emit(self, kind: str, payload: dict | None = None) -> None:
@@ -414,10 +458,25 @@ class Runtime:
         self._lock = threading.Lock()
         self.events: list[dict] = []                       # 最近事件（新前端进场先补一份）
         self.log_path = self.root / "logs" / "events.jsonl"
+        # 轮转与写入必须共用**同一把锁**：换文件那一刻不能有人在写，否则行会写进
+        # 一个已经被 rename 走的文件（谁也不知道它去哪了），或者写出半个事件。
+        # log_max / log_keep 做成实例属性而不是直接用常量：门要能用小阈值验证
+        # 「真的会轮转」，而不是靠读源码相信它。
+        self.log_max = LOG_MAX_BYTES
+        self.log_keep = LOG_KEEP
+        self._log_lock = threading.Lock()
+        try:
+            self._log_size = self.log_path.stat().st_size     # 接着上次的大小算
+        except OSError:
+            self._log_size = 0
         # 开发者模式开关。**故意不放在插件目录里**：一个开了开发者模式的程序
         # 能改自己的文件，如果开关跟着它一起被改坏，人就再也没法把它关掉。
         self.dev_path = self.root / "dev.json"
         self._callers = threading.local()                  # 一次 dispatch 的调用者栈
+        # 每个程序一把数据文件锁（pid → Lock）。**按程序**而不是全局：两个程序
+        # 各写各的 store.json 本来互不相干，一把全局锁会让「甲在写」变成「乙也得等」。
+        self._store_locks: dict[str, threading.Lock] = {}
+        self._rejected: dict[str, str] = {}                # 目录名 → 被拒的理由
 
     # -- 事件 ---------------------------------------------------------
     def subscribe(self) -> queue.Queue:
@@ -451,14 +510,40 @@ class Runtime:
         if len(self.events) > MAX_EVENT_LOG:
             del self.events[: len(self.events) - MAX_EVENT_LOG]
         try:                                               # 审计：谁点的、做了什么
+            # default=str：事件里可能带 Path 之类的非 JSON 值。审计写不进去
+            # 只该丢日志 —— 而 TypeError 不是 OSError，它会在 handler 成功之后
+            # 冲出 publish，让调用方拿不到 Result。
+            line = json.dumps(ev, ensure_ascii=False, default=str) + "\n"
+            data = line.encode("utf-8")
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.log_path.open("a", encoding="utf-8") as fh:
-                # default=str：事件里可能带 Path 之类的非 JSON 值。审计写不进去
-                # 只该丢日志 —— 而 TypeError 不是 OSError，它会在 handler 成功之后
-                # 冲出 publish，让调用方拿不到 Result。
-                fh.write(json.dumps(ev, ensure_ascii=False, default=str) + "\n")
+            with self._log_lock:
+                if self._log_size > 0 and self._log_size + len(data) > self.log_max:
+                    self._rotate_log()
+                with self.log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line)
+                self._log_size += len(data)
         except (OSError, TypeError, ValueError):
             pass
+
+    def _rotate_log(self) -> None:
+        """把 events.jsonl 顶掉一格：``.N`` → ``.N+1``（最老的删掉），当前 → ``.1``。
+
+        调用者必须持有 ``_log_lock``。只保留 ``log_keep`` 份：审计是给人查
+        「最近发生了什么」的，不是归档 —— 要么这里给上界，要么这个文件没有上界。
+        """
+        logs = self.log_path.parent
+        try:
+            oldest = logs / f"{self.log_path.name}.{self.log_keep}"
+            if oldest.exists():
+                oldest.unlink()
+            for n in range(self.log_keep - 1, 0, -1):
+                src = logs / f"{self.log_path.name}.{n}"
+                if src.exists():
+                    src.replace(logs / f"{self.log_path.name}.{n + 1}")
+            self.log_path.replace(logs / f"{self.log_path.name}.1")
+        except OSError:
+            return                       # 轮转失败不该丢事件：接着往当前文件写
+        self._log_size = 0
 
     def _offer(self, q: queue.Queue, ev: dict) -> None:
         """投一条事件。队列满时**丢最老的、留最新的**，并且把丢了几条记下来。
@@ -508,9 +593,18 @@ class Runtime:
         # 或者拿到半新半旧的能力面（version 与实际能力不一致）。
         # 先在副本上做完，最后整体换掉 —— 读侧要么看到旧的整份，要么看到新的整份。
         plugins = dict(self.plugins)
+        rejected: dict[str, str] = {}
         if self.plugins_dir.is_dir():
             for d in sorted(self.plugins_dir.iterdir()):
                 if not d.is_dir() or d.name.startswith(("_", ".")):
+                    continue
+                if d.name in RESERVED_PIDS:
+                    # 不装载，也不放进 self.plugins：program() 先查 plugins，
+                    # 放进去就等于把内置程序劫持成了这个目录。
+                    rejected[d.name] = reserved_reason(d.name)
+                    if self._rejected.get(d.name) != rejected[d.name]:
+                        self.publish("plugin.error", pid=d.name,
+                                     data={"error": rejected[d.name]})
                     continue
                 seen.add(d.name)
                 old = plugins.get(d.name)
@@ -530,6 +624,7 @@ class Runtime:
             changed = True
             self.publish("plugin.removed", pid=gone)
         self.plugins = plugins                      # 整体换掉：读侧永远看不到中间态
+        self._rejected = rejected
         if changed:
             self.version += 1
         return f"插件 {len(self.plugins)} 个，能力 {len(self.capabilities())} 项，版本 v{self.version}"
@@ -540,6 +635,10 @@ class Runtime:
         return tuple((f.name, f.stat().st_mtime_ns) for f in files if f.exists())
 
     def _load(self, p: Plugin) -> None:
+        if p.pid in RESERVED_PIDS:
+            p.error = reserved_reason(p.pid)
+            self.publish("plugin.error", pid=p.pid, data={"error": p.error})
+            return
         backend = p.path / "backend.py"
         try:
             p.manifest = json.loads((p.path / "plugin.json").read_text(encoding="utf-8"))
@@ -560,34 +659,39 @@ class Runtime:
             self.publish("plugin.error", pid=p.pid, data={"error": p.error})
             return
         p.module = mod
-        for fn_name, obj in vars(mod).items():
-            if fn_name.startswith("_") or not callable(obj):
-                continue
-            # 只认**定义在本模块里**的公开函数：导入进来的 time/Annotated 不是能力
-            if getattr(obj, "__module__", None) != name:
-                continue
-            if not inspect.isfunction(obj):
-                continue
-            wire = f"{p.pid}_{fn_name}"
-            if not WIRE_NAME_RE.match(wire):
-                p.error = (p.error or "") + f" {wire} 不是合法能力名"
-                continue
-            doc = inspect.getdoc(obj) or ""
-            p.caps[fn_name] = Capability(
-                pid=p.pid, fn=fn_name, wire=wire,
-                description=(doc.splitlines()[0].strip() if doc else f"{p.pid} 的 {fn_name}"),
-                parameters=build_schema(obj), handler=obj,
-                timeout_ms=int(p.manifest.get("timeoutMs", 15_000)),
-            )
+        p.caps, problems = self._collect_caps(
+            mod, p.pid, int(p.manifest.get("timeoutMs", 15_000)))
+        if problems:
+            p.error = ((p.error + "；") if p.error else "") + "；".join(problems)
 
     # -- 能力面 -------------------------------------------------------
-    def capabilities(self) -> dict[str, Capability]:
-        """全部能力 = 内置程序 + 所有插件。**这是模型和人都看到的同一张表。**"""
+    def _registry(self) -> dict[str, Capability]:
+        """**全系统唯一的能力表**：wire name → 能力（内置 + 插件 + 开发者工具集）。
+
+        为什么必须有它：以前有两份，而且优先级方向相反 —— ``capabilities()`` 用
+        dict 覆盖（插件盖内置），``dispatch()`` 用短路（内置 → devtools → 插件）。
+        于是「声明给模型的能力」与「真正被执行的那份」会分叉：插件目录一旦叫
+        assistant，模型看到的 docstring 来自插件、跑起来的函数来自内置。
+
+        现在次序只在这里定**一次**：内置 → 插件覆盖 → 开发者工具集。声明
+        （``capabilities`` / ``capabilities_of``）与执行（``dispatch``）都从它派生。
+        保留名在装载处就被拒，所以「谁该赢」这个问题不再需要回答。
+        """
         out: dict[str, Capability] = {c.wire: c for c in self.builtins.values()}
         for p in self.plugins.values():
             for c in p.caps.values():
                 out[c.wire] = c
+        for c in self.devtools.values():
+            out[c.wire] = c
         return out
+
+    def capabilities(self) -> dict[str, Capability]:
+        """全部能力 = 内置程序 + 所有插件。**这是模型和人都看到的同一张表。**
+
+        开发者工具集**不在其中**：它不是程序、平时不借给任何人，只在
+        ``capabilities_of`` 里对一个开了开发者模式的程序临时出现。
+        """
+        return {w: c for w, c in self._registry().items() if c.pid != DEV_PID}
 
     def capabilities_of(self, pid: str) -> dict[str, Capability]:
         """**一个程序的智能体只能看见自己那部分能力。**
@@ -603,7 +707,8 @@ class Runtime:
         开关本身是人给的，所以这不是「隔离失效」，是「人临时把手借出去」；
         关掉立刻收回（``dispatch`` 里还有一次复核，不等下一轮重声明）。
         """
-        own = {c.wire: c for c in self.capabilities().values() if c.pid == pid}
+        own = {w: c for w, c in self._registry().items()
+               if c.pid == pid and c.pid != DEV_PID}
         if pid in self.plugins and self.dev_mode(pid):
             own.update({c.wire: c for c in self.devtools.values()})
         return own
@@ -679,6 +784,43 @@ class Runtime:
         """按 pid 找程序：插件或内置程序，都没有就 None。"""
         return self.plugins.get(pid) or self.programs.get(pid)
 
+    @staticmethod
+    def _collect_caps(mod, pid: str, timeout_ms: int
+                      ) -> tuple[dict[str, Capability], list[str]]:
+        """一个模块 → 一套能力，以及**没能变成能力的原因**。
+
+        **三处装载入口共用这一份**：插件目录（``_load``）、内置程序（``mount``）、
+        开发者工具集（``mount_devtools``）。以前是三段复制粘贴的循环：判据一样，
+        失败处理却分了叉 —— 插件路径把「wire 名不合法」记进 ``p.error``，另两条
+        静默 ``continue``。于是同一份代码搬个地方，一个会告诉你为什么，
+        另一个只会回报「0 项能力」/「0 项：」。
+
+        判据（四条，缺一条就会把不是能力的东西当能力）：
+          * 不以下划线开头（``_`` = 私有）
+          * 是函数（模块里的常量、类、导入的对象都不是）
+          * ``__module__`` 就是这个模块（``import time`` 进来的不是能力）
+          * ``<pid>_<fn>`` 匹配 aaas 的 function 名约束（大写开头会掉队）
+        """
+        caps: dict[str, Capability] = {}
+        problems: list[str] = []
+        mod_name = getattr(mod, "__name__", None)
+        for fn_name, obj in vars(mod).items():
+            if fn_name.startswith("_") or not callable(obj):
+                continue
+            if not inspect.isfunction(obj) or getattr(obj, "__module__", None) != mod_name:
+                continue
+            wire = f"{pid}_{fn_name}"
+            if not WIRE_NAME_RE.match(wire):
+                problems.append(f"{wire} 不是合法能力名")
+                continue
+            doc = inspect.getdoc(obj) or ""
+            caps[fn_name] = Capability(
+                pid=pid, fn=fn_name, wire=wire,
+                description=(doc.splitlines()[0].strip() if doc else wire),
+                parameters=build_schema(obj), handler=obj, timeout_ms=timeout_ms,
+            )
+        return caps, problems
+
     def mount(self, mod, pid: str = "assistant", program: dict | None = None,
               timeout_ms: int = 120_000) -> str:
         """把一组函数挂成**一个内置程序**的能力（不走插件目录）。
@@ -689,24 +831,16 @@ class Runtime:
         prog = self.programs.get(pid) or BuiltinProgram(pid, program or {})
         if program:
             prog.meta.update(program)
-        added: list[str] = []
-        for fn_name, obj in vars(mod).items():
-            if fn_name.startswith("_") or not callable(obj) or not inspect.isfunction(obj):
-                continue
-            if getattr(obj, "__module__", None) != mod.__name__:
-                continue
-            wire = f"{pid}_{fn_name}"
-            if not WIRE_NAME_RE.match(wire):
-                continue
-            doc = inspect.getdoc(obj) or ""
-            cap = Capability(
-                pid=pid, fn=fn_name, wire=wire,
-                description=(doc.splitlines()[0].strip() if doc else wire),
-                parameters=build_schema(obj), handler=obj, timeout_ms=timeout_ms,
-            )
+        caps, problems = self._collect_caps(mod, pid, timeout_ms)
+        for fn_name, cap in caps.items():
             prog.caps[fn_name] = cap
             self.builtins[(pid, fn_name)] = cap
-            added.append(wire)
+        added = [c.wire for c in caps.values()]
+        if problems:
+            # 以前这里静默 continue：一个函数叫 Read（大写）时 mount 只回报
+            # 「0 项能力」，而同一份代码放进 plugins/ 会被告知原因。
+            self.publish("plugin.error", pid=pid,
+                         data={"error": "；".join(problems), "builtin": True})
         self.programs[pid] = prog
         self.version += 1
         self.publish("plugin.loaded", pid=pid,
@@ -724,22 +858,12 @@ class Runtime:
         多出来的一双手，不是用户多出来的一个应用 —— 摆进左侧栏就是在说
         「你还有个叫开发者的程序」，那是谎话。
         """
-        added: list[str] = []
-        for fn_name, obj in vars(mod).items():
-            if fn_name.startswith("_") or not callable(obj) or not inspect.isfunction(obj):
-                continue
-            if getattr(obj, "__module__", None) != mod.__name__:
-                continue
-            wire = f"{DEV_PID}_{fn_name}"
-            if not WIRE_NAME_RE.match(wire):
-                continue
-            doc = inspect.getdoc(obj) or ""
-            self.devtools[fn_name] = Capability(
-                pid=DEV_PID, fn=fn_name, wire=wire,
-                description=(doc.splitlines()[0].strip() if doc else wire),
-                parameters=build_schema(obj), handler=obj, timeout_ms=timeout_ms,
-            )
-            added.append(wire)
+        caps, problems = self._collect_caps(mod, DEV_PID, timeout_ms)
+        self.devtools.update(caps)
+        added = [c.wire for c in caps.values()]
+        if problems:
+            self.publish("plugin.error", pid=DEV_PID,
+                         data={"error": "；".join(problems)})
         self.version += 1
         return f"开发者工具集 {len(added)} 项：{'、'.join(sorted(added))}"
 
@@ -780,24 +904,20 @@ class Runtime:
         而「人能用、agent 也能用，完全同一件事」是这个产品的地基。
         """
         started = time.perf_counter()
-        cap = self.builtins.get((pid, fn))           # 内核自带的手
-        if cap is None and pid == DEV_PID:           # 开发者工具集（不属于任何程序）
-            cap = self.devtools.get(fn)
-            if cap is None:
-                return self._reject(pid, fn, source, f"开发者工具集里没有 {fn}", started)
+        cap = self._registry().get(f"{pid}_{fn}")    # 与声明同一张表
+        if cap is not None and (cap.pid != pid or cap.fn != fn):
+            # pid 自己带下划线时（dingtalk 那种），拼出来的 wire 可能恰好撞上
+            # 另一个 (pid, fn) 的组合。单表的键是 wire（声明要用），所以这里
+            # 必须核对回去，否则 dispatch("a", "b_c") 会点到 (a_b, c)。
+            cap = None
+        if cap is None:
+            return self._reject(pid, fn, source, self._why_missing(pid, fn), started)
+        if cap.pid == DEV_PID:                       # 开发者工具集（不属于任何程序）
             who = caller if caller is not None else self.caller()
             if not (who and self.dev_mode(who)):
                 # 开关关掉的那一刻就收回。光靠能力面不够：声明在**这一轮开始时**
                 # 已经发出去了，人可以在半路把它关掉，而这一轮还会继续调。
                 return self._reject(pid, fn, source, "开发者模式没有对这个程序打开", started)
-        if cap is None:                              # 否则是某个插件的能力
-            plugin = self.plugins.get(pid)
-            if plugin is None:
-                return self._reject(pid, fn, source, "未知插件", started)
-            cap = plugin.caps.get(fn)
-            if cap is None:
-                return self._reject(pid, fn, source, f"插件 {pid} 没有能力 {fn}", started)
-
         err = validate(cap.parameters, args if args is not None else {})
         if err:
             # rejected 而不是 error：模型自己能改好参数再调一次
@@ -823,6 +943,17 @@ class Runtime:
         self.publish("call.ok", pid=pid, fn=fn, source=source,
                      data={"text": text, "result": data, "caller": caller})
         return res
+
+    def _why_missing(self, pid: str, fn: str) -> str:
+        """找不到能力时的那句话。模型靠它决定下一步，所以别混成一句「未知」。"""
+        if pid == DEV_PID:
+            return f"开发者工具集里没有 {fn}"
+        if pid in self.plugins:
+            return f"插件 {pid} 没有能力 {fn}"
+        prog = self.programs.get(pid)
+        if prog is not None:
+            return f"「{prog.title}」没有能力 {fn}"
+        return f"未知程序 {pid}"
 
     @staticmethod
     def _split(value) -> tuple[str, dict]:
@@ -866,6 +997,8 @@ def check_plugin(path: Path) -> dict:
     path = Path(path)
     errors: list[str] = []
     manifest: dict = {}
+    if path.name in RESERVED_PIDS:
+        errors.append(f"目录名{reserved_reason(path.name)}")
     mf = path / "plugin.json"
     if not mf.is_file():
         errors.append("缺 plugin.json")
