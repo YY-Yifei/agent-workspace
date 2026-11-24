@@ -1520,7 +1520,7 @@ def _run() -> int:
     except Exception as exc:                          # noqa: BLE001
         _raised = f"{type(exc).__name__}: {exc}"
     check("替身卡住时 call() 要抛（旧版 done.wait(5) 之后直接取 box → 悄悄返回 None）",
-          _raised.startswith("TimeoutError"), _raised or "没有抛，返回了 None")
+          _raised.startswith("TimeoutError"), _raised or "没有抛（call 正常返回了）")
 
     # ---- 源码判据：把「为什么必须投递」钉在 pywebview 自己的代码上，而不是我的复述
     # try **只裹读文件**。以前 check 也裹在里面：任何一条断言自己抛异常（键不存在、
@@ -1530,7 +1530,7 @@ def _run() -> int:
     try:
         _ev_src = (_wvdir / "event.py").read_text(encoding="utf-8")
         _edge_src = (_wvdir / "platforms" / "edgechromium.py").read_text(encoding="utf-8")
-    except OSError as exc:
+    except Exception as exc:      # 不只是 OSError：解码错、包装异常都可能，别把「炸」放回来
         _srcs_ok, _srcs_why = False, f"{type(exc).__name__}: {exc}"
         _ev_src = _edge_src = ""
     check("pywebview 源码可读（读不到这一节就一条都验不了）", _srcs_ok, _srcs_why)
@@ -2100,6 +2100,8 @@ def _run() -> int:
     # （builtins → devtools → plugins）—— 优先级方向相反。插件目录一旦叫 assistant，
     # 声明给模型的是插件那份 docstring，执行的是内置那个函数。
     tmp6 = Path(tempfile.mkdtemp(prefix="aw-caps-"))
+    from . import devtools as _devtools
+    _prev_tb, _prev_dv = toolbox._RT, _devtools._RT     # 必须在 try 之前绑：finally 要用
     try:
         ws6 = fixtures.build(tmp6)
         (ws6 / "probe.txt").write_text("PLAIN-FILE", encoding="utf-8")
@@ -2107,8 +2109,6 @@ def _run() -> int:
         # 而本段结束就 rmtree。不还原的话，后面任何一次用到那两把「手」，
         # 都在对着一个已经不存在的目录干活：要么凭空建出一个空目录（断言在空地上
         # 全绿），要么报一个跟被测代码毫无关系的错。所以先存后还。
-        from . import devtools as _devtools
-        _prev_tb, _prev_dv = toolbox._RT, _devtools._RT
         rt6 = kernel.Runtime(ws6)
         assistant.install(rt6)
         rt6.scan()
@@ -2223,7 +2223,7 @@ def _run() -> int:
             if n == len(lines) - 1:
                 last_i = (ev.get("data") or {}).get("i")
         check("E1 事件日志按大小轮转（旧版：只 append，单文件能长到 48MB）",
-              (logs / "events.jsonl.1").exists() and size <= rt_log.log_max,
+              (logs / "events.jsonl.1").exists() and 0 < size <= rt_log.log_max,
               f"当前 {size}B / 上限 {rt_log.log_max}B，轮转出 {_names(logs)}{_cur_why}")
         _keep = rt_log.log_keep
         check("E2 轮转份数有上限（不许长成无限多个 events.jsonl.N）",
@@ -2359,7 +2359,7 @@ def _run() -> int:
                   _held and a1b == a1 and a2b == a2,
                   f".1 {_delta(a1, a1b)}、.2 {_delta(a2, a2b)}{_held_why}")
             check("E9 失败后 _log_size 与当前文件的真实字节数一致（不一致就让每次写都重试轮转）",
-                  size_told == len(cur_bytes),
+                  _held and size_told == len(cur_bytes),
                   f"_log_size={size_told} 真实={len(cur_bytes)}")
             _crlf = b"\r\n" in cur_bytes
             check("E10 写审计用二进制追加：文件里没有 CRLF、计数与字节数同源"
@@ -2372,6 +2372,71 @@ def _run() -> int:
             check("E12 句柄放开后下一次写就能正常轮转（失败状态不粘连）",
                   _held and a1c == cur_bytes,
                   f".1 {len(a1c)}B vs 失败时的当前文件 {len(cur_bytes)}B{_held_why}")
+
+            # E13：归档链上**不许有破坏性步骤跑在移动前面**。
+            # 上一版是先 unlink(.log_keep)、再把 .1→.2、最后 stage→.1。于是一旦 .1
+            # 挪不动（Windows 上被打开着 → WinError 32），.log_keep 已经被删、.1 还在
+            # 原地，恢复把当前文件放回去 —— 一代归档凭空消失，而这次轮转根本没发生。
+            # 注入用 monkeypatch 而不是「占住文件」：句柄只挡 Windows，注入在哪都能跑。
+            _orig_replace = Path.replace
+            _a1_before = _blob(logs_f / "events.jsonl.1")
+            _a2_before = _blob(logs_f / "events.jsonl.2")
+
+            def _blocked(self_path, target, *a, **kw):
+                if Path(self_path).name == "events.jsonl.1":
+                    raise OSError("注入：.1 挪不动（模拟被别的进程打开）")
+                return _orig_replace(self_path, target, *a, **kw)
+
+            Path.replace = _blocked
+            try:
+                for i in range(20):
+                    rt_fail.publish("probe.blocked", data={"i": i})
+            finally:
+                Path.replace = _orig_replace
+            _a1_after = _blob(logs_f / "events.jsonl.1")
+            _a2_after = _blob(logs_f / "events.jsonl.2")
+            check("E13 归档链上不许先删再挪（.1 挪不动时 .2 必须原封不动）",
+                  _a2_after == _a2_before and _a1_after == _a1_before,
+                  f".2 {_delta(_a2_before, _a2_after)}、.1 {_delta(_a1_before, _a1_after)}")
+
+            # E14：_recover_staging 的另一条分支 —— .staging 与当前文件**同时**在
+            # （copy + unlink 那条，语义最容易错）。前面 E11 只覆盖了「当前文件不在」。
+            _mix = tmp_stage / "mix" / "logs"
+            _mix.mkdir(parents=True)
+            (_mix / "events.jsonl").write_bytes(b'{"type":"cur.line"}\n')
+            (_mix / "events.jsonl.staging").write_bytes(b'{"type":"stage.line"}\n')
+            kernel.Runtime(tmp_stage / "mix")          # 构造即收拾
+            _mixed = _blob(_mix / "events.jsonl")
+            check("E14 重启时 .staging 与当前文件都在：两段都得保住、.staging 要清掉",
+                  b'"cur.line"' in _mixed and b'"stage.line"' in _mixed
+                  and not (_mix / "events.jsonl.staging").exists(),
+                  f"{_mixed[:120]!r}")
+
+            # E15：收拾失败时**不许继续轮转**。否则 cur→.staging 会把上一次崩溃留下的
+            # 那段审计直接覆盖掉 —— 一个「为了不丢」，真正丢在这。
+            _mix2 = tmp_stage / "mix2" / "logs"
+            _mix2.mkdir(parents=True)
+            (_mix2 / "events.jsonl").write_bytes(b'{"type":"cur2"}\n')
+            (_mix2 / "events.jsonl.staging").write_bytes(b'{"type":"KEEP.ME"}\n')
+            _orig_copy = kernel.shutil.copyfileobj
+
+            def _boom(*a, **kw):
+                raise OSError("注入：合并失败")
+
+            # 注入必须一直覆盖到发布期间：只在构造时注入的话，发布时已撤掉，
+            # 收拾会成功、数据正常并回并正常轮转 —— 根本验不到「失败时跳过轮转」。
+            kernel.shutil.copyfileobj = _boom
+            try:
+                _rt2 = kernel.Runtime(tmp_stage / "mix2")
+                _rt2.log_max = 20                       # 一点就够轮转
+                for i in range(5):
+                    _rt2.publish("probe.mix2", data={"i": i})
+            finally:
+                kernel.shutil.copyfileobj = _orig_copy
+            _stage_kept = _blob(_mix2 / "events.jsonl.staging")
+            check("E15 收拾 .staging 失败时不许继续轮转（否则 cur→.staging 把那段覆盖掉）",
+                  b"KEEP.ME" in _stage_kept,
+                  f".staging={_stage_kept[:60]!r}，目录={_names(_mix2)}")
 
             # 轮转中途崩掉会在磁盘上留一份 .staging —— 里面是「当时全部的当前事件」。
             # 把它当垃圾删掉 = 悄悄吃掉一段审计，所以重启时第一件事就是收拾它。

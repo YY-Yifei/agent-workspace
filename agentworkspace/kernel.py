@@ -542,24 +542,35 @@ class Runtime:
         except OSError:
             return 0
 
-    def _recover_staging(self) -> None:
-        """收拾上一次轮转崩在中途留下的现场。
+    def _recover_staging(self) -> bool:
+        """收拾上一次轮转崩在中途留下的现场。返回**是否收拾干净**。
 
         崩在「当前文件已经挪开、归档链还没走完」之间时，事件全在那份 .staging
         里。把它当垃圾删掉就是**悄悄吃掉一段审计** —— 宁可这一次超阈值，也不丢。
+
+        返回值不是装饰：收拾不干净时上层**不许继续轮转** —— 否则 cur→.staging
+        这一步会把那段还没并回来的审计直接覆盖掉（「为了不丢」丢在这）。
+
+        两条已知的粗糙处（都是低危，记在这里而不是假装没有）：
+          * 并回去是**追加到当前文件末尾**，所以顺序不是严格按时间 —— 崩溃之后
+            同一份审计里会有两段各自有序的内容。读的人应当按每条事件自己的 ``ts``
+            排序，而不是按文件行序。
+          * copy 与 unlink 不是原子的：若在两者之间崩掉，下次恢复会把同一段
+            再并一遍，那几行会重复。宁可重复，不可丢失。
         """
         stage = self._staging_path()
         try:
             if not stage.exists():
-                return
+                return True
             if not self.log_path.exists():
                 stage.replace(self.log_path)
-                return
+                return True
             with stage.open("rb") as src, self.log_path.open("ab") as dst:
                 shutil.copyfileobj(src, dst)
             stage.unlink()
+            return True
         except OSError:
-            pass
+            return False
 
     def _rotate_log(self) -> None:
         """把 events.jsonl 顶掉一格：``.N`` → ``.N+1``（最老的删掉），当前 → ``.1``。
@@ -576,16 +587,20 @@ class Runtime:
         """
         logs = self.log_path.parent
         stage = self._staging_path()
-        self._recover_staging()
+        if not self._recover_staging():
+            # 上一次崩在中途的那段还没并回来：此刻轮转 = cur→.staging 把它覆盖掉。
+            self._log_size = self._log_bytes()
+            return
         try:
             self.log_path.replace(stage)        # ① 先把自己挪开
         except OSError:
             self._log_size = self._log_bytes()  # 挪不动 = 本次不轮转，归档一根手指都不碰
             return
         try:                                    # ② 自己安全了，才有资格动归档
-            oldest = logs / f"{self.log_path.name}.{self.log_keep}"
-            if oldest.exists():
-                oldest.unlink()
+            # **这里不先删 .log_keep**：下面第一次 replace（n = log_keep-1 → log_keep）
+            # 就会把它覆盖掉。多一次 unlink 只是多开一个「删了还没挪」的窗口 ——
+            # .1 挪不动时（被别的进程打开着 → WinError 32）那一步已经白删了一代归档，
+            # 恢复又把当前文件放回来，等于这次轮转没发生、却少了一份归档。
             for n in range(self.log_keep - 1, 0, -1):
                 src = logs / f"{self.log_path.name}.{n}"
                 if src.exists():
