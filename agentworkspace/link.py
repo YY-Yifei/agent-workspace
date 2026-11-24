@@ -86,6 +86,29 @@ def _read(path: Path) -> str:
         return ""
 
 
+# 重连退避的封顶：不再翻倍，也不再无限膨胀（秒）。
+RECONNECT_CAP = 30.0
+# 造 Caller 的**唯一**出口，同时是测试注入点：selftest [23] 用假 transport 跑真 Link，
+# 断言「掉线之后自己回来」。注入点必须在模块上 —— 放在 Link 里就只有第一次连接能被替身。
+CALLER_CLASS: type | None = None
+
+
+def _make_caller(url: str, token):
+    """建一条 Caller。重连会反复经过这里，所以只此一处 new。"""
+    cls = CALLER_CLASS or aaas.Caller
+    return cls(url, token=token)
+
+
+def _backoff(attempt: int) -> float:
+    """第 attempt 次连续失败后睡多久：1,2,4,8,16,30,30…（秒）。
+
+    抽成纯函数是为了**能被断言**（selftest [23] A7）：序列写在形式里，
+    而不是藏在 while 里的某个 ``* 2`` 里 —— 那种东西没人能验。
+    """
+    n = max(1, int(attempt))
+    return float(min(RECONNECT_CAP, 2.0 ** (n - 1)))
+
+
 class _SerialExecutor:
     """一条 daemon 线程 + 一条队列：把**同步**执行体挪出事件循环，且保持串行。
 
@@ -164,7 +187,12 @@ class Link:
         self._declared_sig: tuple | None = None
         self._declare_fails = 0        # 同一份坏声明连续失败几次（用来停手）
         self._declare_sig_tried: tuple | None = None   # 上面的计数属于哪一份声明
-        self.status = "idle"            # idle | connecting | ready | error | closed
+        # idle | connecting | ready | reconnecting | error | closed
+        # reconnecting 是**新的真话**：以前断线不改状态，于是它一直是 ready，
+        # 而下一句会撞进一个已经不存在的连接。
+        self.status = "idle"
+        self._reconnects = 0            # 这一条 Link 掉线过几次（as_dict 报给界面）
+        self._lost_at: float | None = None
         self.error: str | None = None
         self.session_id: str | None = None
         self.auto_continue = True       # 本轮内自己的能力面变了 → 自动接力一轮
@@ -212,31 +240,131 @@ class Link:
         token = self.cfg.get("token")
         self.status = "connecting"
         self._emit("link.status", {"status": "connecting", "url": url})
-        try:
-            self._caller = aaas.Caller(url, token=token)
-            await self._caller.connect()
-        except Exception as exc:      # 连不上就是连不上：如实报，不做假聊天降级
-            self.status = "error"
-            self.error = f"{type(exc).__name__}: {exc}"
-            self._emit("link.status", {"status": "error", "error": self.error,
-                                       "hint": "检查 workspace/config.json 里的 aaas.url，"
-                                               "或先启动 aaas-service"})
-            return
-
-        cr = self._caller.connect_result
-        self.session_id = getattr(cr, "session_id", None)
-        # **先声明，再标 ready。** 反过来的话，第一句话可能在 declare 还在路上时就被
-        # 调度出去 —— 那一轮里模型看不到这个程序的任何能力（工具还没到）。
-        self._mark_ready(await self._declare())
-        # 连接活着的期间：**这个程序**的能力有变化就重新声明。
-        # 判据是能力面的差异，不是 rt.version —— 版本号是全工作区的，
-        # 别的插件变了也跟着跳，那会让每个程序无谓地重声明。
-        while True:
-            await asyncio.sleep(0.5)
+        fails = 0                        # 连续失败几次 —— 退避的指数
+        while self.status != "closed":
+            if fails:
+                delay = _backoff(fails)
+                self._emit("link.retry", {"attempt": fails, "delay": delay,
+                                          "error": self.error, "url": url})
+                if not await self._sleep(delay):
+                    return               # stop() 在睡眠里把状态改成了 closed
+            if not await self._connect(url, token):
+                fails += 1
+                continue
+            fails = 0
+            why = None
+            # 连接活着的期间：等它坏，或者**这个程序**的能力面变了要重声明。
+            # 判据是能力面的差异，不是 rt.version —— 版本号是全工作区的，
+            # 别的插件变了也跟着跳，那会让每个程序无谓地重声明。
+            while self.status != "closed":
+                if not await self._sleep(0.5):
+                    return
+                why = self._lost()
+                if why:
+                    break
+                if self._sig() != self._declared_sig:
+                    self._mark_ready(await self._declare())
             if self.status == "closed":
                 return
-            if self._sig() != self._declared_sig:
-                self._mark_ready(await self._declare())
+            # 掉线：先把这条连接收干净（在飞那一轮要收到终态，闸门才开得回来），
+            # 再说实话（reconnecting），然后从 1 秒开始退避重连。
+            await self._drop_caller(why)
+            fails = 1
+
+    async def _connect(self, url: str, token) -> bool:
+        """建一条连接并声明。返回是否成功（失败时 error 已写好、状态已说实话）。"""
+        try:
+            self._caller = _make_caller(url, token)
+            await self._caller.connect()
+        except Exception as exc:      # 连不上就是连不上：如实报，不做假聊天降级
+            self._caller = None       # 半成品不带进下一轮
+            self.error = f"{type(exc).__name__}: {exc}"
+            self.status = "reconnecting"
+            self._emit("link.status", {"status": "reconnecting", "url": url,
+                                       "error": self.error,
+                                       "attempt": self._reconnects + 1,
+                                       "hint": "检查 workspace/config.json 里的 aaas.url，"
+                                               "或先启动 aaas-service"})
+            return False
+        cr = self._caller.connect_result
+        self.session_id = getattr(cr, "session_id", None)
+        self._turn = None            # 上一轮的终态属于上一条连接
+        # **先声明，再标 ready。** 反过来的话，第一句话可能在 declare 还在路上时就被
+        # 调度出去 —— 那一轮里模型看不到这个程序的任何能力（工具还没到）。
+        ok = await self._declare()
+        if ok:
+            self.error = None
+            self._lost_at = None
+        else:
+            self.status = "reconnecting"
+        self._mark_ready(ok)
+        return ok
+
+    def _lost(self) -> str | None:
+        """这条连接还活着吗？返回「为什么算掉线」，或 None。
+
+        aaas 没有公开的「断开」回调，所以读它的**实际状态**，判据写在明处：
+          * ``_reader.done()``：读循环退出 —— 远端消失时最先出现的信号
+          * ``_ws.close_code``：websockets 已判定关闭（1006 = 连关闭帧都没收到）
+          * ``_closed``：Caller 自己被关过
+        三个都不看「我们有没有在发请求」，所以闲置的连接也查得出来。
+        """
+        caller = self._caller
+        if caller is None:
+            return "no caller"
+        reader = getattr(caller, "_reader", None)
+        if reader is not None and getattr(reader, "done", lambda: False)():
+            return "read loop ended"
+        ws = getattr(caller, "_ws", None)
+        if ws is None:
+            return "socket gone"
+        code = getattr(ws, "close_code", None)
+        if code is not None:
+            return f"socket closed ({code})"
+        if getattr(caller, "_closed", False):
+            return "caller closed"
+        return None
+
+    async def _drop_caller(self, why: str | None) -> None:
+        """收掉断掉的那条连接，并把状态说成真话（reconnecting）。
+
+        为什么必须 close：``Caller.close()`` 会给在飞的轮发 ``connection_lost`` 终态
+        （abrupt 掉线时 ``_read_loop`` 的 finally 也会做；close 顺带收掉 socket 与读
+        任务）。轮拿到终态，``_open_turn`` 的 finally 才开得回闸门 —— 否则闸门永久
+        关着，表现是「这个程序从此只回你一句『上一轮还没结束』」。
+        """
+        caller, self._caller = self._caller, None
+        self._turn = None
+        self._reconnects += 1
+        self._lost_at = time.time()
+        self.status = "reconnecting"
+        # 状态说「在重连」，error 必须说「为什么」—— 否则界面上一句没有原因的重连中，
+        # 人只能自己猜是网络、是服务端重启、还是地址写错了。
+        self.error = f"连接断开：{why}" if why else "连接断开"
+        self._emit("link.status", {"status": "reconnecting", "why": why,
+                                   "error": self.error, "attempt": self._reconnects,
+                                   "lossAt": self._lost_at})
+        if caller is None:
+            return
+        try:
+            await asyncio.wait_for(caller.close(), timeout=3.0)
+        except Exception:            # 拆除路径上的异常不该把重连卡住
+            pass
+
+    async def _sleep(self, secs: float) -> bool:
+        """短步睡眠：``stop()`` 一声令下就回来。返回 False 表示已关闭。
+
+        为什么不 ``await asyncio.sleep(secs)`` 一把睡过去：退避封顶 30 秒，一觉睡完
+        才看状态的话，关窗口也要陪着等 30 秒 —— 那正是「关不掉」的来源。
+        """
+        end = time.time() + max(0.0, float(secs))
+        while True:
+            if self.status == "closed":
+                return False
+            left = end - time.time()
+            if left <= 0:
+                return self.status != "closed"
+            await asyncio.sleep(min(0.2, left))
 
     def _emit(self, kind: str, data: dict, source: str = "system") -> None:
         self.rt.publish(kind, pid=self.pid, source=source, data=data)
@@ -389,12 +517,18 @@ class Link:
         那句话就消失了：不报错、只是没人理，最坏的一种失败形态。
         所以这里等一小会儿（默认 20 秒）；等不到才算失败，且如实说。
         """
-        if self.status in ("idle", "connecting") and wait > 0:
+        # reconnecting 也要等：掉线后 1 秒就开始重连了，这时人开口的那句话
+        # 不该被立刻拒掉（「首句不能丢」的通则，断线重连是它的另一半）。
+        waiting = ("idle", "connecting", "reconnecting")
+        if self.status in waiting and wait > 0:
             deadline = time.time() + wait
-            while time.time() < deadline and self.status in ("idle", "connecting"):
+            while time.time() < deadline and self.status in waiting:
                 time.sleep(0.05)
         if self.status != "ready" or self._loop is None:
-            return self.error or "还没连上 aaas-service"
+            if self.status == "reconnecting":
+                return (f"连接断了，正在重连（第 {self._reconnects} 次）："
+                        f"{self.error or '原因未知'}")
+            return self.error or f"还没连上 aaas-service（当前 {self.status}）"
         with self._send_lock:                      # 「检查 + 置位」必须是一步
             # aaas.Turn.done 是 **property**（返回 final is not None），不是方法。
             # 写成 .done() 会 TypeError: 'bool' object is not callable。
@@ -621,6 +755,7 @@ class Link:
         SHOW = 60
         return {"pid": self.pid, "status": self.status, "error": self.error,
                 "sessionId": self.session_id, "busy": self._busy,
+                "reconnects": self._reconnects, "lastLostAt": self._lost_at,
                 "sid": self.sid, "title": self.title,
                 "turns": self._stat.get("turns", 0),
                 "tokensIn": self._stat.get("tokensIn", 0),

@@ -138,7 +138,10 @@ def cli(ws: Path, message: str | None, pid: str = ASSISTANT) -> int:
     if link.status != "ready":
         # 超时也要算失败：idle / connecting 都不是「连上了」。原来只判 error，
         # 于是 30 秒没连上照样打印「已连接 session=None」，再发一句必然发不出去的话。
-        why = link.error if link.status == "error" else f"30 秒内没连上（现在是 {link.status}）"
+        # 断线自愈之后，「连不上」很少是终态 error 了：它会在 reconnecting 里一直试。
+        # 所以把最后一次的原因一起说出来 —— 只说状态等于让人自己猜为什么。
+        why = (f"{link.error}（现在是 {link.status}）" if link.error
+               else f"30 秒内没连上（现在是 {link.status}）")
         print(f"[道] 连不上：{why}", flush=True)
         print("     → 检查 workspace/config.json 里的 aaas.url，或先启动 aaas-service", flush=True)
         hub.stop()

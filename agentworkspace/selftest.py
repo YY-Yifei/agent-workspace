@@ -1610,6 +1610,171 @@ def _run() -> int:
             link_slow.stop()          # 收掉那条 daemon 执行线程
         shutil.rmtree(tmp3, ignore_errors=True)
 
+    # ------------------------------------------------------------ [23] 断线自愈 / 丢弃可见
+    print("[23] harness 两处缺口：断线自愈（退避 + 状态说实话）、事件队列丢弃可见")
+    # A 段用**真 Link + 假 Caller**（注入点 link.CALLER_CLASS）。
+    # 旧实现的失败形态不是「报错」，是「永久假 ready」：断线之后 status 还是 ready、
+    # connects 还是 1，下一句 send() 撞进一个已经不存在的连接。所以断言必须
+    # **跨过一次真实掉线**，而不是读源码判断「有没有写重连」。
+    from . import link as linkmod                    # 只为拿模块上的注入点
+
+    tmp4 = Path(tempfile.mkdtemp(prefix="aw-link-"))
+    link_rec = None
+    _prev_cls = getattr(linkmod, "CALLER_CLASS", None)
+    try:
+        class _FakeWS:
+            """websockets 连接的最小替身：只提供 close_code。"""
+
+            def __init__(self):
+                self.close_code = None
+
+        class _FakeReader:
+            """读循环的替身：远端消失时 done() 为真 —— 这正是真实现里的信号。"""
+
+            def __init__(self, owner):
+                self.owner = owner
+
+            def done(self):
+                return self.owner.dropped
+
+        class _FakeCR:
+            session_id = "s_fake"
+            history_mode = "stateless"
+
+        class _FakeCaller:
+            """只实现 Link 用到的那几样；``drop()`` 模拟远端消失。"""
+
+            connects = 0
+            declares = 0
+            closes = 0
+            fail = False
+
+            def __init__(self, url, token=None):
+                self.url = url
+                self.dropped = False
+                self._closed = False
+                self._ws = _FakeWS()
+                self._reader = _FakeReader(self)
+                self.connect_result = _FakeCR()
+
+            async def connect(self):
+                if _FakeCaller.fail:
+                    raise OSError("连不上（模拟）")
+                _FakeCaller.connects += 1
+                return self.connect_result
+
+            async def declare(self, definition, tools=()):
+                _FakeCaller.declares += 1
+                return "rev-1", [t.declaration.name for t in tools]
+
+            async def send(self, text, instructions=None, history=None):
+                raise AssertionError("这一节不发轮次")
+
+            async def close(self):
+                self.dropped = True
+                self._closed = True
+                _FakeCaller.closes += 1
+
+            def drop(self):
+                self.dropped = True
+                self._ws.close_code = 1006
+
+        class _LinkRT:
+            """Link 需要的最小 Runtime：没有能力、事件只记不发。"""
+
+            version = 0
+
+            def __init__(self):
+                self.kinds = []
+
+            def capabilities_of(self, pid):
+                return {}
+
+            def program(self, pid):
+                return object()
+
+            def dev_mode(self, pid):
+                return False
+
+            def publish(self, kind, **kw):
+                self.kinds.append(kind)
+
+            def dispatch(self, *a, **kw):
+                raise AssertionError("这一节不执行工具")
+
+        def _wait(pred, secs=3.0):
+            end = time.time() + secs
+            while time.time() < end:
+                try:
+                    if pred():
+                        return True
+                except Exception:              # 判据自身不该把这一节炸掉
+                    pass
+                time.sleep(0.02)
+            return False
+
+        linkmod.CALLER_CLASS = _FakeCaller
+        rt_link = _LinkRT()
+        link_rec = Link(rt_link, tmp4, {"url": "ws://fake/"}, "assistant")
+        link_rec.start()
+        up = _wait(lambda: link_rec.status == "ready", 5.0)
+        check("A1 注入假 Caller 后能连上并声明（ready / connects=1 / declares=1）",
+              up and _FakeCaller.connects == 1 and _FakeCaller.declares == 1,
+              f"status={link_rec.status} connects={_FakeCaller.connects} "
+              f"declares={_FakeCaller.declares}")
+
+        first = link_rec._caller
+        if getattr(first, "drop", None):
+            first.drop()                                 # 远端消失
+        healed = _wait(lambda: link_rec.status == "ready" and _FakeCaller.connects >= 2, 8.0)
+        check("A2 掉线后自己重连回来（connects ≥ 2 且 status 回到 ready）",
+              healed, f"connects={_FakeCaller.connects} status={link_rec.status}")
+        check("A3 重连之后**重新声明**过（只连上不声明 = 模型看不到任何能力）",
+              _FakeCaller.declares >= 2, f"declares={_FakeCaller.declares}")
+        check("A4 断掉的那条连接被 close 过（在飞那一轮才收得到终态、闸门才开得回来）",
+              _FakeCaller.closes >= 1, f"closes={_FakeCaller.closes}")
+
+        # 让下一轮连接必然失败：状态必须说「在重连」，而不是假装 ready、也不是一次就认死。
+        _FakeCaller.fail = True
+        cur = link_rec._caller
+        if getattr(cur, "drop", None):
+            cur.drop()
+        saw_rec = _wait(lambda: link_rec.status == "reconnecting", 8.0)
+        check("A5 连不上时 status 是 reconnecting（不假装 ready，也不一次就认死）",
+              saw_rec, f"status={link_rec.status}")
+        check("A6 重连途中 error 里有原因（不许只说「在重连」）",
+              bool(link_rec.error), f"error={link_rec.error!r}")
+
+        back = getattr(linkmod, "_backoff", None)
+        seq = [back(n) for n in range(1, 8)] if callable(back) else None
+        check("A7 退避序列 1/2/4/8/16/30/30（封顶 30 秒，不无限膨胀）",
+              seq == [1, 2, 4, 8, 16, 30, 30], f"{seq}")
+
+        link_rec.stop()
+        thr = getattr(link_rec, "_thread", None)
+        if thr is not None:
+            thr.join(2.5)
+        check("A8 stop() 在退避睡眠里也能立刻收手（线程 2.5 秒内结束）",
+              thr is None or not thr.is_alive(),
+              f"还活着={thr.is_alive() if thr is not None else None}")
+        snap = link_rec.as_dict() or {}
+        check("A9 as_dict 报出重连次数与最后一次掉线时刻（界面/日志要看得见）",
+              isinstance(snap.get("reconnects"), int) and snap.get("reconnects", 0) >= 1
+              and snap.get("lastLostAt") is not None,
+              f"reconnects={snap.get('reconnects')!r} lastLostAt={snap.get('lastLostAt')!r}")
+    finally:
+        if link_rec is not None:
+            link_rec.stop()
+        if _prev_cls is None:
+            try:
+                delattr(linkmod, "CALLER_CLASS")
+            except AttributeError:
+                pass
+        else:
+            linkmod.CALLER_CLASS = _prev_cls          # 替身只活在这一节里
+        shutil.rmtree(tmp4, ignore_errors=True)
+
+
     httpd.shutdown()
     if getattr(App, "native", None):
         App.native.shutdown()                       # 收尸：不留孤儿窗口
