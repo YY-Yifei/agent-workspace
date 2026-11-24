@@ -17,6 +17,26 @@
 
 这条边界很干净：外壳不认识内核、不认识道，它只知道一个 URL。
 将来换 Electron / Tauri / 系统托盘，也只动这一个文件。
+
+**为什么这里要专门为「选中复制」写代码**（第二十三轮的账）：
+
+pywebview 默认把「选中文字」这件事关掉了 —— ``create_window`` 的 ``text_select``
+默认是 ``False``（6.2.1 的 ``window.py``），而它会变成 ``js/customize.js`` 里的
+``disableTextCss``：``body{-webkit-user-select:none;…;cursor:default}``。
+那不是「某个控件不能选」，是**整页**不能选。
+
+就算选中了，WebView2 层还有两道闸，pywebview 把它们绑在自己的 ``debug`` 上
+（``platforms/edgechromium.py``）：::
+
+    AreBrowserAcceleratorKeysEnabled = _state['debug']   → Ctrl+C / Ctrl+A
+    AreDefaultContextMenusEnabled   = _state['debug']    → 右键菜单里的「复制」
+
+我们的窗口默认不是 debug，于是两者都是 ``False``：**选中、Ctrl+C、右键复制
+三条路同时断**。三处一起修才是「能正常选中复制」，只修一处等于没修。
+
+这里同时做兼容：老版本 pywebview 不认 ``text_select`` 参数（会 TypeError），
+那就退回不传 —— 页面里还有一层 ``user-select:text`` 与 Ctrl+C 兜底，
+不至于因为版本差一个参数就整页复制不了。
 """
 
 from __future__ import annotations
@@ -56,6 +76,25 @@ def fit(width: int, height: int, area: tuple[int, int, int, int] | None = None
     return ax + max(0, (aw - w) // 2), ay + max(0, (ah - h) // 2), w, h
 
 
+def open_copy_doors(window, debug: bool = False) -> tuple[bool, str]:
+    """把「选中 → 复制」那两道被 pywebview 关掉的闸打开。
+
+    返回 (是否真的改到了, 说明) —— 这个返回值只给测试与日志用：
+    改不到**不是错误**（别的平台没有 CoreWebView2），页面侧还有兜底。
+
+    DevTools 仍然跟随 ``debug``：不因为要能复制就把 F12 一起送出去。
+    """
+    try:
+        core = window.native.webview.CoreWebView2
+        s = core.Settings
+        s.AreDefaultContextMenusEnabled = True      # 右键 → 复制
+        s.AreBrowserAcceleratorKeysEnabled = True  # Ctrl+C / Ctrl+A
+        s.AreDevToolsEnabled = bool(debug)         # 仍然不给调试器
+        return True, "webview2 settings applied"
+    except Exception as exc:                        # 拿不到 native / 不是 WebView2
+        return False, f"{type(exc).__name__}: {exc}"
+
+
 def run(url: str, *, title: str = TITLE, width: int = 1180, height: int = 800,
         debug: bool = False, storage: Path | None = None, icon: Path | None = None,
         timeout: float = LOAD_TIMEOUT) -> str:
@@ -71,11 +110,19 @@ def run(url: str, *, title: str = TITLE, width: int = 1180, height: int = 800,
     loaded = threading.Event()
     try:
         x, y, w, h = fit(width, height)        # 装进工作区，别让底部掉到屏幕外
-        window = webview.create_window(title, url, width=w, height=h, x=x, y=y,
-                                       min_size=(min(760, w), min(520, h)),
-                                       background_color="#f7f6f4")
+        common = dict(min_size=(min(760, w), min(520, h)), background_color="#f7f6f4")
+        try:
+            # text_select=True → pywebview 不再注入 body{user-select:none}
+            window = webview.create_window(title, url, width=w, height=h, x=x, y=y,
+                                           text_select=True, **common)
+        except TypeError:                       # 老版本 pywebview 没有这个参数
+            window = webview.create_window(title, url, width=w, height=h, x=x, y=y,
+                                           **common)
 
         def _on_loaded() -> None:          # 页面真的渲染出来了
+            # 这两项设置只在 WebView2 上存在，而且必须等 CoreWebView2 就绪
+            # （正是 loaded 的这一刻）。改不到就算了 —— 页面里有兜底。
+            open_copy_doors(window, debug)
             loaded.set()
 
         # pywebview 的事件是**可 += 的对象**，不是装饰器。

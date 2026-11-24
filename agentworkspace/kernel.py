@@ -226,6 +226,9 @@ class Plugin:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.pid = path.name
+        # 插件目录的绝对形态，只算一次：Plugin.ui 每次取值都要拿它做越界判断，
+        # 而 as_dict() 每个程序每份 state 都会走一遍 ui。
+        self._root = path.resolve()
         self.manifest: dict = {}
         self.caps: dict[str, Capability] = {}
         self.module = None
@@ -233,8 +236,16 @@ class Plugin:
 
     @property
     def ui(self) -> Path | None:
-        """这个程序的界面入口文件（网页或原生窗口脚本）。"""
-        p = self.path / (self.manifest.get("ui") or "ui/index.html")
+        """这个程序的界面入口文件（网页或原生窗口脚本）。
+
+        ``ui`` 是**插件自己写的 json 字段**，不可信：写成 ``../../config.json``
+        时它必须变成「没有界面」，而不是把宿主上任意一个文件交给页面。界一越，
+        ``hasUi`` / ``uiKind`` / ``/plugin/<pid>/`` 读到的就是同一个「没有」——
+        不会出现「清单说有页面，点开是 403」那种自相矛盾。
+        """
+        p = (self.path / (self.manifest.get("ui") or "ui/index.html")).resolve()
+        if not p.is_relative_to(self._root):
+            return None
         return p if p.is_file() else None
 
     @property

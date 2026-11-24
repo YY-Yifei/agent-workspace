@@ -74,6 +74,22 @@ def sse_collect(base: str, want: int, out: list, stop: threading.Event) -> None:
         return
 
 
+def _raw_get(base: str, path: str) -> tuple[int, dict]:
+    """一次**不跟随重定向**的 GET —— 302 本身就是要验的东西。"""
+    import http.client
+    from urllib.parse import urlsplit
+
+    u = urlsplit(base)
+    c = http.client.HTTPConnection(u.hostname, u.port, timeout=10)
+    try:
+        c.request("GET", path)
+        r = c.getresponse()
+        r.read()
+        return r.status, {k.lower(): v for k, v in r.getheaders()}
+    finally:
+        c.close()
+
+
 def _fixture_note() -> None:
     """工作区里缺了程序时，先把话说在明处。
 
@@ -231,6 +247,88 @@ def main() -> int:
     check("rebind 真的换掉地址", hub3.url == "ws://a/", hub3.url)
     check("没有连接时 rebind 不炸、也不假装重连了谁",
           hub3.rebind({"url": "ws://b/"}) == [] and hub3.url == "ws://b/", hub3.url)
+
+    print("[4c] 界面入口：plugin.json 说什么，门就开什么")
+    # 这一节的病根是「同一条事实算两遍」：Plugin.ui 读 plugin.json 的 ui，
+    # 而 /plugin/<pid>/ 从前自己拼 "ui/index.html"。入口一旦不叫 index.html，
+    # 内核认、门不认 —— 界面上是 iframe 里一段 JSON，白板且不报错。
+    import shutil
+    import tempfile as _tf
+
+    tmp_ws = Path(_tf.mkdtemp(prefix="uiws-"))
+
+    def _mk(rel: str, text: str) -> None:
+        f = tmp_ws / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text, encoding="utf-8")
+
+    # serve() 把 App.runtime / hub / web / native 写成**类级全局** —— 那是门对
+    # 内核的唯一引用。这里开的是第二个门，收工必须原样还回去：否则后面每一节
+    # 都在对着 tmp_ws 说话，而那会伪装成完全不相干的 bug（我第一次跑就崩在
+    # [13] 的 KeyError: 'dingtalk'，看起来一点不像入口路由的问题）。
+    saved_app = (App.runtime, App.hub, App.web, App.native)
+    try:
+        _mk("plugins/duo/plugin.json", '{"id":"duo","title":"双入口","ui":"ui/shell.html"}')
+        _mk("plugins/duo/backend.py", "")
+        _mk("plugins/duo/ui/shell.html", "<html><body>SHELL</body></html>")
+        _mk("plugins/duo/ui/hello.html", "<html><body>HELLO</body></html>")
+        _mk("plugins/duo/ui/sub/a.css", "body{color:red}")
+        _mk("plugins/nat/plugin.json", '{"id":"nat","title":"原生","ui":"ui/app.py"}')
+        _mk("plugins/nat/backend.py", "")
+        _mk("plugins/nat/ui/app.py", "SECRET_SOURCE = 1\n")
+        _mk("plugins/evil/plugin.json", '{"id":"evil","title":"越界","ui":"../config.json"}')
+        _mk("plugins/evil/backend.py", "")
+        # 两个真实存在的「界外文件」：越界 ui 要指向 plugins/config.json（旧内核
+        # 那时会认它、hasUi=true），穿越要指向工作区根的 config.json。目标不存在
+        # 的话，旧代码也会「碰巧」是对的 —— 那就测不出任何东西。
+        _mk("config.json", '{"hub":"ws://127.0.0.1:1/"}')
+        _mk("plugins/config.json", '{"hub":"ws://127.0.0.1:1/"}')
+
+        rt2 = kernel.Runtime(tmp_ws)
+        rt2.scan()
+        httpd2 = serve(rt2, _FakeHub(), Path(__file__).parent / "web", port=0)
+        base2 = f"http://127.0.0.1:{httpd2.server_address[1]}"
+        threading.Thread(target=httpd2.serve_forever, daemon=True).start()
+        try:
+            progs2 = {p["id"]: p for p in json.loads(get(base2, "/api/state")[1])["programs"]}
+            check("入口改名成 ui/shell.html：内核认得",
+                  progs2.get("duo", {}).get("uiKind") == "web"
+                  and progs2["duo"].get("uiName") == "ui/shell.html", str(progs2.get("duo")))
+            code, body, _ = get(base2, "/plugin/duo/")
+            check("门也认得：/plugin/<pid>/ 开的就是 ui/shell.html",
+                  code == 200 and b"SHELL" in body, f"{code} {body[:60]!r}")
+            code, body, hdrs = get(base2, "/plugin/duo/sub/a.css")
+            check("子目录里的资源照样发得出去（相对入口所在目录）",
+                  code == 200 and body == b"body{color:red}"
+                  and "text/css" in hdrs.get("content-type", ""),
+                  f"{code} {hdrs.get('content-type')}")
+            st302, hd = _raw_get(base2, "/plugin/duo")
+            check("/plugin/<pid> 少尾斜杠 → 302 补斜杠（相对引用的根）",
+                  st302 == 302 and hd.get("location") == "/plugin/duo/",
+                  f"{st302} {hd.get('location')}")
+            code, body, _ = get(base2, "/plugin/nat/")
+            check("原生程序没有网页界面 → 404 说人话",
+                  code == 404 and "没有网页界面".encode("utf-8") in body, f"{code} {body[:80]!r}")
+            for leak in ("/plugin/nat/app.py", "/plugin/nat/ui/app.py"):
+                code, body, _ = get(base2, leak)
+                check(f"顺手请求 {leak} → 不发后端源码",
+                      code != 200 and b"SECRET_SOURCE" not in body, f"{code} {body[:80]!r}")
+            code, body, _ = get(base2, "/plugin/duo/../../config.json")
+            check("穿越插件目录 → 403", code == 403, f"{code} {body[:80]!r}")
+            check("ui 写成 ../config.json → 当没有界面（state 与门同一个结论）",
+                  progs2.get("evil", {}).get("uiKind") == "none"
+                  and not progs2["evil"].get("hasUi"), str(progs2.get("evil")))
+        finally:
+            httpd2.shutdown()
+            App.runtime, App.hub, App.web, App.native = saved_app
+    finally:
+        shutil.rmtree(tmp_ws, ignore_errors=True)
+
+    src_srv = (Path(__file__).parent / "server.py").read_text(encoding="utf-8")
+    check("门里不再有第二份入口约定（判据只在 Plugin.ui）",
+          '"index.html" if rest' not in src_srv
+          and 'base = plugin.path / "ui"' not in src_srv,
+          "server.py 里又出现了自己拼的入口")
 
     print("[5] 执行同一性：人点的按钮与 agent 调用，同一份状态")
     r = post(base, "/api/p/pomodoro/call/start", {"minutes": 7})
@@ -979,6 +1077,193 @@ def main() -> int:
     check("调度失败时把没 await 的协程 close 掉（否则 GC 喷 RuntimeWarning）",
           'getattr(coro, "close", None)' in ljsrc, "")
 
+    # ── 会话（P0）──────────────────────────────────────────────────
+    print("[18] 会话：归我们所有的一份数据，不是服务端的状态")
+    # 挑一个**真的存在**的程序：写死 pomodoro 会让这一节跟着工作区数据一起红，
+    # 而它想验的是会话本身。工作区里哪个在就用哪个，一个都没有就用小助理。
+    _pid = next((p["id"] for p in rt.state()["programs"] if p["id"] != "assistant"),
+                "assistant")
+    _stmp = Path(tempfile.mkdtemp())
+    fake._rt = rt                       # 从这一行起，替身开始真有会话
+    fake.root = _stmp
+    fake._pid = _pid
+    _sid0 = fake.link(_pid).sid
+
+    code, body, _ = get(base, f"/api/p/{_pid}/sessions")
+    _sess = json.loads(body.decode("utf-8")) if code == 200 else {}
+    check("会话列表 200 且带当前会话", code == 200 and _sess.get("sid") == _sid0, str(code))
+    check("列表非静默（truncated/shown 都在）",
+          "truncated" in _sess and "shown" in _sess, str(_sess)[:200])
+
+    code, body, _ = get(base, f"/api/p/{_pid}/session/{_sid0}")
+    _one = json.loads(body.decode("utf-8")) if code == 200 else {}
+    check("单个会话 200，total/shown 齐", code == 200 and _one.get("total") == 0, str(code))
+    code, body, _ = get(base, f"/api/p/{_pid}/session/{_sid0}?limit=5")
+    _lim = json.loads(body.decode("utf-8")) if code == 200 else {}
+    check("limit 生效且不谎报截断", _lim.get("shown") == 0 and _lim.get("truncated") is False,
+          str(_lim)[:200])
+    code, body, _ = get(base, f"/api/p/{_pid}/session/s_deadbeef")
+    check("不存在的会话 404（不假装空会话）", code == 404, str(code))
+
+    r = post(base, f"/api/p/{_pid}/session/new", {})
+    _sid1 = r.get("sid") or ""
+    check("新建会话拿到 sid", r.get("status") == "ok" and _sid1.startswith("s_"), str(r))
+    check("新会话与旧的不同", _sid1 and _sid1 != _sid0, f"{_sid1} vs {_sid0}")
+
+    r = post(base, f"/api/p/{_pid}/session/switch", {"sid": _sid0})
+    check("切回旧会话", r.get("status") == "ok" and r.get("sid") == _sid0, str(r))
+    r = post(base, f"/api/p/{_pid}/session/rename", {"sid": _sid1, "title": "另一个话题"})
+    check("改名成功", r.get("status") == "ok" and r.get("title") == "另一个话题", str(r))
+
+    _l = fake.link(_pid)
+    _l._busy = True                    # 模拟「这一轮还在跑」
+    r = post(base, f"/api/p/{_pid}/session/switch", {"sid": _sid1})
+    check("忙时拒绝切换，且回 409 + 人话", r.get("status") == "busy" and "等它停下来" in str(r.get("message")),
+          str(r))
+    _l._busy = False
+
+    r = post(base, f"/api/p/{_pid}/session/switch", {"sid": "bad-shape"})
+    check("坏 sid 被 400 挡下（形状在门口就收紧）", r.get("status") == "bad", str(r))
+
+    r = post(base, f"/api/p/{_pid}/session/delete", {"sid": _sid1})
+    check("删除完成", r.get("status") == "ok", str(r))
+    check("删除只是搬家（.trash 里有，原目录没有）",
+          any((_stmp / "sessions" / ".trash" / _pid).glob(f"{_sid1}.*.jsonl"))
+          and not (_stmp / "sessions" / _pid / f"{_sid1}.jsonl").exists(), "")
+
+    # 数据层：落盘形状与投影
+    _d = fake.link(_pid).as_dict()
+    check("as_dict 带 sid/turns/truncated", all(k in _d for k in ("sid", "turns", "truncated")), str(_d))
+    _l._record_user("人说的话")
+    _l._record_user("[系统] 能力面已更新", sys=True)
+    _msgs = _l.store.messages(_pid, _l.sid)
+    check("接力消息被标成 sys（不冒充人话）", _msgs[-1]["sys"] is True, str(_msgs[-1]))
+    check("sys 消息照样进模型上下文（当时模型确实看见了）",
+          len(_l._ctx()) == 2, [m.text for m in _l._ctx()])
+    _l.store.append_call(_pid, _l.sid, "status", {}, "ok")
+    check("工具卡不进上下文（协议只允许 user/agent + 文本）",
+          len(_l._ctx()) == 2, [m.text for m in _l._ctx()])
+
+    # 显式 history：这一条是「切会话不需要动 SDK 内部状态」的前提
+    check("每轮显式传 history（真相在我们这份 store 上）",
+          "history=base" in ljsrc, "")
+    check("接力消息走 sys=True", "_one_turn(handoff, sys=True)" in ljsrc, "")
+    check("会话落盘由 Link 自己写（不靠 caller.history）",
+          "self.store.append_user" in ljsrc and "self.store.append_agent" in ljsrc, "")
+
+    print("[19] 选中复制：三道闸，一处没开就等于没开")
+    from . import shell as sh
+
+    sh_src = Path(__file__).with_name("shell.py").read_text(encoding="utf-8")
+    html_src = (Path(__file__).parent / "web" / "index.html").read_text(encoding="utf-8")
+
+    check("建窗时显式打开 text_select（不传 = pywebview 默认关掉选中）",
+          "text_select=True" in sh_src, "")
+    check("老版本 pywebview 不认这个参数时能退回（不整窗起不来）",
+          "except TypeError" in sh_src, "")
+
+    # 根因①②：用 pywebview **自己的**默认值与**自己的**判据复现，而不是我们的复述
+    try:
+        import webview as _wv
+        _wvdir = Path(_wv.__file__).parent
+        _win_src = (_wvdir / "window.py").read_text(encoding="utf-8")
+        _cz = (_wvdir / "js" / "customize.js").read_text(encoding="utf-8")
+        _m = re.search(r"text_select: bool = (\w+)", _win_src)
+        check("pywebview 的 text_select 默认是 False（根因，不是我们配错）",
+              bool(_m) and _m.group(1) == "False", _m.group(0) if _m else "没找到")
+        check("默认 False 会变成 disableTextCss 的注入条件",
+              "disableText = '%(text_select)s' === 'False'" in _cz, "")
+        check("注入的正是 body{user-select:none}（整页，不是某个控件）",
+              "body {-webkit-user-select: none" in _cz, "")
+    except Exception as exc:
+        check("pywebview 可读源码（读不到就跳过根因复现）", True, f"跳过：{exc}")
+
+    # 我们的页面必须压得住它：id 选择器 (1,0,0) 胜过 body (0,0,1)
+    def _spec(sel: str) -> tuple[int, int, int]:
+        ids = len(re.findall(r"#[\w-]+", sel))
+        cls = len(re.findall(r"\.[\w-]+|\[[^\]]*\]|:(?!:)[\w-]+", sel))
+        el = len(re.findall(r"(?:^|[\s>+~])([a-zA-Z][\w-]*)", sel))
+        return ids, cls, el
+
+    check("对话区有 user-select:text（显式，不靠继承）",
+          "#thread,.dlg{user-select:text" in html_src, "")
+    check("它用 id 选择器，特异性压得住 body 的 none",
+          _spec("#thread") > _spec("body") and "#thread,.dlg{user-select:text" in html_src,
+          f"{_spec('#thread')} vs {_spec('body')}")
+    check("开关标签仍然不许选中（不为了复制把整页放开）",
+          "user-select:none" in html_src, "")
+
+    # 用 find 而不是 index：旧代码里根本没有这一段，index() 会抛 ValueError
+    # 把整节 selftest 带走 —— 验收在病还在的时候必须「红」，不能「炸」。
+    _pos = html_src.find("if (e.key !== 'c'")
+    _ctrl = html_src[_pos:_pos + 320] if _pos >= 0 else ""
+    check("Ctrl+C 有兜底（accelerator 被关时也能复制）",
+          "copySelection()" in _ctrl, _ctrl[:90] or "找不到兜底块")
+    check("兜底不拦原生那条路（没有 preventDefault）",
+          bool(_ctrl) and "preventDefault" not in _ctrl, _ctrl[:90] or "找不到兜底块")
+    check("输入框自己的选区不被接管（那里交给浏览器）",
+          "selectionStart !== a.selectionEnd" in html_src, "")
+    check("写剪贴板失败有第二条路（execCommand 回退）",
+          "execCommand('copy')" in html_src, "")
+    check("流式重绘不抹掉已建立的选区",
+          "sel.anchorNode" in html_src and "threadDirty = true" in html_src, "")
+    check("选区消失后补画欠下的那一帧",
+          "selectionchange" in html_src and "threadDirty = false" in html_src, "")
+
+    # 真代码路径 + 假 WebView2：不猜「应该会设上」，而是调一次看它设了什么
+    class _Settings:
+        """字段名与 ``CoreWebView2.Settings`` **逐字一致**。
+
+        为什么要专门写这句：第一次写成了 ctx/acc/dev，``open_copy_doors`` 照样返回
+        True（Python 允许给任意对象加属性），断言却全是 None —— 那是一份假绿。
+        替身的字段名错一个字母，这节测试就变成了空转。
+        """
+
+        def __init__(self) -> None:
+            self.AreDefaultContextMenusEnabled = None
+            self.AreBrowserAcceleratorKeysEnabled = None
+            self.AreDevToolsEnabled = None
+
+    class _Core:
+        def __init__(self) -> None:
+            self.Settings = _Settings()
+
+    class _WV:
+        def __init__(self) -> None:
+            self.CoreWebView2 = _Core()
+
+    class _Native:
+        def __init__(self) -> None:
+            self.webview = _WV()
+
+    class _Win:
+        def __init__(self) -> None:
+            self.native = _Native()
+
+    _w1 = _Win()
+    _okc, _why = sh.open_copy_doors(_w1, debug=False)
+    _s1 = _w1.native.webview.CoreWebView2.Settings
+    check("open_copy_doors 真的打开了右键菜单",
+          _okc and _s1.AreDefaultContextMenusEnabled is True, f"{_okc} {_why}")
+    check("open_copy_doors 真的打开了快捷键（Ctrl+C / Ctrl+A）",
+          _s1.AreBrowserAcceleratorKeysEnabled is True, "")
+    check("DevTools 仍然关着（不因为要复制就把 F12 送出去）",
+          _s1.AreDevToolsEnabled is False, str(_s1.AreDevToolsEnabled))
+
+    _w2 = _Win()
+    sh.open_copy_doors(_w2, debug=True)
+    check("debug=True 时才放 DevTools 出去",
+          _w2.native.webview.CoreWebView2.Settings.AreDevToolsEnabled is True, "")
+
+    class _Broken:
+        @property
+        def native(self):
+            raise RuntimeError("不是 WebView2")
+
+    _okc3, _why3 = sh.open_copy_doors(_Broken(), debug=False)
+    check("拿不到 native 不抛异常（页面里还有兜底）",
+          _okc3 is False and bool(_why3), str(_why3)[:80])
+
     httpd.shutdown()
     if getattr(App, "native", None):
         App.native.shutdown()                       # 收尸：不留孤儿窗口
@@ -987,12 +1272,48 @@ def main() -> int:
 
 
 class _FakeHub:
-    """selftest 不连 aaas：门只需要一个「智能体池」的形状。"""
+    """selftest 不连 aaas：门只需要一个「智能体池」的形状。
 
-    def __init__(self, root: Path | None = None) -> None:
+    但**会话**是纯数据，不需要连接 —— 所以那几条走的是真的 ``Link``
+    （只是从不 ``start()``，因此没有后台线程、不会连任何地址）。
+    这样路由测试测的就是产品代码，而不是一份会自己漂走的复刻。
+    """
+
+    def __init__(self, root: Path | None = None, runtime=None, pid: str = "pomodoro") -> None:
         self.root = Path(root or ".")          # 设置那条路由要用它落盘
         self.cfg: dict = {}
         self.rebound: list[dict] = []
+        self._rt = runtime
+        self._pid = pid
+        self._link = None
+
+    def link(self, pid: str, create: bool = False):
+        """只对「本替身认领的那个程序」给出一条真 Link；从不 start()。"""
+        if self._rt is None or pid != self._pid:
+            return None
+        if self._link is None:
+            self._link = Link(self._rt, self.root, self.cfg, pid)
+        return self._link
+
+    def sessions(self, pid: str, limit: int = 50) -> dict:
+        l = self.link(pid)
+        return {"status": "missing"} if l is None else l.sessions(limit)
+
+    def switch(self, pid: str, sid: str) -> dict:
+        l = self.link(pid)
+        return {"status": "missing"} if l is None else l.switch(sid)
+
+    def new_session(self, pid: str, title: str = "") -> dict:
+        l = self.link(pid)
+        return {"status": "missing"} if l is None else l.new_session(title)
+
+    def rename(self, pid: str, sid: str, title: str) -> dict:
+        l = self.link(pid)
+        return {"status": "missing"} if l is None else l.rename(sid, title)
+
+    def drop(self, pid: str, sid: str) -> dict:
+        l = self.link(pid)
+        return {"status": "missing"} if l is None else l.drop(sid)
 
     @property
     def url(self) -> str:

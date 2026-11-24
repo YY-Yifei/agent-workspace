@@ -23,7 +23,7 @@ import re
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import settings
 
@@ -38,6 +38,13 @@ PLUGIN_RE = re.compile(r"^/plugin/(?P<pid>[a-z][a-z0-9_]*)(?P<rest>/.*)?$")
 # 版本历史：人这一侧的「看一眼 / 退回去」。两个都只作用于 plugins/<pid>，
 # 与 static 路由一样按 pid 分段匹配 —— 不拼路径，就不会有越界。
 VERSIONS_RE = re.compile(r"^/api/p/(?P<pid>[a-z][a-z0-9_]*)/versions$")
+# 会话：列表 / 单个 / 四个动作。sid 的形状在这里就钉死（s_ + 8 位 hex）——
+# 它同时是路径分量，形状收紧了，越界就不必再靠 resolve 兜。
+SESSIONS_RE = re.compile(r"^/api/p/(?P<pid>[a-z][a-z0-9_]*)/sessions$")
+SESSION_ONE_RE = re.compile(r"^/api/p/(?P<pid>[a-z][a-z0-9_]*)/session/(?P<sid>s_[0-9a-f]{8})$")
+SESSION_SID_RE = re.compile(r"^s_[0-9a-f]{8}$")
+SESSION_ACT_RE = re.compile(
+    r"^/api/p/(?P<pid>[a-z][a-z0-9_]*)/session/(?P<act>new|switch|rename|delete)$")
 
 
 class App:
@@ -168,16 +175,88 @@ class Handler(BaseHTTPRequestHandler):
                 "versions": [{k: v[k] for k in ("ver", "short", "sha", "msg", "when")} | {
                     "files": sorted(v["files"])} for v in rows]})
 
+        # 会话列表。截断照抄 versions 的三件套：静默截断比报错更坏 ——
+        # 人以为「就这么多」，于是以为旧对话丢了。
+        m = SESSIONS_RE.match(path)
+        if m:
+            pid = m.group("pid")
+            if rt.program(pid) is None:
+                return self._json({"error": f"没有程序 {pid}"}, 404)
+            if hub is None:
+                return self._json({"error": "智能体池未装配"}, 503)
+            LIMIT = 50
+            out = hub.sessions(pid, limit=LIMIT)
+            if out.get("status") == "missing":
+                return self._json(out, 404)
+            return self._json(out)
+
+        # 单个会话的全部消息。limit 与 versions 同义：多取一条只用来判断还有没有。
+        m = SESSION_ONE_RE.match(path)
+        if m:
+            pid, sid = m.group("pid"), m.group("sid")
+            if rt.program(pid) is None:
+                return self._json({"error": f"没有程序 {pid}"}, 404)
+            if hub is None:
+                return self._json({"error": "智能体池未装配"}, 503)
+            l = hub.link(pid, create=True)
+            if l is None or not l.store.exists(pid, sid):
+                return self._json({"error": f"没有会话 {sid}"}, 404)
+            q = parse_qs(urlsplit(self.path).query)
+            try:
+                LIMIT = max(1, min(1000, int((q.get("limit") or ["200"])[0])))
+            except ValueError:
+                LIMIT = 200
+            rows = l.store.messages(pid, sid)
+            meta = l.store.meta(pid, sid)
+            stats = l.store.stats(pid, sid)
+            total = len(rows)
+            return self._json({
+                "pid": pid, "sid": sid, "title": meta.get("title", ""),
+                "active": sid == l.sid,
+                "messages": rows[-LIMIT:], "total": total,
+                "shown": min(total, LIMIT), "truncated": total > LIMIT,
+                **{k: stats[k] for k in ("turns", "tokensIn", "tokensOut", "bad")},
+            })
+
         m = PLUGIN_RE.match(path)
         if m:
-            pid, rest = m.group("pid"), (m.group("rest") or "/")
+            pid, rest = m.group("pid"), m.group("rest")
             plugin = rt.plugins.get(pid)
             if plugin is None:
                 return self._json({"error": f"没有程序 {pid}"}, 404)
-            base = plugin.path / "ui"
-            rel = "index.html" if rest in ("/", "") else rest.lstrip("/")
-            target = (base / rel).resolve()
-            if not target.is_relative_to(base.resolve()):
+            # **界面入口只有一处判据：Plugin.ui** —— 它读的就是 plugin.json 的 ui。
+            # 这道门从前自己拼 "ui/index.html"：插件把入口写成 "ui/tool.html" 时，
+            # 内核认（hasUi=true、uiName 就是它），门不认（去开 ui/index.html），
+            # 于是界面上是 iframe 里一段 {"error":"not found"}。白板，而且不报错。
+            # 同一条事实算两遍，必然走岔。
+            # **界面入口只有一处判据：Plugin.ui** —— 它读的就是 plugin.json 的 ui。
+            # 这道门从前自己拼 "ui/index.html"：插件把入口写成 "ui/tool.html" 时，
+            # 内核认（hasUi=true、uiName 就是它），门不认（去开 ui/index.html），
+            # 于是界面上是 iframe 里一段 {"error":"not found"}。白板，而且不报错。
+            # 同一条事实算两遍，必然走岔。
+            entry = plugin.ui
+            if entry is None or plugin.ui_kind != "web":
+                # 原生程序只有 .py 窗口脚本：它跑在自己的进程里，不是网页。
+                # 这一条同时挡住「顺手请求 /plugin/<pid>/app.py 拿后端源码」。
+                return self._json({"error": f"{pid} 没有网页界面"}, 404)
+            if rest is None:
+                # 少了尾斜杠：浏览器会把 /plugin/pid 当成**文件**，页内 ./a.js 于是
+                # 解析到 /plugin/a.js（pid 变成 a），相对引用整片错位。302 补齐
+                # 是唯一能让「相对 /plugin/<pid>/」继续成立的做法。
+                self.send_response(302)
+                self.send_header("location", f"/plugin/{pid}/")
+                self.send_header("content-length", "0")
+                self.end_headers()
+                return
+            root = plugin.path.resolve()
+            if not entry.is_relative_to(root):
+                return self._json({"error": "forbidden"}, 403)
+            if rest in ("", "/"):
+                return self._file(entry)
+            target = (entry.parent / rest.lstrip("/")).resolve()
+            # 上界是**整个插件目录**：页面可以放在 ui/sub/ 里引用同级的资源。
+            # .py / .pyc 一律不发 —— 那是后端，从网页路由送出去就是送源码。
+            if not target.is_relative_to(root) or target.suffix.lower() in (".py", ".pyc"):
                 return self._json({"error": "forbidden"}, 403)
             return self._file(target)
 
@@ -229,6 +308,34 @@ class Handler(BaseHTTPRequestHandler):
             if not text.strip():
                 return self._json({"error": "空消息"}, 400)
             return self._json({"status": hub.send(pid, text), "pid": pid})
+
+        # 会话的四个动作：新建 / 切换 / 改名 / 删除。
+        # 它们都在 _origin_ok() 之下 —— 会话是「人这一侧」的东西，不需要另加防线。
+        m = SESSION_ACT_RE.match(path)
+        if m:
+            pid, act = m.group("pid"), m.group("act")
+            if rt.program(pid) is None:
+                return self._json({"error": f"没有程序 {pid}"}, 404)
+            if hub is None:
+                return self._json({"error": "智能体池未装配"}, 503)
+            body = body if isinstance(body, dict) else {}
+            if act == "new":
+                return self._json(hub.new_session(pid, str(body.get("title") or "")))
+            sid = str(body.get("sid") or "")
+            if not SESSION_SID_RE.match(sid):
+                return self._json({"status": "bad", "message": "sid 形状不对"}, 400)
+            if act == "switch":
+                out = hub.switch(pid, sid)
+            elif act == "rename":
+                out = hub.rename(pid, sid, str(body.get("title") or ""))
+            else:                                  # delete
+                out = hub.drop(pid, sid)
+            # busy / missing / bad 都是「人话 + 非 200」：界面要能把原因显示出来，
+            # 而不是只看到一句「操作失败」。
+            code = 200 if out.get("status") == "ok" else (
+                409 if out.get("status") == "busy" else
+                404 if out.get("status") == "missing" else 400)
+            return self._json(out, code)
 
         # 版本回退：人点的按钮。语义是**再提交一版**（不是 reset）——
         # 所以它走的是与写入同一条落盘路径，四道校验照样挡在前面。

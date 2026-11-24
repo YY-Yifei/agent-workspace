@@ -151,6 +151,14 @@
   #thread{flex:1;overflow:auto;padding:18px 16px;display:flex;flex-direction:column;gap:14px;
     scrollbar-gutter:stable}
   .solo #thread{max-width:720px;margin:0 auto;width:100%}
+  /* 选中复制（一）：把「能不能选」这件事钉死在对话区上。
+     pywebview 的 customize.js 在 text_select=False 时会往 <head> **末尾**追加
+     `body{-webkit-user-select:none;cursor:default}`。它特异性只有 (0,0,1)，
+     但后写者赢 —— 所以这里必须用 id 选择器（1,0,0）压住它。
+     不加这一条，症状只是「复制不了」，很难往桌面外壳上想（第二十三轮的真账）。
+     为什么不写 `*{user-select:text}`：那会连 .dev 开关这类「本来就不该选中」的
+     标签一起放开。对话正文与对话框里的说明，才是人要带走的东西。 */
+  #thread,.dlg{user-select:text;-webkit-user-select:text;cursor:auto}
   .msg{width:100%;max-width:100%}
   .msg.me{display:flex;justify-content:flex-end}
   .msg .body{white-space:pre-wrap;word-break:break-word}
@@ -268,9 +276,16 @@
   .dlg .acts button[disabled]{opacity:.6;cursor:default}
   /* 版本面板：与设置面板同一套骨架（#mask/.dlg），只多一个可滚动的列表。
      列表自己滚，标题与按钮不动 —— 版本多了也不会把「关闭」推出视野。 */
-  #vmask{position:fixed;inset:0;background:rgba(0,0,0,.42);display:none;
+  /* 会话面板复用同一套骨架（#mask/.dlg + .vrow）：它是同一类东西 ——
+     一列可滚动的行，每行右侧几个动作。多造一套样式只会多一处要同步维护的漂移。 */
+  #vmask,#smask{position:fixed;inset:0;background:rgba(0,0,0,.42);display:none;
     place-items:center;z-index:41}
-  #vmask.on{display:grid}
+  #vmask.on,#smask.on{display:grid}
+  /* 行内改名：不弹 prompt —— pywebview 的 prompt 支持与否取决于版本，
+     弹不出来就是「点了没反应」。直接就地变成输入框。 */
+  .sren{width:100%;box-sizing:border-box;background:var(--bg);color:var(--ink);
+    border:1px solid var(--accent);border-radius:6px;padding:2px 6px;
+    font:inherit;font-size:13px;font-weight:600}
   .vdlg{width:560px;max-height:calc(100% - 80px)}
   .vlist{overflow:auto;display:flex;flex-direction:column;gap:8px;min-height:60px}
   .vrow{display:flex;align-items:flex-start;gap:10px;padding:9px 11px;
@@ -323,6 +338,17 @@
     </div>
   </div>
 </div>
+<div id="smask" aria-hidden="true">
+  <div class="dlg vdlg" role="dialog" aria-label="会话">
+    <h3 id="stitle">会话</h3>
+    <div class="vlist" id="slist"></div>
+    <div class="hint" id="smsg"></div>
+    <div class="acts">
+      <button type="button" id="snew">新建会话</button>
+      <button type="button" id="sclose">关闭</button>
+    </div>
+  </div>
+</div>
 <script src="/web/turn.js"></script>
 <script src="/web/md.js"></script>
 <script>
@@ -340,6 +366,7 @@ const S = {
   msgs: {},       // pid → [{role:'me'|'it', text, tools:[{label,status,text}]}]
   cur: {},        // pid → 当前这一轮那条消息的下标
   tick: {},       // pid → 被事件碰过几次（用来判断 /api/state 的快照是否已过期）
+  sid: {},        // pid → 当前会话号（磁盘上那份对话的名字）
   railSig: '', stageKey: '', busy: {},
   phase: {},      // pid → idle|sending|running|stopping（判据全在 turn.js）
 };
@@ -373,6 +400,7 @@ async function loadState() {
   for (const [pid, a] of Object.entries(st.agents || {})) {
     if ((S.tick[pid] || 0) !== (tick0[pid] || 0)) continue;   // 这份快照已经过期
     S.agents[pid] = { status: a.status, error: a.error, busy: a.busy };
+    S.sid[pid] = a.sid || S.sid[pid];      // 当前会话号：切会话时要知道「现在在哪」
     setPhase(pid, { type: 'snapshot', busy: !!a.busy });
     if (!S.msgs[pid]) {                      // 只补一次：之后的增量在事件里
       S.msgs[pid] = (a.history || []).map((h) => ({
@@ -486,6 +514,7 @@ function paintStage(force) {
   stage.innerHTML = `<div class="split${solo ? ' solo' : ''}">${pane}${gutter}
     <aside class="chat">
       <header>${esc(p.icon || '')}<b>${esc(p.title)}</b><span>${esc(p.description || '')}</span>
+        <button type="button" class="vbtn" id="sessbtn" title="会话：新建 / 切换 / 改名 / 删除">会话</button>
         ${p.id === 'assistant' ? '' : `<label class="dev${p.dev ? ' on' : ''}" title="打开后它能读写工作区里的文件、改自己的代码（碰不到别的程序）"><input type="checkbox" id="devsw"${p.dev ? ' checked' : ''}><i></i>开发者</label><button type="button" class="vbtn" id="verbtn" title="看这个程序的版本历史 / 退回去">版本</button>`}
       </header>
       <div id="thread"></div>
@@ -497,6 +526,7 @@ function paintStage(force) {
   wireComposer();
   wireDev();
   wireVersions();
+  wireSessions();
   wireGutter();
   if (p.uiKind === 'native') {
     $('#natbtn').onclick = () => toggleNative(p.id, (S.native[p.id] || {}).status === 'running');
@@ -591,6 +621,176 @@ function closeVersions() {
   if (!m) return;
   m.classList.remove('on');
   m.setAttribute('aria-hidden', 'true');
+}
+
+/* ------------------------------------------------------------------ 会话 */
+/* 会话是**人**这一侧的一组对话。它不发明语义：切会话 = 换一份 history，
+   而那份 history 在磁盘上（workspace/sessions/<pid>/<sid>.jsonl）。服务端在
+   stateless 模式下本来就不留历史 —— 所以这里没有第二条真相可以分叉。
+   忙时不许切：那一轮的事件会落错地方，而且它不会报错，只会对不上。 */
+function wireSessions() {
+  const b = $('#sessbtn');
+  if (!b) return;
+  const a = S.agents[S.pid] || {};
+  b.title = a.title ? `当前会话：${a.title}` : '会话：新建 / 切换 / 改名 / 删除';
+  b.onclick = () => openSessions(S.pid);
+  const n = $('#snew');
+  if (n) n.onclick = () => doNewSession(S.pid);
+  const c = $('#sclose');
+  if (c) c.onclick = closeSessions;
+}
+
+function setSHint(text, cls) {
+  const el = $('#smsg');
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = 'hint' + (cls ? ' ' + cls : '');
+}
+
+function fmtTime(t) {
+  const n = Number(t || 0);
+  if (!n) return '—';
+  const d = new Date(n * 1000);
+  const p = (x) => String(x).padStart(2, '0');
+  return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function tokText(r) {
+  const i = Number(r.tokensIn || 0) + Number(r.tokensOut || 0);
+  return i ? `${i} token` : '未计 token';
+}
+
+async function jpost(url, body) {
+  return fetch(url, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  }).then((x) => x.json()).catch((err) => ({ status: 'error', message: String(err) }));
+}
+
+/* 切完会话，屏幕上的那一串必须**整份换掉** —— 增量一定会漏。
+   截断也不静默：上面还有就明说，否则人以为旧对话丢了。 */
+async function reloadThread(pid, sid) {
+  const r = await fetch(`/api/p/${pid}/session/${sid}?limit=200`)
+    .then((x) => x.json()).catch(() => null);
+  if (!r || r.error || !r.messages) return;
+  S.sid[pid] = r.sid || sid;
+  const rows = r.messages.map((h) => ({
+    role: h.role === 'user' ? 'me' : 'it', text: h.text || '', tools: [],
+    note: h.sys ? true : undefined,      // 接力消息是程序自己发的，不冒充人话
+  }));
+  if (r.truncated) {
+    rows.unshift({ role: 'it', note: true, tools: [],
+      text: `这个会话共 ${r.total} 条，这里显示最后 ${r.shown} 条。` });
+  }
+  S.msgs[pid] = rows;
+  S.cur[pid] = null;
+  if (pid === S.pid) paintThread();
+}
+
+async function openSessions(pid) {
+  const m = $('#smask');
+  if (!m) return;
+  m.classList.add('on');
+  m.setAttribute('aria-hidden', 'false');
+  $('#stitle').textContent = `${(prog(pid) || {}).title || pid} · 会话`;
+  setSHint('读取中…');
+  $('#slist').innerHTML = '';
+  const r = await fetch(`/api/p/${pid}/sessions`).then((x) => x.json())
+    .catch((err) => ({ error: String(err) }));
+  if (r.error) { setSHint(r.error, 'bad'); return; }
+  const rows = r.sessions || [];
+  if (!rows.length) { setSHint('还没有任何会话。'); return; }
+  setSHint((r.truncated
+    ? `只显示最近 ${rows.length} 个（更早的还有）。`
+    : `共 ${rows.length} 个会话。`)
+    + '删掉的会移进 sessions/.trash，需要时能捞回。');
+  $('#slist').innerHTML = rows.map((s) => `
+    <div class="vrow${s.active ? ' cur' : ''}">
+      <div class="vmain">
+        <div class="vno">${esc(s.title || '（未命名）')}</div>
+        <div class="vmeta">${esc(fmtTime(s.updated))} · ${s.turns} 轮 · ${esc(tokText(s))}</div>
+      </div>
+      <button type="button" data-act="switch" data-sid="${esc(s.sid)}"${s.active ? ' disabled title="就是当前会话"' : ''}>切过去</button>
+      <button type="button" data-act="rename" data-sid="${esc(s.sid)}">改名</button>
+      <button type="button" data-act="delete" data-sid="${esc(s.sid)}">删除</button>
+    </div>`).join('');
+  $('#slist').querySelectorAll('button[data-act]').forEach((b) => {
+    b.onclick = () => {
+      const sid = b.dataset.sid;
+      if (b.dataset.act === 'switch') return doSwitch(pid, sid);
+      if (b.dataset.act === 'delete') return doDrop(pid, sid, b);
+      return startRename(pid, sid, b);
+    };
+  });
+}
+
+function closeSessions() {
+  const m = $('#smask');
+  if (!m) return;
+  m.classList.remove('on');
+  m.setAttribute('aria-hidden', 'true');
+}
+
+async function doSwitch(pid, sid) {
+  setSHint('正在切过去…');
+  const r = await jpost(`/api/p/${pid}/session/switch`, { sid });
+  if (r.status !== 'ok') { setSHint(r.message || '切换失败', 'bad'); return; }
+  await reloadThread(pid, sid);
+  await openSessions(pid);
+  setSHint(r.message || '已切换', 'ok');
+}
+
+async function doNewSession(pid) {
+  setSHint('正在新建…');
+  const r = await jpost(`/api/p/${pid}/session/new`, {});
+  if (r.status !== 'ok') { setSHint(r.message || '新建失败', 'bad'); return; }
+  await reloadThread(pid, r.sid);
+  await openSessions(pid);
+  setSHint('新会话已开；之前的对话还在，随时能切回去。', 'ok');
+}
+
+async function doDrop(pid, sid, btn) {
+  btn.disabled = true;
+  setSHint('正在删除…');
+  const r = await jpost(`/api/p/${pid}/session/delete`, { sid });
+  if (r.status !== 'ok') {
+    btn.disabled = false;
+    setSHint(r.message || '删除失败', 'bad');
+    return;
+  }
+  if (sid === S.sid[pid]) await reloadThread(pid, r.sid);
+  await openSessions(pid);
+  setSHint(r.message || '已删除', 'ok');
+}
+
+/* 行内改名：就地变成输入框。Enter 保存、Esc 放弃、失去焦点也保存。 */
+function startRename(pid, sid, btn) {
+  const row = btn.closest('.vrow');
+  const no = row && row.querySelector('.vno');
+  if (!no) return;
+  const cur = no.textContent === '（未命名）' ? '' : no.textContent;
+  no.innerHTML = `<input class="sren" spellcheck="false">`;
+  const inp = no.querySelector('input');
+  inp.value = cur;
+  inp.focus();
+  inp.select();
+  let done = false;
+  const restore = () => { done = true; no.textContent = cur || '（未命名）'; };
+  const save = async () => {
+    if (done) return;
+    const title = inp.value.trim();
+    if (!title || title === cur) return restore();
+    done = true;
+    const r = await jpost(`/api/p/${pid}/session/rename`, { sid, title });
+    if (r.status !== 'ok') { done = false; restore(); setSHint(r.message || '改名失败', 'bad'); return; }
+    await openSessions(pid);
+    setSHint(r.message || '已改名', 'ok');
+  };
+  inp.onkeydown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); save(); }
+    if (e.key === 'Escape') { e.preventDefault(); restore(); }
+  };
+  inp.onblur = save;
 }
 
 /* 对话面板宽度：localStorage 记住，按程序分开记。
@@ -921,6 +1121,16 @@ function dropEmpty(pid, m) {
 function paintThread() {
   const el = $('#thread');
   if (!el) return;
+  /* 选中复制（二）：**人在选的时候不许换 DOM**。
+     这条 thread 每收一个 delta 就整段 innerHTML 重画一次；重画会把已经拉好的
+     选区当场抹掉 —— 于是「流式输出时选不中」，而这看起来和「不能复制」是同一个症状。
+     代价：这一帧不画。不丢数据 —— msgs 本来就都在 S 里，欠下的帧由 selectionchange
+     在选区消失时补上（见下面 pasteGuard / selectionchange）。 */
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed && sel.anchorNode && el.contains(sel.anchorNode)) {
+    threadDirty = true;
+    return;
+  }
   const list = msgs(S.pid);
   const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
   let html = list.map((m, i) => { m._i = i; return msgHtml(m); }).join('');
@@ -1170,6 +1380,17 @@ function on(ev) {
       const gone = d.status === 'closed' || (d.status === 'error' && d.scope !== 'declare');
       if (gone) setPhase(pid, 'linkDown');
       break;
+    case 'session.changed': {
+      // 别的窗口切了会话：这边跟着切。**不轮询** —— 事件总线本来就在广播。
+      S.sid[pid] = d.sid || S.sid[pid];
+      S.agents[pid] = { ...(S.agents[pid] || {}), title: d.title || '' };
+      if (pid === S.pid) {
+        const b = $('#sessbtn');
+        if (b) b.title = d.title ? `当前会话：${d.title}` : '会话：新建 / 切换 / 改名 / 删除';
+        reloadThread(pid, S.sid[pid]);
+      }
+      return;
+    }
     case 'dev.changed': {
       const p = prog(pid); if (p) p.dev = !!(d && d.dev);
       paintDev(pid, !!(d && d.dev));
@@ -1210,6 +1431,7 @@ async function syncAgents() {
   for (const [pid, a] of Object.entries(st.agents || {})) {
     if ((S.tick[pid] || 0) !== (tick0[pid] || 0)) continue;
     S.agents[pid] = { status: a.status, error: a.error, busy: a.busy };
+    S.sid[pid] = a.sid || S.sid[pid];
     // 快照是权威：它说空闲就一定空闲（错过终态时这是唯一的出路），
     // 它说忙就跟着忙（另一个窗口在跑，这边也该能停）。
     setPhase(pid, { type: 'snapshot', busy: !!a.busy });
@@ -1285,6 +1507,72 @@ window.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   closeVersions();      // 版本面板在上层，先关它
   closeSettings();
+});
+
+/* ------------------------------------------------------- 选中复制（三）：Ctrl+C */
+/* 为什么需要这层兜底：pywebview 把 `AreBrowserAcceleratorKeysEnabled` 绑在它自己的
+ * debug 上（platforms/edgechromium.py），我们的窗口不是 debug，于是它默认是 False
+ * —— Ctrl+C / Ctrl+A 在 WebView2 里根本不派发。外壳已经在 loaded 时把它打开
+ * （shell.open_copy_doors），但那是 WebView2 专有的设置：换平台、老版本包装不上、
+ * 或者哪天有人把 create_window 的参数改回去，这里必须还有一条路。
+ *
+ * 三个边界，写在这里而不是等踩：
+ *   1) **不 preventDefault**：原生那条路若开着，它复制的是同一段文字，重复一次无害；
+ *      先拦掉再自己写，反而会在 clipboard API 失败时把本来能成的原生复制一起废掉。
+ *   2) 输入框里自己有选区时不接管：那里的复制由浏览器编辑命令负责，比我们准。
+ *   3) 写剪贴板失败要有第二条路：execCommand('copy') 虽然过时，但它不需要额外权限，
+ *      而 127.0.0.1 是安全上下文，navigator.clipboard 正常可用 —— 两条都留着。
+ */
+let threadDirty = false;          // 因为「正在选中」而欠下的那一帧
+
+function copySelection() {
+  const a = document.activeElement;
+  // 输入框/文本框里的选区归浏览器管；这里只看「页面文字」的选区
+  if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA')
+      && a.selectionStart !== a.selectionEnd) return false;
+  const sel = window.getSelection ? window.getSelection() : null;
+  const text = sel ? String(sel) : '';
+  if (!text) return false;
+  writeClipboard(text);
+  return true;
+}
+
+/* 先试异步 API，再退回老命令。两条都失败就只留一句 warn —— 别假装成功。 */
+function writeClipboard(text) {
+  const legacy = () => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+    ta.remove();
+    if (!ok) console.warn('[copy] 剪贴板写入失败');
+    return ok;
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(legacy);
+    return;
+  }
+  legacy();
+}
+
+document.addEventListener('keydown', (e) => {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+  if (e.key !== 'c' && e.key !== 'C') return;
+  copySelection();
+});
+
+/* 选区消失（松手后点一下、或按 Esc）：把欠下的帧补画一次。
+   只补「真的欠过」的那一帧 —— 否则每次点击都会重画整条 thread。 */
+document.addEventListener('selectionchange', () => {
+  if (!threadDirty) return;
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed) return;
+  threadDirty = false;
+  paintThread();
 });
 
 /* ------------------------------------------------------------------ 启动 */

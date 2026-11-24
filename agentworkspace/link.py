@@ -28,6 +28,7 @@ from pathlib import Path
 import aaas
 from aaas import FunctionDeclaration, FunctionResult, Part, Tool
 
+from . import sessions
 from .settings import DEFAULT_URL as _DEFAULT_URL
 from .kernel import Runtime
 
@@ -100,6 +101,8 @@ class Link:
         self._busy = False
         self._send_lock = threading.Lock()
         self._turn_task: asyncio.Task | None = None
+        # 闸门放下的时刻。用来区分两种「忙」：真的在跑，和「刚跑完、还差最后一步」。
+        self._idle_at = 0.0
         self._declared_sig: tuple | None = None
         self._declare_fails = 0        # 同一份坏声明连续失败几次（用来停手）
         self._declare_sig_tried: tuple | None = None   # 上面的计数属于哪一份声明
@@ -110,7 +113,17 @@ class Link:
         self.MAX_CONTINUE = 3           # 防死循环：最多连续接力几轮
         self._continues = 0
         self._turn_caps: set[str] = set()
-        self.history: list[dict] = []   # stateless 模式下服务端不留，我们只留给人看
+        # 对话的**唯一真相**在磁盘上（sessions.py）。self.history 只是它的展示镜像：
+        # 切换会话时整份换掉，切完模型看到的就是这份 —— 没有第二份在别处长着。
+        self.store = sessions.Store(self.root)
+        self.sid: str = self.store.latest(pid) or self.store.create(pid)
+        self.history: list[dict] = self.store.messages(pid, self.sid)
+        # 轮数与 token 累计：在内存里跟着长，避免 as_dict 每次都重读整份文件
+        # （/api/state 会为每个程序调一次 as_dict）。
+        self._stat: dict = self.store.stats(pid, self.sid)
+        # 标题缓存在内存里：as_dict() 会被 /api/state 为**每个程序**调一次，
+        # 每次都去重读整份会话文件，会话越长越慢，而它只需要一个字符串。
+        self.title: str = self.store.meta(pid, self.sid).get("title", "")
         self._clip_warned = False       # 提示词被截断，只提醒一次（别每轮刷屏）
 
     # ------------------------------------------------------------------ 生命周期
@@ -378,21 +391,30 @@ class Link:
                            + "。继续把任务做完：新能力现在就可以调用。如果已经完成，"
                            "用一句话告诉用户你交付了什么、他可以怎么用。")
                 self._emit("turn.handoff", {"added": added, "round": self._continues})
-                final = await self._one_turn(handoff)
+                # sys=True：这句不是人说的。它照样进模型上下文（当时确实是 user 身份
+                # 被看见的），但界面上必须能与人说的分开 —— 否则一旦落盘，
+                # 它就成了永远擦不掉的假用户发言。
+                final = await self._one_turn(handoff, sys=True)
         finally:
             # 闸门必须开回去：否则聊天会永远回「上一轮还没结束」，
             # 而那看起来像「功能正常，只是不理人」—— 最坏的一种故障形态。
             with self._send_lock:
                 self._busy = False
+                self._idle_at = time.time()
 
-    async def _one_turn(self, text: str):
+    async def _one_turn(self, text: str, *, sys: bool = False):
+        # **显式传 history**：真相在我们这份 store 上，``caller.history`` 只是 SDK
+        # 内部细节。显式传带来两个好处，都是必需的：
+        #   * 切会话不必去动 SDK 的内部状态（那还得跨线程跳转）；
+        #   * 「模型看到的那份」恰好等于我们从文件投影出来的那份 —— 只此一份。
+        base = self._ctx()
         try:
-            turn = await self._caller.send(text, instructions=self.instructions())
+            turn = await self._caller.send(text, instructions=self.instructions(), history=base)
         except Exception as exc:
             self._emit("turn.failed", {"error": f"{type(exc).__name__}: {exc}"})
             return None
         self._turn = turn
-        self.history.append({"role": "user", "text": text, "ts": time.time()})
+        self._record_user(text, sys=sys)
         self._emit("turn.started", {"turnId": turn.turn_id})
         parts: list[str] = []
         try:
@@ -419,10 +441,16 @@ class Link:
             self._emit("turn.failed", {"error": f"{type(exc).__name__}: {exc}"})
         final = await turn.end()
         text_out = "".join(parts) or turn.text
-        self.history.append({"role": "assistant", "text": text_out, "ts": time.time()})
+        self._record_agent(text_out)
+        usage = final.usage.to_wire() if getattr(final, "usage", None) else None
+        # 账单要能看见：stateless 每轮重发全史，会话长度就是成本。
+        self.store.append_usage(self.pid, self.sid, usage)
+        if usage:
+            self._stat["tokensIn"] += int(usage.get("input") or 0)
+            self._stat["tokensOut"] += int(usage.get("output") or 0)
         self._emit("turn.completed", {
             "status": final.status, "finishReason": final.finish_reason,
-            "usage": (final.usage.to_wire() if getattr(final, "usage", None) else None),
+            "usage": usage,
             "text": text_out,
             "error": (final.error.to_wire() if getattr(final, "error", None) else None),
         }, source="agent")
@@ -514,9 +542,150 @@ class Link:
                 pass
 
     def as_dict(self) -> dict:
+        """给界面看的一份快照。
+
+        ``history`` 仍然截到 60 条（界面一次画不了那么多），但现在**说出来**了：
+        ``truncated`` 为真时人知道「上面还有」。静默截断比报错更坏 —— 屏幕上演着
+        一段完整的对话，而模型那边是另一回事，这种不一致不报错。
+        """
+        SHOW = 60
         return {"pid": self.pid, "status": self.status, "error": self.error,
                 "sessionId": self.session_id, "busy": self._busy,
-                "history": self.history[-60:]}
+                "sid": self.sid, "title": self.title,
+                "turns": self._stat.get("turns", 0),
+                "tokensIn": self._stat.get("tokensIn", 0),
+                "tokensOut": self._stat.get("tokensOut", 0),
+                "badLines": self._stat.get("bad", 0),
+                "truncated": len(self.history) > SHOW,
+                "total": len(self.history),
+                "history": self.history[-SHOW:]}
+
+
+    # ------------------------------------------------------------------ 会话
+    # 四个动作都只碰**数据**，不碰连接：切会话不重连，因此不会打断正在跑的那一轮
+    # 之外的东西 —— 而正在跑的那一轮是**拒绝**切换的理由（见 switch）。
+    def _ctx(self) -> list[aaas.Message]:
+        """当前会话投影成模型会看到的那份。空文本跳过（Message 要求 parts 非空）。"""
+        out: list[aaas.Message] = []
+        for h in self.history:
+            t = str(h.get("text") or "")
+            if not t.strip():
+                continue
+            out.append(aaas.Message.user(t) if h.get("role") == "user"
+                       else aaas.Message.agent(t))
+        return out
+
+    def _record_user(self, text: str, *, sys: bool = False) -> None:
+        self.store.append_user(self.pid, self.sid, text, sys=sys)
+        new_title = self.store.title_once(self.pid, self.sid, text)
+        if new_title:
+            self.title = new_title
+        self.history.append({"role": "user", "text": text, "ts": time.time(), "sys": sys})
+        self._stat["turns"] = self._stat.get("turns", 0) + 1
+
+    def _record_agent(self, text: str) -> None:
+        self.store.append_agent(self.pid, self.sid, text)
+        self.history.append({"role": "agent", "text": text, "ts": time.time()})
+
+    def _load(self, sid: str) -> None:
+        """把展示镜像换成另一个会话。**整份替换**，不做增量 —— 增量一定会漏。"""
+        self.sid = sid
+        self.history = self.store.messages(self.pid, sid)
+        self._stat = self.store.stats(self.pid, sid)
+        self.title = self.store.meta(self.pid, sid).get("title", "")
+
+    def _settle(self, wait: float = 1.0) -> bool:
+        """等闸门放下，**有上界**。
+
+        为什么需要：``turn.completed`` 是在 ``_one_turn`` 里发出的，而 ``_busy``
+        要到 ``_open_turn`` 的 ``finally`` 才归位 —— 中间还夹着一次能力面比对。
+        于是存在一个几十毫秒的窗口：屏幕上已经跑完了，闸门却还关着。
+        人手点不到，但**贴着终态的自动操作一定会撞上**，然后被回一句「这一轮还在跑」，
+        而那句话在用户眼里就是错的。
+
+        所以这里等着它 —— 但**绝不无限等**：真的在跑时要立刻拒绝，
+        否则点击会悬在那里，而那看起来像「点了没反应」。
+        """
+        end = time.time() + wait
+        while True:
+            if not self._busy and (self._turn is None or self._turn.done):
+                return True
+            if time.time() >= end:
+                return False
+            time.sleep(0.01)
+
+    def switch(self, sid: str) -> dict:
+        """切到另一个会话。**忙时拒绝**：半途切换会让在飞那一轮的事件落进新会话，
+        而它的 history 快照是切换之前取的 —— 两份都对不上，且不会报错。"""
+        if not sid or not self.store.exists(self.pid, sid):
+            return {"status": "missing", "message": f"没有会话 {sid}"}
+        self._settle()                             # 刚跑完的那一瞬间不算「忙」
+        with self._send_lock:                      # 与 send 同一道闸门
+            if self._busy or (self._turn is not None and not self._turn.done):
+                return {"status": "busy",
+                        "message": "这一轮还在跑：等它停下来再切，否则在飞的那一轮会落错地方"}
+            if sid == self.sid:
+                return {"status": "ok", "sid": sid, "title": "",
+                        "message": "已经在这个会话里"}
+            self._load(sid)
+            title = self.title
+        self._emit("session.changed", {"sid": sid, "title": title})
+        return {"status": "ok", "sid": sid, "title": title, "message": f"已切到「{title}」"}
+
+    def new_session(self, title: str = "") -> dict:
+        """开一个新会话并切过去。旧会话仍在盘上，随时切回。"""
+        self._settle()
+        with self._send_lock:
+            if self._busy or (self._turn is not None and not self._turn.done):
+                return {"status": "busy", "message": "这一轮还在跑：等它停下来再开新会话"}
+            sid = self.store.create(self.pid, title)
+            self._load(sid)
+        name = self.title
+        self._emit("session.changed", {"sid": sid, "title": name})
+        return {"status": "ok", "sid": sid, "title": name, "message": "新会话已开"}
+
+    def sessions(self, limit: int = 50) -> dict:
+        """这个程序的全部会话（新的在前）。
+
+        放在 Link 上而不是 Hub 上：Hub 只是「一个 pid 一条 Link」的池子，
+        它不该知道会话长什么样 —— 否则测试里那个替身就得复刻一遍同样的组装逻辑。
+        """
+        rows, more = self.store.list(self.pid, limit=limit)
+        return {"pid": self.pid, "sid": self.sid, "truncated": more, "shown": len(rows),
+                "sessions": [{"sid": r["sid"], "title": r["title"],
+                              "turns": r["turns"], "tokensIn": r["tokensIn"],
+                              "tokensOut": r["tokensOut"], "size": r["size"],
+                              "created": r["created"], "updated": r["updated"],
+                              "active": r["sid"] == self.sid} for r in rows]}
+
+    def rename(self, sid: str, title: str) -> dict:
+        if not self.store.exists(self.pid, sid):
+            return {"status": "missing", "message": f"没有会话 {sid}"}
+        name = self.store.rename(self.pid, sid, title)
+        if not name:
+            return {"status": "bad", "message": "标题不能为空"}
+        if sid == self.sid:
+            self.title = name
+        self._emit("session.changed", {"sid": sid, "title": name})
+        return {"status": "ok", "sid": sid, "title": name, "message": f"已改名为「{name}」"}
+
+    def drop(self, sid: str) -> dict:
+        """删掉一个会话 —— 移进 ``.trash/``，不硬删（对话是唯一副本）。"""
+        if not self.store.exists(self.pid, sid):
+            return {"status": "missing", "message": f"没有会话 {sid}"}
+        self._settle()
+        with self._send_lock:
+            if sid == self.sid and (self._busy
+                                    or (self._turn is not None and not self._turn.done)):
+                return {"status": "busy", "message": "正在跑的这个会话不能删：先停下这一轮"}
+            dst = self.store.drop(self.pid, sid)
+            if sid == self.sid:
+                # 删的正是当前这个：接上最近的一个；一个都不剩就开新的
+                nxt = self.store.latest(self.pid) or self.store.create(self.pid)
+                self._load(nxt)
+        self._emit("session.changed", {"sid": self.sid, "title": self.title})
+        return {"status": "ok", "sid": self.sid,
+                "message": f"已移进回收站（{dst.name if dst else '—'}），需要时可从 sessions/.trash 捞回"}
 
 
 class Hub:
@@ -565,6 +734,29 @@ class Hub:
         if l is None:
             return {"status": "idle", "message": "没有在跑的程序"}
         return l.cancel()
+
+    # -- 会话 -----------------------------------------------------------
+    def _with_link(self, pid: str, act: str, *a, **kw) -> dict:
+        """会话是数据，不依赖连接是否 ready —— 但要有个 Link 才知道「当前是哪个」。"""
+        l = self.link(pid, create=True)
+        if l is None:
+            return {"status": "missing", "message": f"没有程序 {pid}"}
+        return getattr(l, act)(*a, **kw)
+
+    def sessions(self, pid: str, limit: int = 50) -> dict:
+        return self._with_link(pid, "sessions", limit)
+
+    def switch(self, pid: str, sid: str) -> dict:
+        return self._with_link(pid, "switch", sid)
+
+    def new_session(self, pid: str, title: str = "") -> dict:
+        return self._with_link(pid, "new_session", title)
+
+    def rename(self, pid: str, sid: str, title: str) -> dict:
+        return self._with_link(pid, "rename", sid, title)
+
+    def drop(self, pid: str, sid: str) -> dict:
+        return self._with_link(pid, "drop", sid)
 
     # -- 换地址 ---------------------------------------------------------
     @property
