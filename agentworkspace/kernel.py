@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import enum
 import importlib.util
 import inspect
 import json
@@ -42,6 +43,42 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 PRIM = {str: "string", int: "integer", float: "number", bool: "boolean"}
+_UNSET = object()          # 「这个默认值进不了 JSON，别写进 schema」
+
+
+def _json_safe(value):
+    """默认值 → 能进 JSON 的形态；转不了就 ``_UNSET``（调用方**省略**这个键）。
+
+    为什么必须在这一层做：``parameters`` 最终要过 ``aaas.wire.dumps`` ——
+    那是一次**不带** ``default=str`` 的 ``json.dumps``。一个 ``Path`` / ``Enum``
+    默认值会让**整帧**序列化失败，而声明是全量的：这个程序的所有能力一条都
+    声明不上去。现场离写注解的人隔了两层 —— 插件作者只写了 ``p: Path = Path(".")``。
+
+    能转的就转，不丢信息（``Path(".")`` → ``"."``；枚举 → 它的值）；真转不了的
+    才省略：写一个错的值进 schema，比不写更坏 —— 模型会照着它传参。
+    """
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, enum.Enum):
+        return _json_safe(value.value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        out = [_json_safe(v) for v in value]
+        return _UNSET if any(x is _UNSET for x in out) else out
+    if isinstance(value, (set, frozenset)):
+        return _json_safe(sorted(value, key=str))
+    if isinstance(value, dict):
+        out: dict = {}
+        for k, v in value.items():
+            sv = _json_safe(v)
+            if sv is _UNSET:
+                return _UNSET
+            out[str(k)] = sv
+        return out
+    return _UNSET
+
+
 WIRE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")   # aaas §3.2 function 名约束
 MAX_EVENT_LOG = 500
 DEV_PID = "dev"      # 开发者工具集的 wire 前缀。它**不是程序**：不进左侧栏、没有界面
@@ -65,16 +102,36 @@ def _schema_of(tp) -> dict:
         if isinstance(tp, str):
             return meta
     origin, args = typing.get_origin(tp), typing.get_args(tp)
-    if origin is typing.Union:
+    # **两种**联合：``typing.Optional[X]`` 的 origin 是 ``typing.Union``，
+    # 而 PEP 604 的 ``X | None`` 是 ``types.UnionType`` —— 两个不同的对象。
+    # 只认前者，``x: int | None`` 就掉到末尾那条 ``return meta``：属性里**连 type
+    # 都没有**，模型不知道传什么，``validate()`` 也因为 want 为 None 直接跳过。
+    # 而 ``X | None`` 正是模型/人写新函数时最常见的写法 —— 这类缺陷专伤自造工具。
+    if origin is typing.Union or origin is _types.UnionType:
         rest = [a for a in args if a is not type(None)]
-        out = _schema_of(rest[0]) if len(rest) == 1 else {}
-        return {**out, **meta}
+        if not rest:                                   # Optional[None] 这种退化写法
+            return dict(meta)
+        if len(rest) == 1:
+            return {**_schema_of(rest[0]), **meta}
+        # 多分支：anyOf 是协议里那枚校验器支持的关键字（aaas/_jsonschema），
+        # 不会让声明被拒；单分支已在上面化开，绝不产出 anyOf 套 anyOf。
+        return {**{"anyOf": [_schema_of(a) for a in rest]}, **meta}
     if origin is typing.Literal:
-        return {**{"enum": list(args)}, **meta}
+        out: dict = {"enum": list(args)}
+        kinds = {PRIM[type(a)] for a in args if type(a) in PRIM}
+        if len(kinds) == 1:                            # 同质字面量：把 type 也说出来
+            out = {"type": kinds.pop(), **out}
+        return {**out, **meta}
     if origin in (list, set, tuple):
         return {**{"type": "array", "items": _schema_of(args[0]) if args else {}}, **meta}
     if origin is dict:
         return {**{"type": "object"}, **meta}
+    # 裸容器（``files: dict``）：``get_origin(dict)`` 是 None，上一条分支接不住，
+    # 于是也会掉到末尾 —— 真实例子就是 assistant_plugin_write 的 files 参数。
+    if tp in (dict,):
+        return {**{"type": "object"}, **meta}
+    if tp in (list, set, frozenset, tuple):
+        return {**{"type": "array"}, **meta}
     if tp in PRIM:
         return {**{"type": PRIM[tp]}, **meta}
     return meta
@@ -106,7 +163,9 @@ def build_schema(fn) -> dict:
         if name in docs:
             sch["description"] = docs[name]
         if p.default is not inspect.Parameter.empty and "default" not in sch:
-            sch["default"] = p.default
+            safe = _json_safe(p.default)
+            if safe is not _UNSET:                     # 转不了就**不写**这一格
+                sch["default"] = safe
         props[name] = sch
         if p.default is inspect.Parameter.empty:
             required.append(name)
@@ -128,6 +187,12 @@ def validate(schema: dict, args) -> str | None:
         if k not in props:
             return f"未知参数 {k}（不接受未声明的字段）"
         spec = props[k] or {}
+        if spec.get("anyOf"):                          # 多分支联合：任一支通过即可
+            branches = [b for b in spec["anyOf"] if isinstance(b, dict)]
+            if branches and not any(_matches(b, v) for b in branches):
+                kinds = " | ".join(str(b.get("type") or "any") for b in branches)
+                return f"{k} 应为 {kinds} 之一，收到 {type(v).__name__}"
+            continue                                   # 联合已判完，别再按 type 走
         want = spec.get("type")
         if want and v is None:
             continue
@@ -152,6 +217,11 @@ def validate(schema: dict, args) -> str | None:
             if hi is not None and v > hi:
                 return f"{k} 不能大于 {hi}，收到 {v}"
     return None
+
+
+def _matches(spec: dict, value) -> bool:
+    """值是否满足一条 schema 片段（只给 anyOf 的分支判定用）。"""
+    return validate({"type": "object", "properties": {"x": spec}}, {"x": value}) is None
 
 
 # --------------------------------------------------------------------- 数据

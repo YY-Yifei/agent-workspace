@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import ast
+import enum
 import json
 import re
 import shutil
@@ -16,6 +17,7 @@ import threading
 import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from typing import Literal, Optional
 from urllib.request import Request, urlopen
 
 from . import fixtures, kernel, server
@@ -1322,11 +1324,106 @@ def _run() -> int:
     check("拿不到 native 不抛异常（页面里还有兜底）",
           _okc3 is False and bool(_why3), str(_why3)[:80])
 
+    print("\n[20] schema 构造：一种注解只该长出**一份** schema（协议、表单、校验同源）")
+    _s604 = kernel.build_schema(_probe_pep604)
+    _px = _s604["properties"]["x"]
+    check("int|None 长出了 type（PEP 604 的 origin 是 types.UnionType，不是 typing.Union）",
+          _px.get("type") == "integer", str(_px))
+    _why604 = kernel.validate(_s604, {"x": "5"})
+    check("int|None 的坏类型被 validate 挡下（改前它连 type 都没有，谁都能过）",
+          _why604 is not None, str(_why604))
+    _sopt = kernel.build_schema(_probe_optional)
+    check("Optional[int] 与 int|None 给出同一份 schema（对照：老写法行为不变）",
+          _sopt["properties"]["x"] == _px, f"{_sopt['properties']['x']} vs {_px}")
+
+    _sany = _s604["properties"]["y"]
+    check("str|int → anyOf 两支",
+          [b.get("type") for b in _sany.get("anyOf", [])] == ["string", "integer"],
+          str(_sany))
+    check("anyOf：分支内的值放行（'a' 与 3 都过）",
+          kernel.validate(_s604, {"y": "a"}) is None
+          and kernel.validate(_s604, {"y": 3}) is None, "")
+    check("anyOf：分支外的值挡下（不因为它是联合就全放）",
+          kernel.validate(_s604, {"y": 1.5}) is not None, "")
+
+    _sbare = kernel.build_schema(_probe_bare)["properties"]
+    check("裸 dict → object（改前 assistant_plugin_write.files 就没有 type）",
+          _sbare["files"].get("type") == "object", str(_sbare["files"]))
+    check("裸 list → array", _sbare["xs"].get("type") == "array", str(_sbare["xs"]))
+
+    _slit = kernel.build_schema(_probe_literal)["properties"]["mode"]
+    check("Literal 同质字面量带 type + enum",
+          _slit.get("type") == "string" and _slit.get("enum") == ["fast", "slow"],
+          str(_slit))
+
+    _sdef = kernel.build_schema(_probe_defaults)["properties"]
+    check("Path 默认值转成字符串（改前 TypeError: WindowsPath is not JSON serializable）",
+          _sdef["p"].get("default") == ".", str(_sdef["p"]))
+    check("Enum 默认值转成它的值", _sdef["c"].get("default") == "fast", str(_sdef["c"]))
+    check("转不了的默认值被省略（宁可不写，也不写个错的）",
+          "default" not in _sdef["o"], str(_sdef["o"]))
+    _json_err = ""
+    try:
+        json.dumps(kernel.build_schema(_probe_defaults), ensure_ascii=False)
+    except TypeError as exc:                    # 声明帧是**不带** default=str 的序列化
+        _json_err = str(exc)
+    check("整份 schema 能 json.dumps（否则该程序所有能力一条都声明不上去）",
+          not _json_err, _json_err)
+
+    _untyped = [(w, n) for w, c in rt.capabilities().items()
+                for n, s in (c.parameters.get("properties") or {}).items()
+                if not s.get("type") and "enum" not in s]
+    check(f"真实能力面 {len(rt.capabilities())} 项里没有「无 type 无 enum」的参数",
+          not _untyped, str(_untyped[:4]))
+
     httpd.shutdown()
     if getattr(App, "native", None):
         App.native.shutdown()                       # 收尸：不留孤儿窗口
     print(f"\n{'全绿' if bad == 0 else '有失败'}：{ok} 通过 / {bad} 失败")
     return 0 if bad == 0 else 1
+
+
+# ------------------------------------------------- schema 探针（必须在模块级）
+# 为什么不能写在 _run() 里：本文件有 ``from __future__ import annotations``，注解
+# 是**字符串**，``typing.get_type_hints`` 只能从模块全局里解析局部定义的类型名。
+# 写在局部 → 解析失败 → 退化成「没有注解」→ 断言看起来在验，其实全是空转。
+# （这一条正是我上一轮记下的「假绿」的同一个面：门自己得先能红。）
+
+
+class _ProbeColor(enum.Enum):
+    """被当作默认值的枚举。"""
+
+    fast = "fast"
+
+
+class _Opaque:
+    """被当作默认值的、进不了 JSON 的对象。"""
+
+
+def _probe_pep604(x: int | None = None, y: str | int = 0) -> str:
+    """PEP 604 联合（``X | None``）。"""
+    return ""
+
+
+def _probe_optional(x: Optional[int] = None) -> str:
+    """``typing.Optional`` —— 对照组：老写法的产出不许变。"""
+    return ""
+
+
+def _probe_defaults(p: Path = Path("."), c: _ProbeColor = _ProbeColor.fast,
+                    o: _Opaque = _Opaque()) -> str:
+    """三种默认值：可转（Path）、可转（Enum）、转不了（object）。"""
+    return ""
+
+
+def _probe_bare(files: dict, xs: list) -> str:
+    """裸容器：``get_origin(dict)`` 是 None，最容易掉队的一类。"""
+    return ""
+
+
+def _probe_literal(mode: Literal["fast", "slow"] = "fast") -> str:
+    """同质字面量。"""
+    return ""
 
 
 class _FakeHub:
