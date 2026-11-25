@@ -454,7 +454,7 @@ def _run() -> int:
           a_l.instructions()[:80])
 
     print("[10b] 提示词长度：协议的硬约束（>=4096 字符整轮失败）")
-    from .link import MAX_INSTRUCTIONS, clip_instructions
+    from .link import FALLBACK_ASSISTANT, MAX_INSTRUCTIONS, clip_instructions
     a_md = (WS / "prompts" / "assistant.md").read_text(encoding="utf-8")
     check(f"小助理的提示词在 {MAX_INSTRUCTIONS} 字符以内（实测 4096 就被拒）",
           len(a_md) <= MAX_INSTRUCTIONS, f"{len(a_md)} 字符")
@@ -465,6 +465,16 @@ def _run() -> int:
     clipped, did = clip_instructions("你" * 9000)
     check("超长提示词会被截断（而不是让整轮静默失败）",
           did and len(clipped) == MAX_INSTRUCTIONS, f"{len(clipped)} clipped={did}")
+
+    # 兜底职责：可以短，不能空，也不能把「框架接线」写进去。
+    # 非空是**协议要求** —— 服务端拒空 instructions，整轮 2ms 失败且用户看不见解释。
+    check("兜底职责非空（空 = 整轮静默失败）",
+          bool(FALLBACK_ASSISTANT.strip()), repr(FALLBACK_ASSISTANT))
+    check(f"兜底职责够短（{len(FALLBACK_ASSISTANT)} 字符 ≤ 20）",
+          len(FALLBACK_ASSISTANT) <= 20, FALLBACK_ASSISTANT)
+    _leaks = [w for w in ("AaaS", "服务端", "调用方", "function", "声明", "协议")
+              if w in FALLBACK_ASSISTANT]
+    check("兜底职责里没有框架接线词", _leaks == [], str(_leaks))
 
     hub = Hub(rt, WS, {})
     check("智能体池是懒的（没人开程序就一条连接也不建）", hub.status() == {}, str(hub.status()))
