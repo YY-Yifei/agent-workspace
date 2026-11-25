@@ -25,7 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from . import settings
+from . import sessions, settings
 
 mimetypes.add_type("text/javascript", ".js")
 mimetypes.add_type("text/css", ".css")
@@ -45,6 +45,10 @@ SESSION_ONE_RE = re.compile(r"^/api/p/(?P<pid>[a-z][a-z0-9_]*)/session/(?P<sid>s
 SESSION_SID_RE = re.compile(r"^s_[0-9a-f]{8}$")
 SESSION_ACT_RE = re.compile(
     r"^/api/p/(?P<pid>[a-z][a-z0-9_]*)/session/(?P<act>new|switch|rename|delete)$")
+# 一张图。名字就是盘上那个名字（``<16 位 sha>.<后缀>``），形状在这里钉死。
+SESSION_IMG_RE = re.compile(
+    r"^/api/p/(?P<pid>[a-z][a-z0-9_]*)/session/(?P<sid>s_[0-9a-f]{8})"
+    r"/img/(?P<name>[0-9a-f]{16}\.(?:png|jpg|webp|gif))$")
 
 
 class App:
@@ -218,6 +222,20 @@ class Handler(BaseHTTPRequestHandler):
                 **{k: stats[k] for k in ("turns", "tokensIn", "tokensOut", "bad")},
             })
 
+        # 会话里的一张图。**只发图，不列目录**：名字必须是那种形状，
+        # 而 store.image_path 会再判一次（两处判据同一份，不是两份）。
+        m = SESSION_IMG_RE.match(path)
+        if m:
+            pid, sid, name = m.group("pid"), m.group("sid"), m.group("name")
+            if rt.program(pid) is None:
+                return self._json({"error": f"没有程序 {pid}"}, 404)
+            # 不用 hub.link(create=True)：那会顺手把一个智能体叫起来，
+            # 而「看一眼历史里的图」不该有那个副作用。Store 只读盘。
+            target = sessions.Store(rt.root).image_path(pid, sid, name)
+            if target is None or not target.is_file():
+                return self._json({"error": "没有这张图"}, 404)
+            return self._file(target)
+
         m = PLUGIN_RE.match(path)
         if m:
             pid, rest = m.group("pid"), m.group("rest")
@@ -300,9 +318,14 @@ class Handler(BaseHTTPRequestHandler):
                 # 就成了 {"status": {"status": ...}}，前端读到的 status 是个对象。
                 return self._json(hub.cancel(pid))
             text = str((body or {}).get("text", ""))
-            if not text.strip():
+            images = (body or {}).get("images") or []
+            if not isinstance(images, list):
+                return self._json({"error": "images 必须是数组"}, 400)
+            # 只有图、没有字是合法的一句话（「这张怎么样」的省略式）。真正的空
+            # 消息是**两样都没有** —— 那才拒。
+            if not text.strip() and not images:
                 return self._json({"error": "空消息"}, 400)
-            return self._json({"status": hub.send(pid, text), "pid": pid})
+            return self._json({"status": hub.send(pid, text, images=images), "pid": pid})
 
         # 会话的四个动作：新建 / 切换 / 改名 / 删除。
         # 它们都在 _origin_ok() 之下 —— 会话是「人这一侧」的东西，不需要另加防线。
