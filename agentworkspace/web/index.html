@@ -12,6 +12,9 @@
     /* 停止键的底与边：与 --bad 同色系的低透明度两档。写死 rgba 的话，
        浅色主题上会拿到一个"深色主题的红"，与同一行字的 color 不是一家。 */
     --stop-bg:rgba(224,100,91,.12); --stop-line:rgba(224,100,91,.42);
+    /* 开发者开关「开」的轨道：accent 的半透明底色。**不能**用 opacity 做淡 ——
+       滑块是轨道的 ::after，透明度作用在整棵子树上，滑块会跟着一起被削掉。 */
+    --dev-on-bg:rgba(90,162,255,.34);
     /* 滚动条三档：--sb 是**热区**（能抓住的宽度），视觉粗细由 thumb 的透明
        边框削掉；两档可见度 —— 静止时只是边界，鼠标压上去才是控件。 */
     /* 两档刻度按 WCAG 1.4.11 的非文本对比 3:1 定，而且是**算过**的：
@@ -30,6 +33,7 @@
     :root{ --bg:#f6f7f9; --panel:#fff; --line:#e5e7eb; --ink:#171a1f; --dim:#6b7280;
            --bubble:#eef0f3; --accent:#2563eb; --ok:#1f9d55; --bad:#d13b30;
            --stop-bg:rgba(209,59,48,.08); --stop-line:rgba(209,59,48,.38);
+           --dev-on-bg:rgba(37,99,235,.24);
            --sb-thumb:rgba(107,114,128,.8); --sb-thumb-hi:rgba(107,114,128,.95);
            color-scheme:light; }
   }
@@ -142,7 +146,10 @@
   .dev i::after{content:"";position:absolute;top:2px;left:2px;width:11px;height:11px;
     border-radius:50%;background:var(--dim);transition:transform .15s,background .15s}
   .dev.on{color:var(--accent)}
-  .dev.on i{background:var(--accent);opacity:.4}
+  /* 上一版是 `background:var(--accent);opacity:.4`：透明度把滑块一起削到 40%，
+     于是「开」态是一条纯蓝胶囊 —— 看不出它滑到哪边，也就看不出开没开。
+     淡还给轨道（半透明底色），滑块保持实心：两档亮度分开，形状才读得出来。 */
+  .dev.on i{background:var(--dev-on-bg)}
   .dev.on i::after{transform:translateX(11px);background:var(--accent)}
   /* scrollbar-gutter:stable —— 流式输出时每来一段都会让滚动条出现一次，
      没有它正文会跟着左右抖 10px。位置定死，抖动就消失。
@@ -160,7 +167,11 @@
      标签一起放开。对话正文与对话框里的说明，才是人要带走的东西。 */
   #thread,.dlg{user-select:text;-webkit-user-select:text;cursor:auto}
   .msg{width:100%;max-width:100%}
-  .msg.me{display:flex;justify-content:flex-end}
+  /* 一句话 + 几张图 = **一竖列**，整块靠右。
+     上一版是 `display:flex;justify-content:flex-end`（横排），于是正文与图成了
+     两个并排的 flex 项：文字被挤成一根窄柱在左、图在右一列 —— 既不像「我发的」，
+     也把整行撑满。图从来不是正文的兄弟，是它的下一行。 */
+  .msg.me{display:flex;flex-direction:column;align-items:flex-end}
   .msg .body{white-space:pre-wrap;word-break:break-word}
   .msg.me .body{background:var(--bubble);padding:8px 12px;border-radius:12px;max-width:86%}
   /* 没送出去的那一句（人切了程序，草稿放不回去）：虚线 + 淡，别把它画成「说过的话」 */
@@ -237,13 +248,17 @@
   /* 待发的图：小、可删、看得清。× 在角上而不是列表里 —— 删的是**那一张**。 */
   .pends{display:none;gap:8px;flex-wrap:wrap}
   .pends .pk{position:relative}
-  .pends img{height:56px;border-radius:8px;border:1px solid var(--line);object-fit:cover;display:block}
+  .pends img{height:56px;border-radius:8px;border:1px solid var(--line);
+    object-fit:cover;display:block;cursor:zoom-in}
   .pends .pk button{position:absolute;top:-6px;right:-6px;width:20px;height:20px;
     padding:0;border-radius:50%;font-size:12px;line-height:1;background:var(--panel);
     color:var(--ink);border:1px solid var(--line);cursor:pointer}
-  .msg.me .shots{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
-  .msg.me .shots img{max-width:180px;max-height:180px;border-radius:10px;
-    border:1px solid var(--line);display:block}
+  /* 缩略图 120px：够认出是哪张，又不至于两张就把一屏吃掉。真要看清楚就点开
+     （#lb 那张整屏的暗底）—— 缩略图不该假装自己就是原图。 */
+  .msg.me .shots{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;
+    max-width:100%;justify-content:flex-end}
+  .msg.me .shots img{max-width:120px;max-height:120px;border-radius:8px;
+    border:1px solid var(--line);display:block;cursor:zoom-in}
   .composer textarea{flex:1;resize:none;min-height:40px;max-height:160px;padding:10px 12px;
     border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--ink);
     font:inherit;outline:none}
@@ -263,6 +278,8 @@
   /* 停止后的尾注：小、灰、不抢戏 —— 只是「这一轮到此为止」的记号 */
   .stopnote{font-size:11px;color:var(--dim);margin-top:2px}
   .empty{flex:1;display:grid;place-items:center;color:var(--dim);font-size:13px}
+  /* 拖进来的那一刻得有个落点：不然「拖了没反应」和「拖了但不收」长得一模一样。 */
+  .composer.drag{background:var(--bubble);box-shadow:inset 0 0 0 2px var(--accent)}
 
   /* 设置入口在左下角：它管的是「整个工作区连哪个道」，不是某一个程序的事。
      所以它不和程序挤在同一列里 —— 中间用一道分隔线分开。 */
@@ -294,6 +311,12 @@
   #vmask,#smask{position:fixed;inset:0;background:rgba(0,0,0,.42);display:none;
     place-items:center;z-index:41}
   #vmask.on,#smask.on{display:grid}
+  /* 看大图：整屏暗底，点任意处 / Esc 关掉。它不改任何状态，只是一次「看清楚」。 */
+  #lb{position:fixed;inset:0;background:rgba(0,0,0,.8);display:none;place-items:center;
+    padding:24px;z-index:42;cursor:zoom-out}
+  #lb.on{display:grid}
+  #lb img{max-width:100%;max-height:100%;border-radius:8px;
+    box-shadow:0 24px 60px rgba(0,0,0,.5)}
   /* 行内改名：不弹 prompt —— pywebview 的 prompt 支持与否取决于版本，
      弹不出来就是「点了没反应」。直接就地变成输入框。 */
   .sren{width:100%;box-sizing:border-box;background:var(--bg);color:var(--ink);
@@ -313,6 +336,18 @@
     font-size:12px;cursor:pointer}
   .vrow button:hover{border-color:var(--accent);color:var(--accent)}
   .vrow button[disabled]{opacity:.55;cursor:default}
+  /* 会话行：**整行就是「切过去」**，右边只留两个动作。
+     三个按钮并排（切过去 / 改名 / 删除）每行都要读一遍，而「切过去」在当前那一行
+     永远是按不动的 —— 一个按不动的按钮不是信息，是噪音。当前会话改用一个词说清。 */
+  .vrow.srow{cursor:pointer;align-items:center}
+  .vrow.srow:hover{border-color:var(--accent)}
+  .vrow .scur{flex:0 0 auto;font-size:11px;color:var(--accent)}
+  .vrow .sact{height:24px;padding:0 8px;border-radius:7px;border:1px solid transparent;
+    background:transparent;color:var(--dim);font:inherit;font-size:12px;cursor:pointer}
+  .vrow .sact:hover{color:var(--ink);border-color:var(--line)}
+  .vrow .sact.dele:hover{color:var(--bad);border-color:var(--stop-line)}
+  .vrow .sact.dele.confirm{color:var(--bad);border-color:var(--stop-line);
+    background:var(--stop-bg)}
   /* 入口按钮：和「开发者」开关同一行，靠右。它不改变任何状态，只是打开一页。 */
   .vbtn{flex:0 0 auto;height:26px;padding:0 10px;border-radius:8px;
     border:1px solid var(--line);background:transparent;color:var(--dim);font:inherit;
@@ -362,6 +397,7 @@
     </div>
   </div>
 </div>
+<div id="lb" aria-hidden="true"><img alt="看大图"></div>
 <script src="/web/turn.js"></script>
 <script src="/web/md.js"></script>
 <script>
@@ -374,6 +410,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"]/g,
    没有第二份「界面状态」—— 界面是它的投影，不是它的所有者。 */
 const S = {
   programs: [], agents: {}, native: {}, devtools: null, pid: null,
+  stitle: {},        // 每个程序当前会话的标题（悬停里那句「当前会话：…」）
   settings: { url: '' },
   vcs: { enabled: false, reason: '' },   // 版本化开关（内核没装 pure-python-git 时为 false）
   msgs: {},       // pid → [{role:'me'|'it', text, tools:[{label,status,text}]}]
@@ -651,8 +688,9 @@ function closeVersions() {
 function wireSessions() {
   const b = $('#sessbtn');
   if (!b) return;
-  const a = S.agents[S.pid] || {};
-  b.title = a.title ? `当前会话：${a.title}` : '会话：新建 / 切换 / 改名 / 删除';
+  // 标题来自会话本身（reloadThread 接住的），不是 agents 快照 —— 那份里没有 title。
+  const t = S.stitle[S.pid];
+  b.title = t ? `当前会话：${t}` : '会话：新建 / 切换 / 改名 / 删除';
   b.onclick = () => openSessions(S.pid);
   const n = $('#snew');
   if (n) n.onclick = () => doNewSession(S.pid);
@@ -672,12 +710,15 @@ function fmtTime(t) {
   if (!n) return '—';
   const d = new Date(n * 1000);
   const p = (x) => String(x).padStart(2, '0');
-  return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
-
-function tokText(r) {
-  const i = Number(r.tokensIn || 0) + Number(r.tokensOut || 0);
-  return i ? `${i} token` : '未计 token';
+  const hm = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  // 今天 / 昨天 / 更早：人不做日期减法 —— 「11-25 13:17」得先算一下才知道是不是今天。
+  const day = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const t0 = new Date();
+  t0.setHours(0, 0, 0, 0);
+  const back = Math.round((t0.getTime() - day) / 86400000);
+  if (back === 0) return `今天 ${hm}`;
+  if (back === 1) return `昨天 ${hm}`;
+  return `${d.getMonth() + 1}-${p(d.getDate())} ${hm}`;
 }
 
 async function jpost(url, body) {
@@ -694,6 +735,11 @@ async function reloadThread(pid, sid) {
     .then((x) => x.json()).catch(() => null);
   if (!r || r.error || !r.messages) return;
   S.sid[pid] = r.sid || sid;
+  if (r.title) S.stitle[pid] = r.title;
+  const sb = $('#sessbtn');                       // 切完会话，悬停里那句也得跟着换
+  if (sb && pid === S.pid) {
+    sb.title = S.stitle[pid] ? `当前会话：${S.stitle[pid]}` : sb.title;
+  }
   const rows = r.messages.map((h) => ({
     role: h.role === 'user' ? 'me' : 'it', text: h.text || '', tools: [],
     files: h.files || [],                // 引用，不是字节：界面按引用拼 /img/<name>
@@ -724,22 +770,35 @@ async function openSessions(pid) {
   setSHint((r.truncated
     ? `只显示最近 ${rows.length} 个（更早的还有）。`
     : `共 ${rows.length} 个会话。`)
-    + '删掉的会移进 sessions/.trash，需要时能捞回。');
+    + '删掉的会先进回收站，需要时能捞回。');
+  /* 每一行只回答两个问题：这是哪个会话（标题 + 什么时候、几轮）、我能对它做什么。
+     切过去 = **点这一行**（整行都是它）；动作只留「改名」「删除」两个。
+     token 数不进这一行：那是账单，不是「这是哪个会话」。 */
   $('#slist').innerHTML = rows.map((s) => `
-    <div class="vrow${s.active ? ' cur' : ''}">
+    <div class="vrow srow${s.active ? ' cur' : ''}" data-sid="${esc(s.sid)}"
+         ${s.active ? '' : 'title="切到这个会话"'}>
       <div class="vmain">
         <div class="vno">${esc(s.title || '（未命名）')}</div>
-        <div class="vmeta">${esc(fmtTime(s.updated))} · ${s.turns} 轮 · ${esc(tokText(s))}</div>
+        <div class="vmeta">${esc(fmtTime(s.updated))} · ${Number(s.turns || 0)} 轮</div>
       </div>
-      <button type="button" data-act="switch" data-sid="${esc(s.sid)}"${s.active ? ' disabled title="就是当前会话"' : ''}>切过去</button>
-      <button type="button" data-act="rename" data-sid="${esc(s.sid)}">改名</button>
-      <button type="button" data-act="delete" data-sid="${esc(s.sid)}">删除</button>
+      ${s.active ? '<span class="scur">当前</span>' : ''}
+      <button type="button" class="sact" data-act="rename" data-sid="${esc(s.sid)}">改名</button>
+      <button type="button" class="sact dele" data-act="delete" data-sid="${esc(s.sid)}">删除</button>
     </div>`).join('');
+  $('#slist').querySelectorAll('.vrow.srow').forEach((row) => {
+    if (row.classList.contains('cur')) return;          // 已经在用的那个：点了也没事可做
+    const sid = row.dataset.sid;
+    row.onclick = (e) => {
+      if (e.target.closest && e.target.closest('button,input')) return;
+      // 双击选词不算「点行」：选完就切走，选区当场没了。
+      if (!window.getSelection().isCollapsed) return;
+      doSwitch(pid, sid);
+    };
+  });
   $('#slist').querySelectorAll('button[data-act]').forEach((b) => {
     b.onclick = () => {
       const sid = b.dataset.sid;
-      if (b.dataset.act === 'switch') return doSwitch(pid, sid);
-      if (b.dataset.act === 'delete') return doDrop(pid, sid, b);
+      if (b.dataset.act === 'delete') return armDelete(b, () => doDrop(pid, sid, b));
       return startRename(pid, sid, b);
     };
   });
@@ -770,7 +829,29 @@ async function doNewSession(pid) {
   setSHint('新会话已开；之前的对话还在，随时能切回去。', 'ok');
 }
 
+/* 删除按两下。一步就删的东西，在「极简」的界面里迟早会被误触 —— 而这里删掉的是
+   对话（虽然进回收站，但没人愿意专门去那儿捞）。第一下把按钮变成「确认删除」，
+   4 秒没有第二下就自己变回去 —— 不弹窗、不占地方。 */
+function armDelete(btn, run) {
+  if (btn.dataset.armed === '1') {
+    delete btn.dataset.armed;
+    clearTimeout(btn._t);
+    return run();
+  }
+  btn.dataset.armed = '1';
+  btn.textContent = '确认删除';
+  btn.classList.add('confirm');
+  btn._t = setTimeout(() => {
+    delete btn.dataset.armed;
+    btn.textContent = '删除';
+    btn.classList.remove('confirm');
+  }, 4000);
+}
+
 async function doDrop(pid, sid, btn) {
+  const row = btn.closest ? btn.closest('.vrow') : null;
+  const no = row ? row.querySelector('.vno') : null;
+  const title = no ? no.textContent : '';
   btn.disabled = true;
   setSHint('正在删除…');
   const r = await jpost(`/api/p/${pid}/session/delete`, { sid });
@@ -781,7 +862,8 @@ async function doDrop(pid, sid, btn) {
   }
   if (sid === S.sid[pid]) await reloadThread(pid, r.sid);
   await openSessions(pid);
-  setSHint(r.message || '已删除', 'ok');
+  // 服务端那句还带着落盘文件名（sessions/.trash/…）：那是账，不是给人读的话。
+  setSHint(`已删掉${title ? `「${title}」` : ''} —— 回收站里还留着，捞得回来。`, 'ok');
 }
 
 /* 行内改名：就地变成输入框。Enter 保存、Esc 放弃、失去焦点也保存。 */
@@ -986,12 +1068,30 @@ function wirePictures(ta, form) {
     e.preventDefault();
     addPics(S.pid, files);
   });
-  form.ondragover = (e) => { e.preventDefault(); };
-  form.ondrop = (e) => { e.preventDefault(); addPics(S.pid, [...((e.dataTransfer || {}).files || [])]); };
+  /* 拖进来的落点反馈：拖到一半松手是**什么都不发生**的，所以必须看得出「这里收」。
+     用计数器而不是布尔：dragenter/leave 会在子元素之间成对地反复触发，
+     一个布尔值会让高亮在鼠标从 textarea 滑到按钮上时闪一下。 */
+  const hasFiles = (e) => [...(((e.dataTransfer || {}).types) || [])].includes('Files');
+  let depth = 0;
+  const off = () => { depth = 0; form.classList.remove('drag'); };
+  form.ondragenter = (e) => {
+    if (!hasFiles(e)) return;
+    depth += 1;
+    form.classList.add('drag');
+  };
+  form.ondragover = (e) => { e.preventDefault(); };   // 不拦这一下就没有 drop
+  form.ondragleave = () => { depth -= 1; if (depth <= 0) off(); };
+  form.ondrop = (e) => {
+    e.preventDefault();
+    off();                                            // 松手就撤，无论收不收
+    addPics(S.pid, [...((e.dataTransfer || {}).files || [])]);
+  };
   const box = $('#pends');
   if (box) box.onclick = (e) => {
     const b = e.target.closest ? e.target.closest('button[data-pk]') : null;
-    if (b) dropPic(S.pid, Number(b.dataset.pk));
+    if (b) return dropPic(S.pid, Number(b.dataset.pk));
+    const im = e.target.closest ? e.target.closest('img') : null;   // 没发出去也能看大图
+    if (im) openPhoto(im.src);
   };
 }
 
@@ -1329,6 +1429,24 @@ function shotsHtml(pid, m) {
   return out ? `<div class="shots">${out}</div>` : '';
 }
 
+/* 看大图：一整屏的暗底，点任意处或 Esc 关掉。它不改任何状态、不发任何请求 ——
+   只是一次「看清楚」。缩略图负责认出是哪张，它负责看清。 */
+function openPhoto(src) {
+  const lb = $('#lb');
+  if (!lb || !src) return;
+  lb.querySelector('img').src = src;
+  lb.classList.add('on');
+  lb.setAttribute('aria-hidden', 'false');
+}
+
+function closePhoto() {
+  const lb = $('#lb');
+  if (!lb || !lb.classList.contains('on')) return;
+  lb.classList.remove('on');
+  lb.setAttribute('aria-hidden', 'true');
+  lb.querySelector('img').src = '';     // 别把上一张的 src 留在 DOM 里
+}
+
 function toolsHtml(m) {
   const list = m.tools || [];
   if (!list.length) return '';
@@ -1361,6 +1479,9 @@ function toolsHtml(m) {
 /* 工具区的点击只有两个落点（整组 / 单项）。整段 thread 每次重绘都换掉，
    所以用委托 —— 逐个绑会在重绘后全部失效。 */
 function onThreadClick(e) {
+  // 缩略图先走：它不是按钮，但在对话区里点一张图就该放大 —— 不管它挂在哪条消息上。
+  const im = e.target.closest ? e.target.closest('.shots img') : null;
+  if (im) { openPhoto(im.src); return; }
   const btn = e.target.closest ? e.target.closest('.tgh,.th') : null;
   if (!btn) return;
   const grp = btn.closest('.tgroup');
@@ -1637,9 +1758,16 @@ $('#setform').onsubmit = saveSettings;
 $('#mask').addEventListener('click', (e) => { if (e.target.id === 'mask') closeSettings(); });
 $('#vclose').onclick = closeVersions;
 $('#vmask').addEventListener('click', (e) => { if (e.target.id === 'vmask') closeVersions(); });
+/* 会话面板与它们同一套骨架，就该有同一套「怎么关」：Esc、点窗外。
+   上一版只有「关闭」按钮能关 —— 点遮罩、按 Esc 都没有反应，而这两条正是
+   所有浮层默认该有的路（人不会先去找按钮）。 */
+$('#smask').addEventListener('click', (e) => { if (e.target.id === 'smask') closeSessions(); });
+$('#lb').addEventListener('click', closePhoto);
 window.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
+  closePhoto();         // 大图在最上层：先关它，别一次把底下的面板也关掉
   closeVersions();      // 版本面板在上层，先关它
+  closeSessions();
   closeSettings();
 });
 
