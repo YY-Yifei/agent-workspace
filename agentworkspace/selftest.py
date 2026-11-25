@@ -1614,6 +1614,47 @@ def _run() -> int:
     check(f"真实能力面 {len(rt.capabilities())} 项里没有「无 type 无 enum」的参数",
           not _untyped, str(_untyped[:4]))
 
+    # ---------------- 模型看到的那几句字：要瘦，但不许丢硬约束
+    # aaas 只把 name / description / parameters 交给模型（§4.2.1）：description 来自
+    # docstring 首行，参数说明来自「name: 说明」那一行。所以「精简」只动这两处文字，
+    # **不动 schema 结构** —— type/default/required 同时喂着协议、界面表单、执行前
+    # 校验三处，删一格就是漏一道校验。
+    _DESC_MAX, _ARG_MAX = 40, 60
+    _vis = [(f"{c.pid}:{w}", c) for w, c in
+            {**rt.capabilities_of("assistant"), **rt.devtools}.items()]
+    check("内置能力面 10 + 9 都在（空集上的预算检查是假绿）",
+          len(_vis) >= 19, f"只拿到 {len(_vis)} 项：{sorted(w for w, _ in _vis)}")
+    _long = [(w, len(c.description)) for w, c in _vis if len(c.description) > _DESC_MAX]
+    check(f"每条工具说明 ≤ {_DESC_MAX} 字符（它是模型的唯一索引，一句话够）",
+          not _long, str(_long[:4]))
+    _arglong = [(w, n, len(s.get("description") or ""))
+                for w, c in _vis
+                for n, s in (c.parameters.get("properties") or {}).items()
+                if len(s.get("description") or "") > _ARG_MAX]
+    check(f"每条参数说明 ≤ {_ARG_MAX} 字符", not _arglong, str(_arglong[:4]))
+    _dangling = [(w, n) for w, c in _vis
+                 for n, s in (c.parameters.get("properties") or {}).items()
+                 if (s.get("description") or "").endswith(("；", "，", "、", "：", ";", ","))]
+    check("参数说明不以「；，、：」结尾 —— 悬空 = 后半句被丢了，模型只看到半句",
+          not _dangling, str(_dangling[:4]))
+    _md = [(w, n) for w, c in _vis
+           for n, t in ([("", c.description)]
+                        + [(n, s.get("description") or "")
+                           for n, s in (c.parameters.get("properties") or {}).items()])
+           if re.search(r"\*\*[^*\n]+\*\*|`", t)]
+    check("模型可见文字里没有 markdown 强调 / 反引号（tool schema 不渲染它，只是白花 token）",
+          not _md, str(_md[:4]))
+    for _pid, _lim in (("assistant", 600), ("dev", 660)):
+        _n = sum(len(c.description)
+                 + sum(len(s.get("description") or "")
+                       for s in (c.parameters.get("properties") or {}).values())
+                 for w, c in _vis if c.pid == _pid)
+        check(f"{_pid} 的可见说明合计 ≤ {_lim} 字符（当前 {_n}：加一句就得先删一句）",
+              _n <= _lim, f"{_n} > {_lim}")
+    _sw = kernel.build_schema(_probe_wrapped)["properties"]
+    check("折行的参数说明接得回来（只认第一行 → 后半句丢，模型看到半句还以为是全句）",
+          "最要紧的硬约束" in (_sw["files"].get("description") or ""), str(_sw["files"]))
+
     print("\n[21] 两把老手（search / shell）：不许**静默**地少给、错给、或把我们自己干的当成命令的失败")
     from types import SimpleNamespace
 
@@ -2635,6 +2676,16 @@ def _probe_defaults(p: Path = Path("."), c: _ProbeColor = _ProbeColor.fast,
 
 def _probe_bare(files: dict, xs: list) -> str:
     """裸容器：``get_origin(dict)`` 是 None，最容易掉队的一类。"""
+    return ""
+
+
+def _probe_wrapped(files: dict, why: str = "") -> str:
+    """折行的参数说明：后半句缩进更深，接不回来就**静默丢了**。
+
+    files: {文件名: 内容}，只收 plugin.json / backend.py / ui/**；
+           最要紧的硬约束恰恰写在第二行
+    why: 为什么改
+    """
     return ""
 
 

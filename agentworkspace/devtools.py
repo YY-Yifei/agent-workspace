@@ -122,9 +122,9 @@ def _page(lines: list[str], offset: int, limit: int) -> tuple[str, int, bool]:
 # ------------------------------------------------------------------ 看
 
 def tree(max_depth: int = 3) -> dict:
-    """看工作区结构（只读）。你自己的文件在 plugins/<你的 id>/ 下。
+    """看工作区结构（只读）；你的文件在 plugins/<你的 id>/ 下。
 
-    max_depth: 递归深度，默认 3
+    max_depth: 递归深度
     """
     from . import toolbox
 
@@ -136,11 +136,11 @@ def tree(max_depth: int = 3) -> dict:
 
 
 def read(path: str, offset: int = 1, limit: int = SHOW_LIMIT) -> dict:
-    """读一个文件（工作区内，可**分页**）。改自己之前，先把当前那一版读出来。
+    """读工作区内的文件，可分页。改自己前先读当前版。
 
-    path: 相对工作区的路径，如 plugins/<你的 id>/backend.py
-    offset: 从第几行开始（1 = 文件开头）
-    limit: 最多读多少行（默认 200，硬顶 500）
+    path: 相对工作区的路径
+    offset: 起始行（1 = 开头）
+    limit: 最多行数（硬顶 500）
     """
     from . import toolbox
 
@@ -149,15 +149,15 @@ def read(path: str, offset: int = 1, limit: int = SHOW_LIMIT) -> dict:
 
 def search(pattern: str, path: str = ".", limit: int = 30, regex: bool = False,
            ignore_case: bool = False, glob: str = "", context: int = 0) -> dict:
-    """在工作区里按文本检索，返回「文件:行号: 内容」。
+    """检索工作区，返回「文件:行号: 内容」。
 
-    pattern: 要找的文本（regex=True 时是正则）
-    path: 检索起点（相对工作区），默认整个工作区
-    limit: 最多返回多少条命中
-    regex: 按正则解释 pattern（默认纯文本子串）
+    pattern: 要找的文本
+    path: 检索起点，可给目录或单个文件
+    limit: 最多几条命中
+    regex: 按正则解释 pattern
     ignore_case: 忽略大小写
-    glob: 只看文件名匹配它的，如 *.py / plugins/*/backend.py
-    context: 每条命中额外带几行上下文（0~5）
+    glob: 只看匹配的文件名，如 *.py
+    context: 每条命中带几行上下文（0~5）
 
     和 ``dev_read`` 一样是**只读**的；返回里的 truncated 说明「到 limit 就停了」，
     别把「给了 30 条」当成「一共 30 条」。
@@ -170,12 +170,12 @@ def search(pattern: str, path: str = ".", limit: int = 30, regex: bool = False,
 # ------------------------------------------------------------------ 史
 
 def versions(limit: int = 20) -> dict:
-    """看**你自己**的历史版本（最新在前）。改坏了想退回去，先看这里。
+    """看你自己的历史版本（最新在前），回退前先看这里。
 
     每一版一行：版本号、短号、时间、摘要、改了哪几个文件。
     ``v1`` 是最早的那版，号越大越新 —— 回退时用 ``dev_revert(version="v3")``。
 
-    limit: 最多列多少版，默认 20
+    limit: 最多列几版
     """
     vcs = _vcs()
     me = _me()
@@ -207,15 +207,15 @@ def versions(limit: int = 20) -> dict:
 
 
 def show(version: str, path: str = "", offset: int = 1, limit: int = SHOW_LIMIT) -> dict:
-    """看某一版：**不带 path 看清单**（有哪些文件、各多少行、与你现在的差别），带 path 看那个文件。
+    """看某一版：不带 path 看文件清单，带 path 看那个文件。
 
     先看清单再要片段，比一次要全文省得多 —— 你通常只想知道「那时候 backend.py
     有几个函数」，而不是把 300 行全搬进上下文。
 
-    version: 版本号（v1 / v2 …）或短号（8 位），取 dev_versions 里出现过的
-    path: 相对你自己目录的路径（plugin.json / backend.py / ui/**），留空看清单
-    offset: 从第几行开始（1 = 文件开头）
-    limit: 最多多少行（默认 200，硬顶 500）
+    version: 版本号（v1 / v2 …）或 8 位短号
+    path: 相对你目录的路径，留空看清单
+    offset: 起始行（1 = 开头）
+    limit: 最多行数（硬顶 500）
     """
     vcs = _vcs()
     me = _me()
@@ -269,12 +269,12 @@ def show(version: str, path: str = "", offset: int = 1, limit: int = SHOW_LIMIT)
 
 
 def diff(version: str, path: str = "") -> dict:
-    """看某一版**到你现在**的逐行差别。定位「是哪一行改坏的」，比整份回退准得多。
+    """看某一版到你现在的逐行差别（定位是哪行改坏的）。
 
     不带 path：先给统计头（几个文件、各 +/- 多少行），再给改动最多的那个文件的 hunk。
 
-    version: 版本号（v1 / v2 …）或短号
-    path: 只看某个文件（plugin.json / backend.py / ui/**），留空看全部
+    version: 版本号（v1 / v2 …）或 8 位短号
+    path: 只看某个文件，留空看全部
     """
     vcs = _vcs()
     pdir = _pdir()
@@ -318,9 +318,9 @@ def diff(version: str, path: str = "") -> dict:
 # ------------------------------------------------------------------ 写
 
 def write(path: str, content: str) -> dict:
-    """写一个普通文本文件（工作区内）。**不要用来改自己** —— 改自己用 dev_plugin_write。
+    """写工作区内的文本文件。改自己用 dev_plugin_write。
 
-    path: 相对工作区的路径（plugins/**、dev.json、config.json 会被拒）
+    path: 相对工作区的路径（data/、plugins/**、dev.json、config.json 拒写）
     content: 完整内容
     """
     from . import toolbox
@@ -329,14 +329,13 @@ def write(path: str, content: str) -> dict:
 
 
 def plugin_write(files: dict, why: str = "") -> dict:
-    """提交**你自己**的新版本：一次提交整份文件，四道校验后才落盘。
+    """提交你自己的新版本（整份一次提交，四道校验后落盘）。
 
     提交的是整份文件，不是补丁：backend.py 里原有的函数、注解、docstring
     都得带上，否则那个能力（和用户用的那个按钮）就没了。
 
-    files: {文件名: 内容}，只接受 plugin.json / backend.py / ui/**；
-           data/（用户攒下的数据）永远不许碰
-    why: 一句话说明**为什么**改（进历史，下一轮的你会读到它）
+    files: {文件名: 内容}，只收 plugin.json / backend.py / ui/**（data/ 不许碰）
+    why: 为什么改（进历史，下一轮的你会读到）
 
     校验不过会**整份回滚**到提交前那一版，你什么也没改成。
     成功后会记一版历史：dev_versions 看得见，dev_revert 退得回。
@@ -356,14 +355,14 @@ def plugin_write(files: dict, why: str = "") -> dict:
 
 
 def revert(version: str, paths: list[str] | None = None, why: str = "") -> dict:
-    """回到某一版：把那一版的内容**再提交一次**（不是 reset，历史照旧留着）。
+    """回到某一版：把那一版再提交一次（不是 reset，历史留着）。
 
     为什么不是 reset：回退本身也得可逆。这样退回去之后还能再退回来，
     而且四道校验仍然挡在前面 —— 退到一版坏代码会被拒，并告诉你为什么。
 
-    version: 版本号（v1 / v2 …）或短号，取 dev_versions 里出现过的
-    paths: 只退某几个文件（如 ["backend.py"]），留空 = 整份回到那一版
-    why: 一句话说明为什么退（进历史）
+    version: 版本号（v1 / v2 …）或 8 位短号
+    paths: 只退这几个文件，留空 = 整份回退
+    why: 为什么退（进历史）
     """
     me = _me()
     from . import toolbox

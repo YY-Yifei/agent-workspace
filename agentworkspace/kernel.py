@@ -157,12 +157,33 @@ def _schema_of(tp) -> dict:
 
 
 def _arg_docs(doc: str | None) -> dict[str, str]:
-    """docstring 里的 ``name: 说明`` → {name: 说明}（就地重用，不引额外解析库）。"""
+    """docstring 里的 ``name: 说明`` → {name: 说明}（就地重用，不引额外解析库）。
+
+    **续行要接回来。** 说明写长了自然折行，而这里只认「name: 说明」那一行 ——
+    折下去的后半截就静默丢了。实测（_tmp/audit_desc.py）：``files: {文件名: 内容}，
+    只接受 plugin.json / backend.py / ui/**；`` 的下一行是「data/ 永远不许碰」，
+    模型看到的却是一句以「；」结尾的断句，**那条硬约束它从来没看见过**。
+    丢半句而不报错比丢整句更坏：模型会以为自己看完了。
+
+    判据：缩进比上一条参数说明**更深**、且自己不是「name: …」的行 → 接到上一条。
+    空行、或缩进回落（正文段落与参数说明同缩进）→ 这一条说到此为止。
+    """
     out: dict[str, str] = {}
+    last: str | None = None
+    last_indent = -1
     for ln in (doc or "").splitlines():
-        m = re.match(r"^\s*(\w+)\s*(?:\([^)]*\))?\s*[:：]\s*(.+)$", ln)
+        m = re.match(r"^(\s*)(\w+)\s*(?:\([^)]*\))?\s*[:：]\s*(.+)$", ln)
         if m:
-            out[m.group(1)] = m.group(2).strip()
+            last, last_indent = m.group(2), len(m.group(1))
+            out[last] = m.group(3).strip()
+            continue
+        if last is None or not ln.strip():
+            last = None                       # 空行 = 这一条说完了
+            continue
+        if len(ln) - len(ln.lstrip()) > last_indent:
+            out[last] = f"{out[last]} {ln.strip()}".strip()
+        else:
+            last = None                       # 缩进回落 = 正文，不是上一条的续行
     return out
 
 

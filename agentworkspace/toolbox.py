@@ -65,9 +65,9 @@ def _safe(path: str, *, must_exist: bool = False) -> Path:
 # ------------------------------------------------------------------ 看
 
 def tree(max_depth: int = 3) -> dict:
-    """看一眼工作区结构：有哪些目录、插件、提示词。
+    """看工作区结构：目录、插件、提示词。
 
-    max_depth: 递归深度，默认 3
+    max_depth: 递归深度
     """
     root = _ws()
     lines: list[str] = []
@@ -96,11 +96,11 @@ MAX_READ_CHARS = 20000          # 一次读进上下文的硬顶（字符）
 
 
 def read(path: str, offset: int = 1, limit: int = 0) -> dict:
-    """读一个文件的内容（工作区内，可**分页**）。
+    """读工作区内的文件，可分页。
 
-    path: 相对工作区的路径，如 plugins/pomodoro/backend.py
-    offset: 从第几行开始（1 = 文件开头）
-    limit: 最多读多少行（0 = 尽可能多，仍受 20000 字符硬顶）
+    path: 相对工作区的路径
+    offset: 起始行（1 = 开头）
+    limit: 最多行数（0 = 尽量多，上限 2 万字符）
 
     为什么现在要分页：老版本是 ``text[:20000]`` —— 截了却不**说**，于是 agent 看见
     ``lines: 3000``、实际只拿到 800 行，却以为自己读完了整份文件，然后基于半份文件
@@ -171,15 +171,15 @@ def _skip_part(parts: tuple[str, ...]) -> bool:
 
 def search(pattern: str, path: str = ".", limit: int = 30, regex: bool = False,
            ignore_case: bool = False, glob: str = "", context: int = 0) -> dict:
-    """在工作区里按文本检索，返回「文件:行号: 内容」。
+    """检索工作区，返回「文件:行号: 内容」。
 
-    pattern: 要找的文本（regex=True 时是正则）
-    path: 检索起点（相对工作区），默认整个工作区；也可以直接给一个文件
-    limit: 最多返回多少**条命中**（硬顶 500）
-    regex: 按正则解释 pattern（默认按纯文本子串）
+    pattern: 要找的文本
+    path: 检索起点，可给目录或单个文件
+    limit: 最多几条命中（硬顶 500）
+    regex: 按正则解释 pattern
     ignore_case: 忽略大小写
-    glob: 只看文件名匹配它的，如 *.py / plugins/*/backend.py
-    context: 每条命中额外带几行上下文（0~5，grep 的 -C）
+    glob: 只看匹配的文件名，如 *.py
+    context: 每条命中带几行上下文（0~5）
 
     返回里 count 是命中条数；truncated 为真表示「到 limit 就停了，可能还有」；
     files_scanned 是实际看了多少个文件。跳过的（太大 / 二进制 / 在 data 里）
@@ -322,7 +322,7 @@ def _write_target(path: str) -> Path:
 
 
 def write(path: str, content: str) -> dict:
-    """写一个文本文件（工作区内，自动建父目录）。不要用来改插件，改插件用 plugin_write。
+    """写工作区内的文本文件（自动建目录）。改插件用 plugin_write。
 
     path: 相对工作区的路径
     content: 完整内容
@@ -392,11 +392,11 @@ def _spill_shell(text: str) -> str:
 
 
 def shell(command: str, cwd: str = "", timeout: int = SHELL_TIMEOUT) -> dict:
-    """在工作区里跑一条命令，把输出带回来。用来看测试结果、列目录、跑脚本。
+    """跑一条命令并带回输出（看测试、列目录、跑脚本）。
 
-    command: 要执行的命令（走系统 shell：Windows 是 cmd.exe）
-    cwd: 在哪个子目录里跑（相对工作区，默认工作区根；越界会被拒）
-    timeout: 最多等多少秒（1~600，默认 30）；到点会**连同子进程**一起杀掉
+    command: 要执行的命令（走系统 shell）
+    cwd: 在哪个子目录里跑（相对工作区，越界会被拒）
+    timeout: 最多等几秒（1~600），到点连同子进程一起杀
 
     返回里一定有 exit / seconds / cwd / encoding。三条约定：
         - **被我们杀掉时 exit 是 None**，另有 killed="timeout" | "output-limit"。
@@ -509,14 +509,13 @@ def shell(command: str, cwd: str = "", timeout: int = SHELL_TIMEOUT) -> dict:
 # ------------------------------------------------------------------ 造
 
 def plugin_write(pid: str, files: dict) -> dict:
-    """创建或重写一个插件的文件 —— 一次提交整个目录，四道校验后才落盘。
+    """创建或重写插件：一次提交整个目录，四道校验过后才落盘。
 
     这是「agent 写程序」的唯一入口。写成功后插件立刻生效，
     下一轮你就能调用它自己的函数了。
 
-    pid: 插件 id（小写字母开头，只能是 a-z0-9_，如 ledger）
-    files: {文件名: 内容}，只接受 plugin.json / backend.py / ui/**；
-           data/ 永远不许碰
+    pid: 插件 id（小写字母开头，只含 a-z0-9_）
+    files: {文件名: 内容}，只收 plugin.json / backend.py / ui/**（data/ 不许碰）
 
     界面有两种形态，由 plugin.json 的 "ui" 决定：
         "ui": "ui/index.html"  → 网页，活在宿主窗口里（**默认选这个**）
@@ -666,10 +665,10 @@ def _plugin_revert(pid: str, version: str, paths: list[str] | None = None, *,
 
 
 def plugin_delete(pid: str, keep_data: bool = True) -> dict:
-    """删除一个插件。默认保留 data/（用户攒下的数据）。
+    """删除插件，默认保留 data/（用户攒的数据）。
 
     pid: 插件 id
-    keep_data: 是否保留数据目录，默认保留
+    keep_data: 保留 data/ 吗
     """
     if _rt().caller() == pid:
         raise ValueError(
@@ -714,7 +713,7 @@ def plugin_delete(pid: str, keep_data: bool = True) -> dict:
 
 
 def plugin_list() -> dict:
-    """列出工作区里所有插件、它们的能力，以及装载错误。"""
+    """列出所有插件、能力、装载错误。"""
     rt = _rt()
     rows = []
     for p in rt.plugins.values():
@@ -724,7 +723,7 @@ def plugin_list() -> dict:
 
 
 def plugin_verify(pid: str) -> dict:
-    """对一个插件做静态体检（不落盘、不执行）—— 提交前先自查。
+    """静态体检插件（不落盘、不执行），提交前自查。
 
     pid: 插件 id
     """
@@ -732,14 +731,14 @@ def plugin_verify(pid: str) -> dict:
 
 
 def plugin_call(pid: str, fn: str, args: dict | None = None) -> dict:
-    """替用户操作**别的程序**：调用 pid 这个程序的 fn 能力。
+    """调用别的程序的能力：pid 这个程序的 fn。
 
     用户的程序不止一个，而只有你能操作它们 —— 「开始专注」「记一笔」「喝了杯水」
     这种话落在哪个程序上，就调哪个程序的函数。不确定有哪些能力就先 plugin_list。
 
     pid: 程序 id（如 pomodoro）
     fn: 那个程序里的函数名（如 start）
-    args: 参数对象，省略等于 {}
+    args: 参数对象，省略 = {}
     """
     rt = _rt()
     if pid == "assistant":
