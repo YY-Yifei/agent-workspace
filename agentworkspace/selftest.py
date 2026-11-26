@@ -2328,8 +2328,11 @@ def _run() -> int:
     check("D10c 求值器会 await（不 await 的话 (async()=>42)() 会序列化成 {}）",
           "await" in _pc.SERIALIZER and "async" in _pc.SERIALIZER, "")
 
-    p_ok = _pc.plugin_of(Path("workspace"), "dingtalk")
-    p_no = _pc.plugin_of(Path("workspace"), "no-such-plugin")
+    # 用 WS（这次 selftest 自己的隔离工作区）而不是 Path("workspace")：
+    # 后者按 cwd 解析，干净检出上根本没有这个目录 —— 那会让 D10d 因为
+    # 「样例程序不在」而红，跟被测的代码一点关系都没有。
+    p_ok = _pc.plugin_of(WS, "pomodoro")
+    p_no = _pc.plugin_of(WS, "no-such-plugin")
     check("D10d 有页面的程序认得出（entry 指向真文件）",
           p_ok["has_ui"] and Path(p_ok.get("index") or "").exists(), p_ok.get("why"))
     check("D10e 不存在的程序说「没有这个程序」，不说「页面有问题」",
@@ -2358,6 +2361,92 @@ def _run() -> int:
     check("D10j 子进程 env 里钉着包根（工作区里 cwd 不含包，全靠它）",
           str(Path(_pc.__file__).resolve().parent.parent) in str(_env.get("PYTHONPATH")),
           _env.get("PYTHONPATH"))
+
+    # D10 续：ocr 第45轮 15 条发现逐条配门。
+    # 每一条在旧代码上都是红的 —— 见 _tmp/p45_mut.py 的变异验证。
+    check("D10k 点错面名会进「跳过」（consle 不能变成一份空报告）",
+          _pc.unknown_areas(["consle"]) == ["consle"]
+          and _pc.unknown_areas(["load"]) == []
+          and "interactive" in _pc.KNOWN_AREAS,
+          _pc.unknown_areas(["consle"]))
+    check("D10l 命令行退出码看报告本身（全 ✗ 必须退出 1，否则流水线以为页面是好的）",
+          _pc.exit_code({"report": {"areas": [{"ok": False}]}}) == 1
+          and _pc.exit_code({"report": {"areas": [{"ok": True}]}}) == 0
+          and _pc.exit_code({"report": {"areas": []}}) == 0
+          and _pc.exit_code({"shot_error": "x"}) == 1,
+          _pc.exit_code({"report": {"areas": [{"ok": False}]}}))
+
+    _rep_out = _dt._page_report({"pid": "probe", "areas": [{"name": "a", "ok": True}],
+                                 "engine": {}, "sizes": {}, "plugin": {},
+                                 "console": [], "network": [], "pageerrors": [],
+                                 "_png": "aGk="})
+    check("D10m 报告里不带 _png（否则每份报告多出 ~270KB 的 data，界面一个字节不用）",
+          "_png" not in _rep_out["report"] and len(_rep_out.get("images") or []) == 1,
+          f"keys={sorted(_rep_out['report'])}")
+
+    _lt = Path(tempfile.mkdtemp(prefix="aw-plog-")) / "w.log"
+    _lt.write_text("BOOM: 真正的原因\n", encoding="utf-8")
+    _dt._PAGE_LOG["p45probe"] = _lt
+    _dt._PAGE["p45probe"] = {"log": _lt, "at": time.time(), "buf": b"", "sock": None}
+    _dt._page_kill("p45probe")                   # kill 会把会话从 _PAGE 里摘掉
+    check("D10n 会话收掉之后日志还读得到（先 kill 再读，本来就永远读不到）",
+          "BOOM" in _dt._page_log_tail("p45probe"),
+          _dt._page_log_tail("p45probe") or "空")
+    _dt._PAGE_LOG.pop("p45probe", None)
+    shutil.rmtree(_lt.parent, ignore_errors=True)
+
+    _s1, _s2 = _dt._page_new_sid(), _dt._page_new_sid()
+    check("D10o sid 只增不减（len+1 会把还活着的会话整条覆盖掉）",
+          _s1 != _s2 and _s2 not in _dt._PAGE
+          and "len(_PAGE)" not in _insp.getsource(_dt.page_open),
+          f"{_s1} / {_s2}")
+
+    _wk = _pc.Worker("probe", WS, 0, 0)
+    check("D10p 缓存落在工作区里（落在包目录旁边时 dev_read 打不开、装成 wheel 还会只读）",
+          _wk.cache.is_relative_to(WS) and _wk.cache.name == "probe",
+          str(_wk.cache))
+    check("D10q 透明背景不当黑色（rgba(0,0,0,0) 会把正常页面判成对比度 1.0）",
+          _pc._contrast_ratio("rgba(0, 0, 0, 0)", "rgb(0, 0, 0)") is None
+          and _pc._contrast_ratio("rgb(0,0,0)", "rgb(255,255,255)") == 21.0
+          # 这一条是防假绿的：不透明的 rgba 必须算得出 21.0。
+          # 只断言前两条的话，「解析 4 个分量时解包炸了 → except → None」
+          # 这种实现也能过 —— 而它让**所有** rgba 背景都不再被检查。
+          and _pc._contrast_ratio("rgba(0, 0, 0, 1)", "rgb(255, 255, 255)") == 21.0,
+          f'{_pc._contrast_ratio("rgba(0, 0, 0, 0)", "rgb(0, 0, 0)")} / '
+          f'{_pc._contrast_ratio("rgba(0, 0, 0, 1)", "rgb(255, 255, 255)")}')
+
+    _rt_p = kernel.Runtime(Path(tempfile.mkdtemp(prefix="aw-port-")))
+    check("D10r Runtime.port 在 __init__ 里就有（别处不用 getattr(..., 0) 去猜）",
+          "port" in vars(_rt_p) and _rt_p.port == 0, vars(_rt_p).get("port"))
+
+    _t2, _d2, _im2 = kernel.Runtime._split(
+        {"text": "a", "images": ["https://x/y.png"], "k": 1})
+    check("D10s 转不成 file part 的 images 留在 data 里（静默摘掉 = 界面永远等不到它）",
+          _t2 == "a" and _im2 == [] and _d2.get("images") == ["https://x/y.png"],
+          f"{_d2} / {_im2}")
+
+    _p45 = object.__new__(_lk.Link)              # 只借方法，不建连接
+    _p45._caller = None
+    _pp = _p45._out_parts("hi", [{"raw": b"\x89PNG", "mime": "image/png"}])
+    check("D10t 图发不出去时改成一句话（不能让整个工具结果空着、更不能让轮级失败）",
+          len(_pp) == 1 and "图没能发给你" in _pp[0].text,
+          [_p.text[:40] for _p in _pp])
+
+    import socket as _socklib      # selftest 顶部没 import socket，门里自己取
+    _a, _b = _socklib.socketpair()
+    _dt._PAGE["p45to"] = {"log": None, "at": time.time(), "buf": b"", "sock": _a}
+    try:
+        _dt._page_cmd("p45to", {"op": "info"}, timeout=0.2)
+        _to_raised = ""
+    except ValueError as exc:
+        _to_raised = str(exc)
+    check("D10u 命令超时就收掉会话（留着它，之后每条回答都错一位、而且看起来正常）",
+          "没回话" in _to_raised and "p45to" not in _dt._PAGE, _to_raised or "没抛")
+    for _s in (_a, _b):
+        try:
+            _s.close()
+        except OSError:
+            pass
 
     # E 段：事件日志必须有**上界**。
     # 旧实现只 append、从不轮转：真实工作区的 workspace/logs/events.jsonl 已经

@@ -63,7 +63,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-CACHE = ROOT / ".dev-cache"
+# 缓存**不在这里**：它必须落在工作区里，见 Worker.cache。
 OFFSCREEN = -3000                  # 屏幕外坐标：可见（能合成帧）但不挡人
 MAX_VALUE = 4000                   # eval 返回值超过这个字符就落盘
 IDLE = 300                         # 没有命令这么久就自己收尸
@@ -103,7 +103,17 @@ FRAME_JS = """(() => {
           scrollW: d.documentElement ? d.documentElement.scrollWidth : 0,
           clientW: d.documentElement ? d.documentElement.clientWidth : 0,
           scrollH: d.documentElement ? d.documentElement.scrollHeight : 0,
-          bg: d.body ? getComputedStyle(d.body).backgroundColor : null,
+          bg: d.body ? (function eff(el) {
+                 // 透明的 body（默认就是 rgba(0,0,0,0)）不等于黑色：往上找到
+                 // 第一个真的画了颜色的祖先，那才是眼睛看到的那个底。
+                 while (el) {
+                   const c = getComputedStyle(el).backgroundColor || '';
+                   if (c && c !== 'transparent'
+                       && !/^rgba\\(0,\\s*0,\\s*0,\\s*0\\)$/.test(c)) return c;
+                   el = el.parentElement;
+                 }
+                 return 'rgb(255, 255, 255)';
+               })(d.body) : null,
           fg: d.body ? getComputedStyle(d.body).color : null,
           title: d.title || ''};
 })()"""
@@ -131,6 +141,18 @@ DESKTOP_JS = """(() => {
 })()"""
 
 DEFAULT_AREAS = ("load", "console", "network", "overflow", "contrast", "narrow")
+KNOWN_AREAS = DEFAULT_AREAS + ("interactive",)
+
+
+def unknown_areas(picks) -> list[str]:
+    """点名了却**不存在**的面。
+
+    为什么要有这个函数：``check()`` 的装饰器只匹配已注册的名字，
+    所以 ``areas="consle"`` 会得到「一行不跑、一条跳过也不报」——
+    ``ok=false`` 配一份空报告，一个字的解释都没有。这与
+    「没跑的东西必须出现在跳过里」正好相反。提成纯函数，才能被门钉住。
+    """
+    return [n for n in (picks or []) if n not in KNOWN_AREAS]
 
 
 # ------------------------------------------------------------------ 小工具
@@ -274,8 +296,20 @@ class Worker:
         self._idle_at = time.time()
         self._last = ""
         self.ua = ""
+        self.gen = 0                      # 第几「代」页面：导航一次 +1
         # 插件自己的运行时数据：真页面会写它。记下来，收尾时如实说。
         self.data0 = self._data_snap()
+
+    @property
+    def cache(self) -> Path:
+        """``<工作区>/.dev-cache/<pid>/`` —— 缓存只能落在这里。
+
+        返回给 agent 的路径（eval 落盘、截图）要拿 ``dev_read`` 去打开，
+        而 ``toolbox._safe()`` 拒绝工作区外的一切；落在包目录旁边时，
+        那些路径一个都打不开。装成 wheel 之后那个目录还常常是只读的
+        —— 于是 ``eval`` 抛 PermissionError，而它不在这条路的 try 里。
+        """
+        return self.ws / ".dev-cache" / self.pid
 
     # -- 起 ---------------------------------------------------------
     def url(self) -> str:
@@ -338,6 +372,7 @@ class Worker:
         self.page.on("pageerror", lambda e: self.errors.append(str(e)))
         self.page.on("requestfailed", self._on_failed)
         self.page.on("response", self._on_response)
+        self.page.on("framenavigated", self._on_nav)
         # attach 之后 reload：加载期的事件（更容易出错的那一批）现在收得到。
         # 页面本身一个字不动 —— 代价是它加载了两次，第一次的 console 拿不到。
         self.page.reload(wait_until="load")
@@ -372,6 +407,37 @@ class Worker:
                 self.network.append(f"{r.status} {r.url}")
         except Exception:
             pass
+
+    def _on_nav(self, frame) -> None:
+        """页面重新加载 = 新的一代，旧记录不再属于「现在」。
+
+        不清空的话，「看一眼 → 改一处 → 再看一眼」这个循环永远走不完：
+        第二次 check 报的还是修复前的 console 错误，而 agent 会去改一段
+        **已经改好**的代码 —— 这比不给答案更坏。
+        """
+        try:
+            if frame is self.page or f"plugin/{self.pid}" in (frame.url or ""):
+                self._reset()
+        except Exception:
+            pass
+
+    def _reset(self) -> None:
+        self.console.clear()
+        self.errors.clear()
+        self.network.clear()
+        self.aborted.clear()
+        self.gen += 1
+
+    def reload(self) -> dict:
+        """重新加载页面并等它画好；顺带清掉上一代的记录。"""
+        if self.page is None:
+            return {"ok": False, "error": self._why_not_ready()}
+        try:
+            self.page.reload(wait_until="load")
+        except Exception as exc:
+            return {"ok": False, "error": f"重新加载没成：{type(exc).__name__}: {exc}"}
+        self._settle()
+        return {"ok": True, "gen": self.gen, "sizes": self._facts()}
 
     def _settle(self, ms: int = 900) -> None:
         """等页面把该画的画完。Iframe 的加载不一定落在主 frame 的 load 之后。"""
@@ -435,7 +501,7 @@ class Worker:
         return out
 
     def _spill(self, text: str, slug: str) -> str:
-        d = CACHE / self.pid / "spill"
+        d = self.cache / "spill"
         d.mkdir(parents=True, exist_ok=True)
         name = f"{time.strftime('%Y%m%d-%H%M%S')}-{slug}.txt"
         (d / name).write_text(text, encoding="utf-8")
@@ -445,7 +511,7 @@ class Worker:
         if self.page is None:
             return {"ok": False, "error": self._why_not_ready()}
         png = self.page.screenshot(full_page=bool(full))
-        d = CACHE / self.pid / "shots"
+        d = self.cache / "shots"
         d.mkdir(parents=True, exist_ok=True)
         path = d / f"{time.strftime('%Y%m%d-%H%M%S')}.png"
         path.write_bytes(png)
@@ -516,6 +582,12 @@ class Worker:
         picks = list(areas) if areas else list(DEFAULT_AREAS)
         rows: list[dict] = []
         skipped: list[dict] = []
+        # 名字点错了不能静默：没跑的东西必须出现在「跳过」里。
+        # 少了这一段，``dev_page_check(areas="consle")`` 会给出 ok=false +
+        # 一份空报告，一个字的解释都没有 —— 与「缺口可见」正好相反。
+        for name in unknown_areas(picks):
+            skipped.append({"name": name,
+                            "why": "没有这一面（可选：" + "/".join(KNOWN_AREAS) + "）"})
         if not self.plugin.get("has_ui"):
             skipped.append({"name": "全部页面面", "why": self.plugin.get("why") or "没有页面"})
             return {"ok": True, "pid": self.pid, "plugin": self.plugin,
@@ -612,6 +684,7 @@ class Worker:
 
         out = {"ok": True, "pid": self.pid, "plugin": self.plugin,
                "engine": {"browser": self.engine, "engine": "webview2"},
+               "gen": self.gen,
                "sizes": self._facts(), "areas": rows, "skipped": skipped,
                "console": self.console, "network": self.network,
                "aborted": self.aborted,
@@ -652,14 +725,19 @@ def _contrast_ratio(bg: str | None, fg: str | None) -> float | None:
     def lum(c: str) -> float | None:
         if not c:
             return None
-        nums = [int(float(x)) for x in c.replace("rgba(", "").replace("rgb(", "")
-                .replace(")", "").split(",")[:3]]
+        nums = [float(x) for x in c.replace("rgba(", "").replace("rgb(", "")
+                .replace(")", "").split(",")[:4]]
         if len(nums) < 3:
+            return None
+        if len(nums) >= 4 and nums[3] < 0.9:
+            # 半透明 / 全透明：底下是什么颜色，这一层不知道 —— 不猜。
+            # 把 rgba(0,0,0,0) 当黑，一个完全正常的页面会被判成对比度 1.0，
+            # 然后 agent 去「修」一段本来没问题的代码。
             return None
         def f(v: float) -> float:
             v = v / 255
             return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
-        r, g, b = (f(v) for v in nums)
+        r, g, b = (f(v) for v in nums[:3])
         return 0.2126 * r + 0.7152 * g + 0.0722 * b
     try:
         a, b = lum(bg), lum(fg)
@@ -705,22 +783,30 @@ def serve_socket(w: Worker, conn: socket.socket) -> None:
                 send({"ok": False, "error": f"请求不是 JSON：{exc}"})
                 continue
             op = req.get("op")
-            if op == "eval":
-                send(w.eval(req.get("js") or "", req.get("frame") or "page"))
-            elif op == "shot":
-                send(w.shot(bool(req.get("full"))))
-            elif op == "check":
-                send(w.check(req.get("areas"), bool(req.get("shot"))))
-            elif op == "resize":
-                send(w.resize(int(req.get("width") or NARROW)))
-            elif op == "info":
-                send({"ok": True, "engine": w.engine, "plugin": w.plugin,
-                      "sizes": w._facts(), "url": w.url()})
-            elif op == "close":
-                send({"ok": True, "closed": True, "data_changed": w._data_delta()})
-                w._closing = True
-            else:
-                send({"ok": False, "error": f"不认识的 op：{op!r}"})
+            # 一条命令炸了不能连带把窗口拆掉：异常冒出去会被 _work 里那个
+            # except 接住，然后整个会话被销毁 —— devtools 只看到「会话断了」，
+            # 真正的原因（截图抢跑、求值期间导航）全丢了，而那个会话本来还能用。
+            try:
+                if op == "eval":
+                    send(w.eval(req.get("js") or "", req.get("frame") or "page"))
+                elif op == "shot":
+                    send(w.shot(bool(req.get("full"))))
+                elif op == "check":
+                    send(w.check(req.get("areas"), bool(req.get("shot"))))
+                elif op == "resize":
+                    send(w.resize(int(req.get("width") or NARROW)))
+                elif op == "reload":
+                    send(w.reload())
+                elif op == "info":
+                    send({"ok": True, "engine": w.engine, "plugin": w.plugin,
+                          "sizes": w._facts(), "url": w.url(), "gen": w.gen})
+                elif op == "close":
+                    send({"ok": True, "closed": True, "data_changed": w._data_delta()})
+                    w._closing = True
+                else:
+                    send({"ok": False, "error": f"不认识的 op：{op!r}"})
+            except Exception as exc:                       # noqa: BLE001
+                send({"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:400]}"})
 
 
 def serve_script(w: Worker, box: dict) -> None:
@@ -743,6 +829,24 @@ def serve_script(w: Worker, box: dict) -> None:
     box["sizes"] = w._facts()
 
 
+def exit_code(box: dict) -> int:
+    """命令行模式的退出码。报告里有 ✗ 就是 1 —— 流水线只看这个数。
+
+    为什么它值得单独一个函数：不看 ``report.ok`` 的后果不是「少一条信息」，
+    而是「一页全红、退出 0」—— 调用方从 0 只能得出一个结论：页面是好的。
+    这种错在测试里读不出来，只能靠一条把判据钉住的断言。
+    """
+    if box.get("eval") and not box["eval"].get("ok"):
+        return 1
+    if box.get("shot_error"):
+        return 1
+    rep = box.get("report") or {}
+    if isinstance(rep, dict) and rep.get("areas"):
+        if not all(a.get("ok") for a in rep["areas"]):
+            return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="agentworkspace.pagecheck",
                                  description="在真窗口真引擎里看自己的页面")
@@ -758,7 +862,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--check", action="store_true", help="逐面检查并打印报告")
     ap.add_argument("--areas", default="", help="只跑这几面，逗号分隔")
     ap.add_argument("--shot", dest="shot_out", default="", help="截一张图存到这个路径")
-    ap.add_argument("--json", action="store_true", help="打印完整 JSON（默认也是 JSON）")
+    # --json 删掉了：默认输出就是 JSON，一个从不被读的参数只会让人以为它在起作用。
     ap.add_argument("--worker", action="store_true", help="常驻会话模式（给 devtools）")
     ap.add_argument("--port", type=int, default=0, help="worker 模式：命令端口")
     ap.add_argument("--no-relaunch", action="store_true", help="不要重投到交互式会话")
@@ -803,7 +907,8 @@ def main(argv: list[str] | None = None) -> int:
         if not host_port:
             # 没有现成宿主可连（宿主不是带界面启动的）：自己起一个，但仍是**真工作区**。
             # 真数据 + 新窗口 —— 不是复制品，也不跟你抢你正在看的那个窗口。
-            host, host_port = spawn_host(ws, args.pid, CACHE / args.pid / "host.log")
+            host, host_port = spawn_host(ws, args.pid,
+                                         ws / ".dev-cache" / args.pid / "host.log")
 
         w = Worker(args.pid, ws, host_port, cdp, args.viewport, args.width or None)
         w.host = host
@@ -841,9 +946,7 @@ def main(argv: list[str] | None = None) -> int:
     if listener is not None:
         return 0 if (w is not None and w._ready) else 1
     print(json.dumps(box, ensure_ascii=False, indent=2, default=str), flush=True)
-    if box.get("eval") and not box["eval"].get("ok"):
-        return 1
-    return 0 if not box.get("shot_error") else 1
+    return exit_code(box)
 
 
 def __main__(argv: list[str] | None = None) -> int:

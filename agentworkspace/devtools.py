@@ -445,9 +445,29 @@ def revert(version: str, paths: list[str] | None = None, why: str = "") -> dict:
 # 而那正是页面调试的全部内容。
 
 _PAGE: dict[str, dict] = {}        # sid → 会话
+_PAGE_SEQ = 0                      # sid 只增不减
+# 日志路径**另存一份**：会话收掉之后仍要读得到。
+# 排在 _PAGE 里的话，每一条错误路径都会先 _page_kill（第一件事就是 pop），
+# 再读日志 —— 读到的永远是空串。真正的原因被代码自己删掉了。
+_PAGE_LOG: dict[str, Path] = {}
+_PAGE_LOG_KEEP = 20
 PAGE_IDLE = 300                    # 没有命令这么久就自己收尸
 PAGE_READY = 150                   # 起窗口 + 连 CDP 的上限（秒）
 PAGE_CMD = 180                     # 单条命令的上限（截图/逐面检查会慢）
+
+
+def _page_new_sid() -> str:
+    """一个新的、**保证**没在用的 sid。
+
+    别用 ``len(_PAGE) + 1``：开着 page1、page2，关掉 page1 之后 len 又回到 1，
+    下一次就又叫 page2 —— 把那个还活着的会话整条覆盖掉，旧窗口、旧子进程、
+    旧句柄一起变成没人认领的孤儿（而新会话看起来一切正常）。
+    """
+    global _PAGE_SEQ
+    _PAGE_SEQ += 1
+    while f"page{_PAGE_SEQ}" in _PAGE:
+        _PAGE_SEQ += 1
+    return f"page{_PAGE_SEQ}"
 
 
 def _page_reap() -> None:
@@ -499,7 +519,15 @@ def _page_cmd(sid: str, req: dict, timeout: float = PAGE_CMD) -> dict:
     s["sock"].sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
     buf = s["buf"]
     while b"\n" not in buf:
-        chunk = s["sock"].recv(1 << 20)
+        try:
+            chunk = s["sock"].recv(1 << 20)
+        except socket.timeout:
+            # 超时之后这条通道就不可信了：迟到的那条回答还排在队列里，
+            # 下一条命令会先读到它 —— 从此每条结果都错一位，而每条都
+            # 「看起来正常」。宁可丢会话，也不要一个悄悄错位的通道。
+            _page_kill(sid)
+            raise ValueError(f"页面会话 {sid} 在 {timeout:.0f}s 内没回话，已收掉；"
+                             "重新 dev_page_open() 一个") from None
         if not chunk:
             raise ValueError("页面会话断了（窗口被关掉了？）")
         buf += chunk
@@ -508,8 +536,8 @@ def _page_cmd(sid: str, req: dict, timeout: float = PAGE_CMD) -> dict:
 
 
 def _page_log_tail(sid: str, n: int = 900) -> str:
-    s = _PAGE.get(sid) or {}
-    log = s.get("log")
+    """日志尾部。**会话收掉之后仍然读得到** —— 要排的正是失败那一刻。"""
+    log = _PAGE_LOG.get(sid) or (_PAGE.get(sid) or {}).get("log")
     try:
         return Path(log).read_text(encoding="utf-8", errors="replace")[-n:] if log else ""
     except Exception:
@@ -560,9 +588,12 @@ def page_open(viewport: str = "pane") -> dict:
     proc = subprocess.Popen(argv, cwd=str(root), stdout=fh, stderr=subprocess.STDOUT,
                             env=_child_env())
 
-    sid = f"page{len(_PAGE) + 1}"
+    sid = _page_new_sid()
     _PAGE[sid] = {"proc": proc, "fh": fh, "log": log, "at": time.time(),
                   "buf": b"", "sock": None, "viewport": viewport}
+    _PAGE_LOG[sid] = log
+    for old in list(_PAGE_LOG)[:-_PAGE_LOG_KEEP]:
+        _PAGE_LOG.pop(old, None)
 
     # 连上去：worker 先 bind 再干活，所以这一步很快（真正的等待在 ready 上）
     t0 = time.time()
@@ -573,13 +604,15 @@ def page_open(viewport: str = "pane") -> dict:
             break
         except Exception:
             if proc.poll() is not None:
+                tail = _page_log_tail(sid)      # 先读日志：_page_kill 会摘掉会话
                 _page_kill(sid)
-                return {"text": f"页面自查进程起不来（退出码 {proc.returncode}）：\n"
-                                f"{_page_log_tail(sid)}"}
+                return {"text": f"页面自查进程起不来（退出码 {proc.returncode}）：\n{tail}"}
             time.sleep(0.2)
     if sock is None:
+        tail = _page_log_tail(sid)
         _page_kill(sid)
-        return {"text": "60 秒内没连上页面自查进程（它可能卡在起窗口那一步）"}
+        return {"text": "60 秒内没连上页面自查进程（它可能卡在起窗口那一步）：\n"
+                        f"{tail}"}
     _PAGE[sid]["sock"] = sock
 
     # 等 ready：起宿主 + 起窗口 + 连 CDP + reload，全在这一步里
@@ -592,18 +625,21 @@ def page_open(viewport: str = "pane") -> dict:
                 break
             buf += chunk
     except socket.timeout:
+        tail = _page_log_tail(sid)
         _page_kill(sid)
-        return {"text": f"{PAGE_READY} 秒内窗口没就绪：\n{_page_log_tail(sid)}"}
+        return {"text": f"{PAGE_READY} 秒内窗口没就绪：\n{tail}"}
     if b"\n" not in buf:
+        tail = _page_log_tail(sid)
         _page_kill(sid)
-        return {"text": f"页面自查进程没回话就退了：\n{_page_log_tail(sid)}"}
+        return {"text": f"页面自查进程没回话就退了：\n{tail}"}
     line, rest = buf.split(b"\n", 1)
     _PAGE[sid]["buf"] = rest
     hello = json.loads(line.decode("utf-8"))
     if not hello.get("ok"):
         why = hello.get("error") or "窗口没起来"
+        tail = _page_log_tail(sid)
         _page_kill(sid)
-        return {"text": f"窗口没起来：{why}\n\n{_page_log_tail(sid)}"}
+        return {"text": f"窗口没起来：{why}\n\n{tail}"}
 
     plugin = hello.get("plugin") or {}
     sizes = hello.get("sizes") or {}
@@ -715,6 +751,17 @@ def page_check(sid: str = "", areas: str = "", shot: bool = False) -> dict:
     if not r.get("ok"):
         return {"text": f"检查没跑成：{r.get('error')}"}
 
+    return _page_report(r)
+
+
+def _page_report(r: dict) -> dict:
+    """pagecheck 的报告 → 给 agent 的形状（文字 + 图）。纯函数，好上门。
+
+    ``_png`` 必须在这里摘掉：它是「给 agent 那一张」的 base64 备份，
+    不是报告内容 —— 留着它每份报告都多出 ~270KB 的 data，
+    而界面收到的那坨字符串它一个字节都不会用。
+    """
+    png = r.pop("_png", "")
     eng = r.get("engine") or {}
     sizes = r.get("sizes") or {}
     plugin = r.get("plugin") or {}
@@ -748,8 +795,8 @@ def page_check(sid: str = "", areas: str = "", shot: bool = False) -> dict:
         lines.append(f"  [请求] {n}")
     out = {"text": "\n".join(lines), "report": r,
            "ok": all(a.get("ok") for a in rows) if rows else False}
-    if r.get("_png"):
-        out["images"] = [{"raw": base64.b64decode(r["_png"]), "mime": "image/png",
+    if png:
+        out["images"] = [{"raw": base64.b64decode(png), "mime": "image/png",
                           "name": f"{r.get('pid')}-page.png"}]
     return out
 

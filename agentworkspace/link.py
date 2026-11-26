@@ -509,8 +509,7 @@ class Link:
                 lambda: self.rt.dispatch(pid, fn, kwargs, source="agent", caller=self.pid))
             res = await asyncio.wrap_future(fut, loop=loop)
             return FunctionResult(status=res.status,
-                                  parts=(Part.t(res.text or ""),
-                                         *_image_parts(res.images)),
+                                  parts=self._out_parts(res.text, res.images),
                                   reason=res.reason)
         return run
 
@@ -616,6 +615,29 @@ class Link:
                 self.error = f"{type(exc).__name__}: {exc}"
                 return self.error
         return "sent"
+
+    def _out_parts(self, text: str, images) -> tuple:
+        """工具结果 → 协议 parts。**图要过和 send() 一样的两道闸。**
+
+        为什么不能直接 ``Part.image``：服务端对坏图回 ``-32602`` 是**轮级**
+        失败 —— 一张截图能把整轮连同这句话一起弄死。所以先问「这条连接收不收图」
+        （:meth:`_no_vision_reason`），再问「这张图合不合规」（``media.prepare``）。
+
+        被闸下来时把原因写进**文字**：工具结果没有「这一轮」可死，
+        但 agent 必须知道图没到它眼前 —— 否则它会对着一张自己没看见的图下判断。
+        """
+        parts: list = [Part.t(text or "")]
+        if not images:
+            return tuple(parts)
+        why = self._no_vision_reason()
+        pics: list[media.Image] = []
+        if not why:
+            pics, why = media.prepare(images, max_bytes=self._max_file_bytes())
+        if why:
+            parts[0] = Part.t(f"{text or ''}\n\n（图没能发给你：{why}）")
+        else:
+            parts.extend(Part.image(im.raw, im.mime, im.name) for im in pics)
+        return tuple(parts)
 
     def _no_vision_reason(self) -> str:
         """这条连接能不能收图；不能就返回一句人话（空串 = 能）。

@@ -211,3 +211,66 @@ ocr review -c HEAD --audience agent --format json -o .tmp/ocr-review-2.json
 2. **换强模型不代表更好用**：同一份代码用 `deepseek-v4-pro` 复扫，30 分钟超时被杀
    （`--timeout 25` 分钟的上限都没跑完），换成 flash 才跑得完。
    评审的门槛是「跑得完 + 结论可读」，不是「模型最强」。
+
+
+## 第45轮评审（0.4.7 之前）
+
+上一节之后代码动了不少，所以发版前重跑一次。这次只看**本轮改动**，不是全仓：
+
+| 项 | 值 |
+|---|---|
+| 命令 | `ocr review --from HEAD~2 --to HEAD --audience agent --format json -o .tmp/ocr-review-3.json` |
+| 范围 | 6 个 `.py` / +1524 −17（pagecheck 855 · devtools 358 · kernel · link · main · selftest） |
+| 结果 | **15 条**：high 2 / medium 10 / low 3（bug 11 / maintainability 3 / test 1） |
+| 用时 | 18m20s，5.3M tokens（cache 读 3.9M） |
+| session | `8fc733f9-21ee-4060-bbb7-d049e1363752` |
+
+**15 条全部核实为真，全部修了。** 逐条判真这件事本身就有收获 —— 其中两条是
+「代码看起来对、机制上不对」：
+
+- **high · 缓存落错地方**：`ROOT` 是包父目录，不是工作区，于是 `eval` 落盘与截图的
+  路径在 `.dev-cache/` 里、**`dev_read` 打不开**（`toolbox._safe()` 拒绝工作区外），
+  装成 wheel 之后那个目录还常常只读。改成 `Worker.cache`，落在 `<ws>/.dev-cache/<pid>/`。
+- **high · 诊断信息被自己删掉**：5 条失败路径都是「先 `_page_kill` 再 `_page_log_tail`」，
+  而 `_page_kill` 第一件事就是 `_PAGE.pop`，`_page_log_tail` 又靠 `_PAGE` 找路径 ——
+  于是**最需要日志的时刻，日志永远是空串**。修法不是调顺序（那还得靠人记得），
+  而是把路径另存 `_PAGE_LOG`：这个坑从机制上没有了。
+
+另外三条值得单独说：
+
+- **图发不出去时，必须说出来**：`_handler` 里出站图片绕过了 `send()` 的两道闸
+  （`_no_vision_reason` + `media.prepare`）。服务端对坏图回 `-32602` 是**轮级**失败 ——
+  一张截图能把整轮弄死。现在过闸，拦下来时把原因**写进文字**：工具结果没有「这一轮」
+  可死，但 agent 必须知道图没到它眼前。
+- **「改一处 → 再看一眼」原本走不通**：`console` / `errors` / `network` 只追加不重置，
+  第二次 `check` 报的还是修复前的错误，agent 会去改一段**已经改好**的代码。
+  现在 `framenavigated` 就重置（报告里带 `gen` 说明这是第几代），并加了 `reload` op。
+- **透明背景曾被当成黑色**：`rgba(0,0,0,0)` 取前三个分量就是纯黑，一个完全正常的页面
+  被判成对比度 1.0。现在在页面里往上找第一个真的画了颜色的祖先，Python 侧 alpha < 0.9
+  一律「算不出来」（不猜）。
+
+### 我自己在这次修复里制造的一个假绿
+
+改 alpha 判定时把 `nums[:3]` 改成了 `[:4]`，而解包那行是 `r, g, b = (f(v) for v in nums)`
+—— 任何 `rgba(...)` 都会 `ValueError`，被外层 `except Exception` 吃掉，返回 `None`。
+于是「对比度算不出来」对**所有 rgba 颜色**成立：contrast 面永远判绿，而且是**静默**的。
+
+发现它靠的是变异验证：把 alpha 分支删掉，门居然还是绿的 —— 一条门在两个不同的
+实现上都绿，就说明它测的不是那件事。所以 D10q 补了一条「**不透明的 rgba 必须算得出
+21.0**」：靠异常返回 `None` 的实现会在这里露馅。
+
+### 回归
+
+- `python -m agentworkspace.selftest` → **477 通过 / 0 失败**（新增 D10k–D10u 11 道）
+- 变异验证 `_tmp/p45_mut.py` → **11/11 全部抓住**（每条都在旧行为上先红）
+- 真窗口三套：`p44_real` **25/0** · `p43_gates` **20/0** · `p43_e2e` **21/0**
+
+`p43_gates` 一开始有 2 条红的，都是**脚本自己过时**，但两条都改好了才收工：
+一条变异没传 `frame`，清空动作落在插件 iframe 里（那里没有 `#appframe`），**根本没清空**；
+一条 `tree_sha` 还在要求「真工作区一个字节都没变」，而「真页面会写自己的 data」是
+第44轮起就定下的语义。红着又被解释掉的负面对照，等于没有负面对照。
+
+### 工具侧仍然只能记着
+
+`ocr` 这次报了一次 `code_search failed: git grep ... missing closing parenthesis`
+—— 它的正则没转义，有一条工具调用失败。结论条数按它实际给的 15 条记，没有替它补。

@@ -255,7 +255,7 @@ def gui(ws: Path, port: int, open_browser: bool, browser: bool = False,
         print("     → 也许已经有一个 Agent Workspace 在跑；换一个端口：--port 8778", flush=True)
         hub.stop()
         return 4
-    rt.port = int(httpd.server_address[1])   # 页面自查的 real 模式要用它
+    rt.port = int(httpd.server_address[1])   # 页面自查连现成宿主时用它
     url = f"http://127.0.0.1:{httpd.server_address[1]}/"
     if open_pid:                       # 深链接：直接打开某个程序（验收/复现用）
         url += f"#p/{open_pid}"

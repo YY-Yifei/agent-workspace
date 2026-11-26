@@ -569,6 +569,8 @@ class Runtime:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
         self.plugins_dir = self.root / "plugins"
+        self.port = 0                     # 门起来之后由 main 写；声明在这里，
+                                          # 别处就不用 getattr(..., 0) 去猜
         self.plugins: dict[str, Plugin] = {}
         self.builtins: dict[tuple[str, str], Capability] = {}   # (pid, fn) → 内核自带的能力
         self.programs: dict[str, BuiltinProgram] = {}      # 内置程序（小助理）
@@ -1282,10 +1284,26 @@ class Runtime:
             return value, {}, []
         if isinstance(value, dict):
             text = value.get("text")
-            rest = {k: v for k, v in value.items() if k not in ("text", "images")}
-            images = value.get("images") or []
-            if not isinstance(images, list):
-                images = [images]
+            rest = {k: v for k, v in value.items() if k != "text"}
+            raw = value.get("images")
+            images: list = []
+            keep: list = []
+            if raw:
+                for im in (raw if isinstance(raw, list) else [raw]):
+                    # 只有真的带字节的才叫「图」：bytes 一进 json.dumps 就炸，
+                    # 所以它必须从 data 里摘出去走 file part。其余形态（URL
+                    # 列表、路径字符串、没有 raw 的 dict）留在 data 里 ——
+                    # 摘掉它们，界面就永远等不到那个字段，而 text 还在说成功。
+                    if isinstance(im, (bytes, bytearray)):
+                        images.append(bytes(im))
+                    elif isinstance(im, dict) and im.get("raw"):
+                        images.append(im)
+                    else:
+                        keep.append(im)
+            if keep:
+                rest["images"] = keep
+            elif "images" in rest:
+                rest.pop("images", None)
             if text is None:
                 return json.dumps(rest, ensure_ascii=False, default=str), rest, images
             return str(text), rest, images
