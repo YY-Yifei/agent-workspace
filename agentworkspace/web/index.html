@@ -5,6 +5,22 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Agent Workspace</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%235aa2ff'/%3E%3Crect x='10' y='12' width='11' height='40' rx='5' fill='%23fff'/%3E%3Crect x='26' y='17' width='28' height='11' rx='5' fill='%23fff'/%3E%3Crect x='26' y='36' width='28' height='11' rx='5' fill='%23fff'/%3E%3C/svg%3E">
+<script>
+/* 首帧的主题。真源在 config.json（/api/state.settings.theme），但那是异步的：
+   等它回来再换色，浅色的人开机时会先闪一下深色。所以把**上一次解析出来的**
+   结果（只剩 dark / light 两档）存在 localStorage 当缓存，先贴上去；
+   state 一到，applyTheme() 按真源重贴一次 —— 缓存只负责「第一帧别难看」，
+   它永远不是第二份真源（换台机器、换个人改设置，以 config.json 为准）。 */
+(function () {
+  var t = null;
+  try { t = localStorage.getItem('aw-theme'); } catch (e) { /* 存不上就读系统 */ }
+  if (t !== 'dark' && t !== 'light') {
+    t = (window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches)
+      ? 'light' : 'dark';
+  }
+  document.documentElement.dataset.theme = t;
+})();
+</script>
 <style>
   :root{
     --bg:#0e1013; --panel:#14171b; --line:#22272e; --ink:#e6eaef; --dim:#8b949e;
@@ -29,13 +45,18 @@
        仍会被画成浅色。 */
     color-scheme:dark;
   }
-  @media (prefers-color-scheme:light){
-    :root{ --bg:#f6f7f9; --panel:#fff; --line:#e5e7eb; --ink:#171a1f; --dim:#6b7280;
-           --bubble:#eef0f3; --accent:#2563eb; --ok:#1f9d55; --bad:#d13b30;
-           --stop-bg:rgba(209,59,48,.08); --stop-line:rgba(209,59,48,.38);
-           --dev-on-bg:rgba(37,99,235,.24);
-           --sb-thumb:rgba(107,114,128,.8); --sb-thumb-hi:rgba(107,114,128,.95);
-           color-scheme:light; }
+  /* 浅色：**只此一处**。旧版靠 @media 跟随系统 —— 那等于「关不掉」，而设置里
+     既然有了三档，深浅就只认一个判据：<html data-theme="dark|light">。
+     谁写上去？头顶那段开机脚本负责首帧，之后由 applyTheme() 维护；CSS 自己
+     **不再看 @media** —— 两条判据并存时，「设成深色的人被系统切浅」这种事故
+     迟早会在某个边角上重演。 */
+  :root[data-theme="light"]{
+    --bg:#f6f7f9; --panel:#fff; --line:#e5e7eb; --ink:#171a1f; --dim:#6b7280;
+    --bubble:#eef0f3; --accent:#2563eb; --ok:#1f9d55; --bad:#d13b30;
+    --stop-bg:rgba(209,59,48,.08); --stop-line:rgba(209,59,48,.38);
+    --dev-on-bg:rgba(37,99,235,.24);
+    --sb-thumb:rgba(107,114,128,.8); --sb-thumb-hi:rgba(107,114,128,.95);
+    color-scheme:light;
   }
   *{box-sizing:border-box}
   /* 滚动条。系统默认那一条是画给"文档"的：17px 宽、浅灰凹槽、两头各一个
@@ -304,6 +325,16 @@
     background:var(--bg);color:var(--ink);font:inherit;cursor:pointer}
   .dlg .acts button.p{background:var(--accent);border-color:var(--accent);color:#fff}
   .dlg .acts button[disabled]{opacity:.6;cursor:default}
+  /* 外观三档：一排等宽按钮，选中那个亮着。不做下拉 —— 三档一眼看得全，下拉
+     要点两下才知道里面有几档；也不做开关 —— 开关只有两档，而「跟随系统」
+     正是默认那档，它比「深」「浅」都更常被选中。 */
+  .dlg .field{display:flex;flex-direction:column;gap:6px}
+  .dlg .field > span{font-size:12px;color:var(--dim)}
+  .seg{display:flex;gap:6px}
+  .seg button{flex:1 1 0;height:32px;border-radius:10px;border:1px solid var(--line);
+    background:var(--bg);color:var(--dim);font:inherit;font-size:13px;cursor:pointer}
+  .seg button:hover{color:var(--ink);border-color:var(--dim)}
+  .seg button.on{background:var(--bubble);border-color:var(--accent);color:var(--ink)}
   /* 版本面板：与设置面板同一套骨架（#mask/.dlg），只多一个可滚动的列表。
      列表自己滚，标题与按钮不动 —— 版本多了也不会把「关闭」推出视野。 */
   /* 会话面板复用同一套骨架（#mask/.dlg + .vrow）：它是同一类东西 ——
@@ -363,6 +394,14 @@
 <div id="mask" aria-hidden="true">
   <form class="dlg" id="setform">
     <h3>设置</h3>
+    <div class="field">
+      <span>外观</span>
+      <div class="seg" id="themeseg" role="radiogroup" aria-label="外观">
+        <button type="button" role="radio" data-theme-pref="auto">跟随系统</button>
+        <button type="button" role="radio" data-theme-pref="dark">深色</button>
+        <button type="button" role="radio" data-theme-pref="light">浅色</button>
+      </div>
+    </div>
     <label for="aaasurl">aaas-service 地址
       <input id="aaasurl" spellcheck="false" autocomplete="off"
              placeholder="ws://localhost:8888/">
@@ -411,7 +450,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"]/g,
 const S = {
   programs: [], agents: {}, native: {}, devtools: null, pid: null,
   stitle: {},        // 每个程序当前会话的标题（悬停里那句「当前会话：…」）
-  settings: { url: '' },
+  settings: { url: '', theme: 'auto' },   // theme: auto | dark | light
   vcs: { enabled: false, reason: '' },   // 版本化开关（内核没装 pure-python-git 时为 false）
   msgs: {},       // pid → [{role:'me'|'it', text, tools:[{label,status,text}]}]
   cur: {},        // pid → 当前这一轮那条消息的下标
@@ -446,7 +485,8 @@ async function loadState() {
   S.programs = st.programs || [];
   S.native = st.native || {};
   S.devtools = st.devtools || null;   // 只为工具卡写清「谁在动手」，不进左侧栏
-  S.settings = st.settings || S.settings;   // 只有一个设置项：aaas-service 地址
+  S.settings = st.settings || S.settings;   // 两项：连哪个道（url）+ 什么外观（theme）
+  applyTheme(S.settings.theme);             // 真源到了就重贴：缓存只管第一帧
   S.vcs = st.vcs || S.vcs;                  // 版本化是否可用：门只搬运，不重新发明
   for (const [pid, a] of Object.entries(st.agents || {})) {
     if ((S.tick[pid] || 0) !== (tick0[pid] || 0)) continue;   // 这份快照已经过期
@@ -493,7 +533,7 @@ function paintRail() {
              title="${esc(p.title)}">${esc(p.icon || (p.title || '?').slice(0, 1))}</button>`
   ).join('') + `<div class="grow"></div>
     <div class="sep"></div>
-    <button class="rbtn" id="setbtn" title="设置（aaas-service 地址）"
+    <button class="rbtn" id="setbtn" title="设置（外观 · aaas-service 地址）"
             aria-label="设置">⚙</button>`;
   rail.querySelectorAll('.rbtn[data-pid]').forEach((b) => {
     b.onclick = () => select(b.dataset.pid);
@@ -1702,8 +1742,55 @@ async function syncAgents() {
 }
 
 /* ------------------------------------------------------------------ 设置 */
-/* 全部设置只有一项：aaas-service 地址。它决定「这个工作区连哪个道」——
-   所以它属于整个工作区，放在左下角，不混进程序那一列。 */
+/* 设置有两项：**连哪个道**（aaas-service 地址）与**什么外观**（深/浅）。
+   两项都属于整个工作区 —— 所以放在左下角，不混进程序那一列。 */
+
+/* ------------------------------------------------------------ 外观（深/浅） */
+/* 三档：auto / dark / light。**解析只有一处**（resolveTheme）：CSS 里只认
+   <html data-theme="dark|light">，「到底画哪一档」全由这里决定 —— 见 CSS 里
+   那段注释说的「两条判据并存迟早要出事」。 */
+const THEME_KEY = 'aw-theme';
+let themeOpening = null;      // 打开面板时的那一档；非 null = 有没保存的预览
+
+function resolveTheme(pref) {
+  if (pref === 'dark' || pref === 'light') return pref;
+  return window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches
+    ? 'light' : 'dark';
+}
+
+/* 贴上去、记进缓存、把三档的选中态画对。返回值是**真正落地的**那一档
+   （auto 会被解析成 dark/light）—— 调用方需要时不用再算一遍。 */
+function applyTheme(pref) {
+  const p = (pref === 'dark' || pref === 'light') ? pref : 'auto';
+  if (S.settings) S.settings.theme = p;
+  const t = resolveTheme(p);
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem(THEME_KEY, t); } catch (e) { /* 存不上就算了，不影响画 */ }
+  paintThemeSeg();
+  return t;
+}
+
+function paintThemeSeg() {
+  const box = $('#themeseg');
+  if (!box) return;
+  const cur = (S.settings && S.settings.theme) || 'auto';
+  for (const b of box.querySelectorAll('button')) {
+    const on = b.dataset.themePref === cur;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-checked', on ? 'true' : 'false');
+  }
+}
+
+/* auto 档要**实时**跟随系统：不监听的话，人切了系统主题、页面一动不动，
+   会以为这个设置坏了。显式选了深/浅的人不该被这条事件动到。 */
+if (window.matchMedia) {
+  const mq = matchMedia('(prefers-color-scheme: light)');
+  const onSysTheme = () => {
+    if (((S.settings && S.settings.theme) || 'auto') === 'auto') applyTheme('auto');
+  };
+  if (mq.addEventListener) mq.addEventListener('change', onSysTheme);
+  else if (mq.addListener) mq.addListener(onSysTheme);   // 老引擎兜底
+}
 function setHint(text, cls) {
   const el = $('#setmsg');
   if (!el) return;
@@ -1714,18 +1801,24 @@ function setHint(text, cls) {
 function openSettings() {
   const m = $('#mask');
   if (!m) return;
+  themeOpening = (S.settings && S.settings.theme) || 'auto';   // 取消要能还原
   m.classList.add('on');
   m.setAttribute('aria-hidden', 'false');
   $('#aaasurl').value = (S.settings && S.settings.url) || '';
+  paintThemeSeg();
   setHint('');
   paintConn();
   $('#aaasurl').focus();
   $('#aaasurl').select();
 }
 
+/* 关面板 = 放弃还没保存的外观改动。外观是「点一下就变」的（不然得先保存才能
+   看一眼，那就不叫预览了），所以预览与已保存之间必须有一条退路；地址不用退 ——
+   它只在保存那一刻才生效。 */
 function closeSettings() {
   const m = $('#mask');
   if (!m) return;
+  if (themeOpening != null) { applyTheme(themeOpening); themeOpening = null; }
   m.classList.remove('on');
   m.setAttribute('aria-hidden', 'true');
 }
@@ -1736,23 +1829,33 @@ async function saveSettings(e) {
   if (e) e.preventDefault();
   const btn = $('#setsave');
   const url = $('#aaasurl').value.trim();
+  const theme = (S.settings && S.settings.theme) || 'auto';
+  const oldUrl = (S.settings && S.settings.url) || '';
   btn.disabled = true;
   setHint('保存中…');
   const r = await fetch('/api/settings', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ url }),
+    body: JSON.stringify({ url, theme }),
   }).then((x) => x.json()).catch((err) => ({ status: 'bad', error: String(err) }));
   btn.disabled = false;
   if (!r || r.status !== 'ok') { setHint((r && r.error) || '保存失败', 'bad'); return; }
-  S.settings = { url: r.url };
+  S.settings = { url: r.url, theme: r.theme || theme };
+  themeOpening = null;              // 已落盘：关面板不必再还原
+  applyTheme(S.settings.theme);
   $('#aaasurl').value = r.url;
   const n = (r.reconnected || []).length;
-  setHint(`已保存 · ${n ? `正在用新地址重连 ${n} 个程序` : '还没有程序连过，下次说话时连'}`,
-          'ok');
+  setHint(`已保存 · ${r.url !== oldUrl
+    ? (n ? `正在用新地址重连 ${n} 个程序` : '还没有程序连过，下次说话时连')
+    : '外观已记下'}`, 'ok');
   await syncAgents();
   paintConn();
 }
 
+/* 点一下就该变：外观是「看一眼才知道」的东西，不给人先存后看。 */
+$('#themeseg').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-theme-pref]');
+  if (b) applyTheme(b.dataset.themePref);
+});
 $('#setcancel').onclick = closeSettings;
 $('#setform').onsubmit = saveSettings;
 $('#mask').addEventListener('click', (e) => { if (e.target.id === 'mask') closeSettings(); });

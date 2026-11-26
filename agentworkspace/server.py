@@ -148,7 +148,12 @@ class Handler(BaseHTTPRequestHandler):
             st = rt.state()
             return self._json({**st,
                                "native": App.native.info() if App.native else {},
-                               "settings": {"url": hub.url} if hub else {},
+                               # 设置面板要的那两项：连哪个道 + 什么外观。
+                               # 主题是「这台机器上这个工作区长什么样」，
+                               # 与地址同级 —— 所以它跟着 state 一起下来。
+                               "settings": {"url": hub.url if hub else "",
+                                            "theme": settings.load_theme(
+                                                hub.root if hub else rt.root)},
                                "agents": hub.status() if hub else {},
                                "vcs": {"enabled": vcs_ok, "reason": vcs_why}})
         if path == "/api/events":
@@ -156,7 +161,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/settings":
             if hub is None:
                 return self._json({"error": "智能体池未装配"}, 503)
-            return self._json({"url": hub.url, "agents": hub.status()})
+            return self._json({"url": hub.url, "theme": settings.load_theme(hub.root),
+                               "agents": hub.status()})
 
         m = VERSIONS_RE.match(path)
         if m:
@@ -390,13 +396,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/settings":
             if hub is None:
                 return self._json({"error": "智能体池未装配"}, 503)
+            # 面板上有两项：地址与外观。两件都**先校验**再落盘 —— 一次保存
+            # 不该只成一半（主题存进去了、地址报错，人就不知道该信哪个）。
+            body = body or {}
             try:
-                url = settings.save_url(hub.root, (body or {}).get("url"))
-            except settings.BadURL as exc:      # 消息本来就是给人看的，原样回
+                theme = (settings.normalize_theme(body.get("theme"))
+                         if "theme" in body else settings.load_theme(hub.root))
+                new_url = settings.normalize(body.get("url")) if "url" in body else None
+            except (settings.BadURL, settings.BadTheme) as exc:   # 消息给人看的，原样回
                 return self._json({"status": "bad", "error": str(exc)}, 400)
-            pids = hub.rebind(settings.hub_cfg(hub.root))
-            return self._json({"status": "ok", "url": hub.url, "reconnected": pids,
-                               "agents": hub.status()})
+            settings.save_theme(hub.root, theme)
+            pids = []
+            if new_url is not None:
+                settings.save_url(hub.root, new_url)
+                if new_url != hub.url:     # 地址没变就别把每个程序都重连一遍
+                    pids = hub.rebind(settings.hub_cfg(hub.root))
+            return self._json({"status": "ok", "url": hub.url, "theme": theme,
+                               "reconnected": pids, "agents": hub.status()})
 
         if path == "/api/rescan":
             msg = rt.scan()

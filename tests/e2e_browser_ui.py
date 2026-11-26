@@ -71,7 +71,7 @@ STATE = {
     }],
     "native": {},
     "devtools": None,
-    "settings": {"url": ""},
+    "settings": {"url": "", "theme": "auto"},
     "vcs": {"enabled": False, "reason": "e2e"},
     "agents": {
         "pomodoro": {
@@ -85,6 +85,9 @@ STATE = {
         },
     },
 }
+
+POSTED: dict = {}          # 页面对 /api/settings 的**请求体**，门要查它真交了什么
+
 
 SESSIONS = {
     "pid": "pomodoro", "sid": SID, "truncated": False, "shown": 3,
@@ -127,6 +130,19 @@ def open_page(ctx, base: str):
     page.route(f"**/session/{SID}/img/*.png", lambda r: r.fulfill(
         status=200, content_type="image/png",
         body=_png(300, 200) if PIC_A in r.request.url else _png(200, 300)))
+    def on_settings(route):
+        if route.request.method != "POST":
+            return route.fulfill(status=200, content_type="application/json",
+                                 body=json.dumps({"url": "", "theme": "auto", "agents": {}}))
+        POSTED.clear()
+        POSTED.update(json.loads(route.request.post_data or "{}"))
+        return route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({"status": "ok", "url": POSTED.get("url", ""),
+                             "theme": POSTED.get("theme", "auto"),
+                             "reconnected": [], "agents": {}}))
+
+    page.route("**/api/settings", on_settings)
     page.goto(f"{base}/#p/pomodoro")
     page.wait_for_selector("#thread .msg", timeout=15000)
     page.wait_for_timeout(250)
@@ -142,6 +158,92 @@ def box(page, sel: str) -> dict | None:
       return {x:r.x, y:r.y, w:r.width, h:r.height, top:r.top, bottom:r.bottom,
               left:r.left, right:r.right};
     }""", sel)
+
+
+def bg_lum(page) -> float:
+    """页面底色有多亮（0 = 全黑，1 = 全白）。门判的是这个，不是 data-theme 属性
+    —— 属性对而调色板没换，正是「假绿」的经典形态。"""
+    return page.evaluate("""() => {
+      const m = getComputedStyle(document.body).backgroundColor.match(/[\\d.]+/g) || [];
+      const c = m.map(Number);
+      if (c.length < 3) return -1;
+      return (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]) / 255;
+    }""")
+
+
+def theme_pref(page) -> str:
+    return page.evaluate("() => (window.S && S.settings && S.settings.theme) || (document"
+                         ".querySelector('#themeseg button.on') || {}).dataset?.themePref "
+                         "|| ''")
+
+
+def gates_theme(page) -> None:
+    print("\n[F] 外观（深/浅）：在设置里，三档，点了就变，取消还原，真落盘")
+    page.click("#setbtn")
+    page.wait_for_selector("#mask.on", timeout=5000)
+    labels = page.evaluate(
+        "[...document.querySelectorAll('#themeseg button')].map(b=>b.textContent.trim())")
+    check("设置面板里有「外观」三档", labels == ["跟随系统", "深色", "浅色"], str(labels))
+    on = page.evaluate(
+        "(document.querySelector('#themeseg button.on')||{}).dataset?.themePref")
+    check("打开面板时选中的是当前那档（auto）", on == "auto", str(on))
+
+    # 系统这台机器是 dark（见 main 里的 color_scheme），所以 auto 解析成 dark
+    check("auto 档按系统解析：页面是深的", bg_lum(page) < 0.2, f"lum={bg_lum(page):.2f}")
+
+    page.click("#themeseg button[data-theme-pref='light']")
+    page.wait_for_timeout(120)
+    check("点「浅色」→ html 上是 light",
+          page.evaluate("document.documentElement.dataset.theme") == "light")
+    check("点「浅色」→ 底色真的变亮了（不是只改了个属性）",
+          bg_lum(page) > 0.7, f"lum={bg_lum(page):.2f}")
+
+    page.click("#setcancel")
+    page.wait_for_timeout(120)
+    check("取消 → 面板关掉", not page.evaluate(
+        "document.querySelector('#mask').classList.contains('on')"))
+    check("取消 → 外观还原成打开前那档（预览不是既成事实）",
+          bg_lum(page) < 0.2 and page.evaluate("document.documentElement.dataset.theme") == "dark",
+          f"lum={bg_lum(page):.2f}")
+
+    page.click("#setbtn")
+    page.wait_for_selector("#mask.on", timeout=5000)
+    page.click("#themeseg button[data-theme-pref='light']")
+    page.click("#setsave")
+    page.wait_for_timeout(250)
+    check("保存时把外观一起交给了 /api/settings", POSTED.get("theme") == "light", str(POSTED))
+    check("保存后仍然是浅色（不会被「关面板」撤回）",
+          bg_lum(page) > 0.7, f"lum={bg_lum(page):.2f}")
+    check("保存后那档记在 S 里（刷新/下一个窗口按它画）",
+          theme_pref(page) == "light", theme_pref(page))
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(120)
+    check("已保存的外观：Esc 关面板也不会被还原", bg_lum(page) > 0.7, f"lum={bg_lum(page):.2f}")
+
+    # auto 要实时跟随系统：CSS 已经不自己看 @media 了，靠的就是这条监听
+    page.click("#setbtn")
+    page.wait_for_selector("#mask.on", timeout=5000)
+    page.click("#themeseg button[data-theme-pref='auto']")
+    page.wait_for_timeout(120)
+    check("选回 auto → 按当前系统（dark）解析成深色",
+          page.evaluate("document.documentElement.dataset.theme") == "dark",
+          page.evaluate("document.documentElement.dataset.theme"))
+    page.emulate_media(color_scheme="light")
+    page.wait_for_timeout(150)
+    check("auto 档：系统变浅，页面跟着变浅（实时，不用刷新）",
+          bg_lum(page) > 0.7 and theme_pref(page) == "auto",
+          f"lum={bg_lum(page):.2f} pref={theme_pref(page)}")
+    page.click("#themeseg button[data-theme-pref='dark']")
+    page.emulate_media(color_scheme="dark")
+    page.wait_for_timeout(120)
+    page.emulate_media(color_scheme="light")
+    page.wait_for_timeout(150)
+    check("显式选了深色：系统变浅也**不动**它（这就是「设置里那一档」的意思）",
+          page.evaluate("document.documentElement.dataset.theme") == "dark"
+          and bg_lum(page) < 0.2,
+          f"lum={bg_lum(page):.2f} theme={page.evaluate('document.documentElement.dataset.theme')}")
+    page.click("#setcancel")
+    page.wait_for_timeout(100)
 
 
 def gates_bubble(page) -> None:
@@ -312,7 +414,7 @@ def gates_drag(page) -> None:
 
 def negative_controls(page) -> None:
     """把旧样式注回去 —— 这几条门必须红。不红就是没打在病上。"""
-    print("\n[F] 对照组：旧样式注回去，门必须红")
+    print("\n[G] 对照组：旧样式注回去，门必须红")
     page.add_style_tag(content=".msg.me{flex-direction:row;justify-content:flex-end}")
     page.wait_for_timeout(120)
     body = box(page, ".msg.me .body")
@@ -320,6 +422,18 @@ def negative_controls(page) -> None:
     red = bool(body and shots) and body["bottom"] > shots["top"] + 2
     check("旧横排版：正文与图并排（「图在下面」这条会红）", red,
           f"body.bottom={body['bottom']:.1f} shots.top={shots['top']:.1f}" if body and shots else "")
+
+    # 旧做法：深浅交给 @media 决定 —— 那就等于「设置里那一档管不住系统」
+    page.evaluate("() => applyTheme('dark')")
+    page.emulate_media(color_scheme="light")
+    page.wait_for_timeout(150)
+    check("对照组前置：显式深色 + 系统浅色 → 页面仍是深的",
+          bg_lum(page) < 0.2, f"lum={bg_lum(page):.2f}")
+    page.add_style_tag(
+        content="@media (prefers-color-scheme:light){:root{--bg:#f6f7f9}}")
+    page.wait_for_timeout(150)
+    check("旧 @media 写法注回去：系统一浅，显式深色就被盖掉（那条门会红）",
+          bg_lum(page) > 0.7, f"lum={bg_lum(page):.2f}")
 
     page.add_style_tag(content=".dev.on i{opacity:.4}")
     page.wait_for_timeout(120)
@@ -342,12 +456,15 @@ def main() -> int:
             httpd.shutdown()
             return 0
         print(f"真浏览器：{br.version}")
-        ctx = br.new_context(viewport={"width": 1180, "height": 760})
+        # 系统主题钉成 dark：auto 档才有一个确定的答案可断言
+        ctx = br.new_context(viewport={"width": 1180, "height": 760},
+                             color_scheme="dark")
         page = open_page(ctx, base)
         gates_bubble(page)
         gates_dev(page)
         gates_sessions(page)
         gates_drag(page)
+        gates_theme(page)
         if neg:
             negative_controls(page)
         ctx.close()

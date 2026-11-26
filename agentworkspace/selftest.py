@@ -253,6 +253,24 @@ def _run() -> int:
     check("地址：没有主机 → 报错", why_bad("ws://:8888/") is not None, str(why_bad("ws://:8888/")))
     check("地址：端口不是数字 → 报错", why_bad("ws://x:abc/") is not None, str(why_bad("ws://x:abc/")))
 
+    # 外观三档：纯函数，所以不必起服务
+    check("外观：三个词都认", [st.normalize_theme(v) for v in ("auto", "dark", "light")]
+          == ["auto", "dark", "light"])
+    check("外观：空 = auto（不填不是错）", st.normalize_theme(None) == "auto"
+          and st.normalize_theme("  ") == "auto")
+    check("外观：大小写不较真（手写的 body 不该因为 Dark 收 400）",
+          st.normalize_theme(" Dark ") == "dark")
+
+    def theme_bad(v):
+        try:
+            st.normalize_theme(v)
+            return None
+        except st.BadTheme as exc:
+            return str(exc)
+
+    check("外观：认不出的值 → 报错，且消息里带着它是谁",
+          (theme_bad("blue") or "").find("blue") >= 0, str(theme_bad("blue")))
+
     tmp = Path(tempfile.mkdtemp(prefix="ws-settings-"))
     (tmp / "config.json").write_text(json.dumps({
         "aaas": {"url": "ws://localhost:8888/", "token": None},
@@ -289,6 +307,35 @@ def _run() -> int:
               == "ws://127.0.0.1:9900/")
         check("/api/state 反映新地址",
               json.loads(get(base, "/api/state")[1])["settings"]["url"] == "ws://127.0.0.1:9900/")
+
+        # ---- 外观：与地址同一页设置、同一份 config.json ----
+        check("没设过外观 → 默认 auto（等于上一版「跟随系统」的行为）",
+              st.load_theme(tmp) == "auto", st.load_theme(tmp))
+        r = post(base, "/api/settings", {"theme": "light"})
+        check("只改外观也成（不必把地址一起交上来）",
+              r.get("status") == "ok" and r.get("theme") == "light", str(r)[:160])
+        check("外观真的落盘了（config.json 的 ui.theme）",
+              json.loads((tmp / "config.json").read_text(encoding="utf-8"))["ui"]["theme"]
+              == "light")
+        check("只改外观不会把地址改掉",
+              json.loads((tmp / "config.json").read_text(encoding="utf-8"))["aaas"]["url"]
+              == "ws://127.0.0.1:9900/", str(st.load(tmp).get("aaas")))
+        check("GET /api/settings 一并读回外观",
+              json.loads(get(base, "/api/settings")[1]).get("theme") == "light")
+        check("/api/state 里也能拿到外观（界面首帧靠它）",
+              json.loads(get(base, "/api/state")[1])["settings"].get("theme") == "light")
+        r = post(base, "/api/settings", {"url": "ws://127.0.0.1:9900/", "theme": "blue"})
+        check("认不出的外观被拒（不是 200 的假成功）",
+              r.get("status") == "bad" and "外观" in str(r.get("error")), str(r)[:160])
+        check("坏外观没有把外观写坏（还是 light）",
+              st.load_theme(tmp) == "light", st.load_theme(tmp))
+        r = post(base, "/api/settings", {"url": "ftp://x/", "theme": "dark"})
+        check("地址与外观一起交、地址坏 → 整单被拒",
+              r.get("status") == "bad", str(r)[:160])
+        check("整单被拒时外观**也没落**（一次保存不该只成一半）",
+              st.load_theme(tmp) == "light", st.load_theme(tmp))
+        st.save_theme(tmp, "auto")
+        check("auto 存得回去（取消/跟随系统不是一个死状态）", st.load_theme(tmp) == "auto")
     finally:
         server.App.hub = saved
 
@@ -946,6 +993,12 @@ def _run() -> int:
     check("thumb:hover 用 background-color（简写会重置 background-clip）",
           bool(hov) and "background-color" in hov.group(1)
           and not re.search(r"(?<!-)background\s*:", hov.group(1)), "")
+    # 这一条守的是**这次改动本身**：深浅只能有一个判据（<html data-theme>），
+    # 由设置面板决定。@media 一旦回来，就有两个判据同时说话 —— 「设成深色的人
+    # 被系统切浅」会以最难查的方式重演（CSS 静默盖掉 JS 的决定）。
+    check("深浅只有一个判据：浅色块挂在 [data-theme=light] 上，不再由 @media 决定",
+          re.search(r":root\[data-theme=\"light\"\]\s*\{", naked) is not None
+          and "prefers-color-scheme:light" not in naked.replace(" ", ""), "")
     check("深浅两套 color-scheme（缺浅色那套，浅色系统上仍画深色原生控件）",
           re.search(r"color-scheme\s*:\s*dark", naked) is not None
           and re.search(r"color-scheme\s*:\s*light", naked) is not None, "")
@@ -957,8 +1010,13 @@ def _run() -> int:
     # 锚在**语义特征**上（这一块声明了 color-scheme:dark），不是锚在"第一个 :root"。
     # 上一版锚位置，暗色块被删掉就落到浅色块（alpha .8），照样绿 —— 空转的第二次。
     # `[\d.]+`：`1`（整数）、`.62`、`0.62` 都合法，别把写法差异当失败。
-    dark_root = re.search(r":root\s*\{([^}]*color-scheme\s*:\s*dark[^}]*)\}", naked)
-    light_root = re.search(r":root\s*\{([^}]*color-scheme\s*:\s*light[^}]*)\}", naked)
+    # 选择器可能是裸 :root，也可能带一截属性（:root[data-theme="light"]）——
+    # 浅色那一套从「跟随系统」改成「由设置决定」之后就长这样了。锚的仍是
+    # color-scheme 这个**语义特征**，不是选择器写法。
+    dark_root = re.search(
+        r":root(?:\[[^\]]*\])?\s*\{([^}]*color-scheme\s*:\s*dark[^}]*)\}", naked)
+    light_root = re.search(
+        r":root(?:\[[^\]]*\])?\s*\{([^}]*color-scheme\s*:\s*light[^}]*)\}", naked)
 
     def _alpha(block: str, var: str):
         """取某个 --sb* 变量的 alpha；取不到返回 None（None 一律判失败，别当 0 放过）。"""
