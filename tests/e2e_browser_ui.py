@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import json
+import re
 import struct
 import sys
 import threading
@@ -88,6 +89,15 @@ STATE = {
 
 POSTED: dict = {}          # 页面对 /api/settings 的**请求体**，门要查它真交了什么
 
+#: [E] 停止=撤回那一节用的会话内容。``collapse`` 为真时，第一轮被撤回 ——
+#: 这正是盘上 ``{"t":"retract","turn":"t-e2e-1"}`` 投影出来的那份 rows。
+RETRACT_ROWS: dict = {"collapse": True, "rows": [
+    {"role": "user", "text": "把那个配置改一下", "turn": "t-e2e-1"},
+    {"role": "agent", "text": "好的，我先看看——", "turn": "t-e2e-1"},
+    {"role": "user", "text": "第二个问题", "turn": "t-e2e-2"},
+    {"role": "agent", "text": "第二个回答", "turn": "t-e2e-2"},
+]}
+
 
 SESSIONS = {
     "pid": "pomodoro", "sid": SID, "truncated": False, "shown": 3,
@@ -127,6 +137,20 @@ def open_page(ctx, base: str):
             status=200, content_type="application/json",
             body=json.dumps({"status": "ok", "sid": SID, "title": "番茄钟怎么用",
                              "message": f"{a} ok"})))
+    def on_session(route):
+        rows = [dict(r) for r in RETRACT_ROWS["rows"]]
+        if RETRACT_ROWS.get("collapse"):
+            for r in rows[:2]:                 # 第一轮整组被撤回
+                r["retracted"] = True
+        return route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({"pid": "pomodoro", "sid": SID, "title": "番茄钟怎么用",
+                             "active": True, "messages": rows, "total": len(rows),
+                             "shown": len(rows), "truncated": False,
+                             "turns": 0, "tokensIn": 0, "tokensOut": 0, "bad": 0}))
+
+    # 重载会话那一条：带上 ?limit=200（正则，别让 img 那些也落进来）
+    page.route(re.compile(r"/session/" + SID + r"\?limit="), on_session)
     page.route(f"**/session/{SID}/img/*.png", lambda r: r.fulfill(
         status=200, content_type="image/png",
         body=_png(300, 200) if PIC_A in r.request.url else _png(200, 300)))
@@ -441,6 +465,87 @@ def negative_controls(page) -> None:
     check("旧 opacity 版：轨道真的被削到 0.4（那条门会红）", op == "0.4", f"opacity={op}")
 
 
+def gates_retract(page) -> dict:
+    """[E] 停止 = 撤回：被撤回的那一轮塌成一枚记号。
+
+    走的是**真重载路径**（reloadThread → /session/<sid>?limit= → groupRetracted
+    → DOM），不是直接往 S.msgs 里塞数据：塞数据只能证明「画得出来」，证明不了
+    「盘上那条 retract 记录能一路走到屏幕上」。
+    """
+    print("\n[E] 停止 = 撤回：塌成一枚记号，不是正文 + 一句尾注")
+    page.evaluate("reloadThread('pomodoro', '%s')" % SID)
+    page.wait_for_selector("#thread .retract", timeout=8000)
+    page.wait_for_timeout(150)
+    st = page.evaluate("""() => {
+      const r = document.querySelectorAll('#thread .retract');
+      const cs = r.length ? getComputedStyle(r[0]) : null;
+      return {
+        n: r.length,
+        me: document.querySelectorAll('#thread .msg.me').length,
+        meText: [...document.querySelectorAll('#thread .msg.me')]
+                  .map(e => e.textContent).join(' | '),
+        q: (r[0] && r[0].querySelector('.rq') || {}).textContent || '',
+        text: document.querySelector('#thread').textContent,
+        border: cs ? cs.borderTopStyle : '',
+        dim: cs ? cs.borderTopColor : '',
+        body: document.querySelectorAll('#thread .msg.it .body:not(:empty)').length,
+        open: document.querySelectorAll('#thread .retract .rb').length,
+        btn: [...document.querySelectorAll('#thread .retract button')]
+               .map(b => b.textContent.trim()),
+      };
+    }""")
+    check("撤回的一轮变成**恰好一枚**记号", st["n"] == 1, str(st["n"]))
+    # 原话**该在记号里出现一次**（那是给人看重发用的），但不该再是一句正文气泡：
+    # 判据是「哪一类节点里有没有它」，不是「整页有没有它」。整页扫字符串的话，
+    # 这条门连正确的实现也会判红 —— 假红和假绿是同一个毛病：门没打在病上。
+    check("被撤回的那句话不再是正文气泡（只剩 1 条 .msg.me：未撤回的那一句）",
+          st["me"] == 1 and "把那个配置改一下" not in st["meText"],
+          f"me={st['me']} {st['meText']}"[:90])
+    check("原话整页只出现一次（没有同时留在正文和记号里）",
+          st["text"].count("把那个配置改一下") == 1,
+          str(st["text"].count("把那个配置改一下")))
+    check("记号上留着原话（不知道刚才问了什么，就没法重发）",
+          "把那个配置改一下" in st["q"], repr(st["q"]))
+    check("未撤回的那一轮照常在正文里（门没把工具砸到所有气泡上）",
+          "第二个回答" in st["text"], "")
+    check("记号是虚线的（视觉上「不属于对话」）", st["border"] == "dashed", st["border"])
+    check("半句回答默认收着（不占正文）", st["open"] == 0, str(st["open"]))
+    check("记号上只有两个动作：展开 / 重新发送",
+          st["btn"] == ["展开", "重新发送"], str(st["btn"]))
+
+    # 展开：那半句露出来，而且带删除线（存在过，但不算话）
+    page.click("#thread .retract .rx")
+    page.wait_for_timeout(120)
+    ex = page.evaluate("""() => {
+      const b = document.querySelector('#thread .retract .rb .body');
+      const t = document.querySelector('#thread .retract .rx');
+      return {has: !!b, line: b ? getComputedStyle(b).textDecorationLine : '',
+              txt: b ? b.textContent : '', label: t ? t.textContent.trim() : ''};
+    }""")
+    check("点「展开」露回那半句", ex["has"] and "我先看看" in ex["txt"], str(ex))
+    check("展开的那半句带删除线", "line-through" in ex["line"], ex["line"])
+    check("按钮就地变成「收起」", ex["label"] == "收起", ex["label"])
+
+    # 重新发送：只把原话填回输入框，**不替人发**
+    reqs = []
+    page.on("request", lambda r: reqs.append(r.url))
+    page.click("#thread .retract .ry")
+    page.wait_for_timeout(150)
+    box = page.evaluate("(document.querySelector('#ta')||{}).value || ''")
+    check("点「重新发送」把原话填回输入框", box == "把那个配置改一下", repr(box))
+    check("重新发送**不**自己发出去（人按发送才算一句话）",
+          not any("/send" in u for u in reqs), str(reqs[-3:]))
+
+    # 反面对照：同一份数据、只是没被撤回 —— 必须**一枚记号都没有**。
+    # 少了这一半，一个「把所有气泡都塌成记号」的实现也会让上面全绿。
+    RETRACT_ROWS["collapse"] = False
+    page.evaluate("reloadThread('pomodoro', '%s')" % SID)
+    page.wait_for_timeout(250)
+    n2 = page.evaluate("document.querySelectorAll('#thread .retract').length")
+    check("没被撤回就**一枚记号都没有**（门判的是 retract 记录，不是「有对话就塌」）",
+          n2 == 0, str(n2))
+
+
 def main() -> int:
     neg = "--negative" in sys.argv
     httpd, base = start_server()
@@ -465,6 +570,7 @@ def main() -> int:
         gates_sessions(page)
         gates_drag(page)
         gates_theme(page)
+        gates_retract(page)
         if neg:
             negative_controls(page)
         ctx.close()

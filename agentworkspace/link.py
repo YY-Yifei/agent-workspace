@@ -222,6 +222,14 @@ class Link:
         # 每次都去重读整份会话文件，会话越长越慢，而它只需要一个字符串。
         self.title: str = self.store.meta(pid, self.sid).get("title", "")
         self._clip_warned = False       # 提示词被截断，只提醒一次（别每轮刷屏）
+        #: 我们**受理过**停止的那些轮。撤回的判据要用它：服务端自己取消（超时 /
+        #: 上游关闭）不算人的意志，不该替人做「这一轮不算数」这个决定。
+        #: 跨线程读写（cancel 在 HTTP 线程、_one_turn 在循环线程）—— set 的
+        #: add/in 在 GIL 下是原子的，且**不能**在这里拿 _send_lock（见 _turn_done）。
+        self._stop_asked: set[str] = set()
+        #: 撤回时若那一轮真执行过工具，就给下一轮塞一句一次性提示（用完即弃）。
+        #: 世界没有回退，而模型看不见自己做过什么 —— 这是唯一一处会伤人的地方。
+        self._retract_note = ""
 
     # ------------------------------------------------------------------ 生命周期
     def start(self) -> str:
@@ -401,6 +409,21 @@ class Link:
             self._clip_warned = True
             self._emit("prompt.clipped", {"chars": len(raw), "limit": MAX_INSTRUCTIONS})
         return text
+
+    def _instructions_now(self) -> str:
+        """这一次真正发出去的自我认知 = 提示词 + （至多一次）撤回的后果提示。
+
+        注记**不进历史**：它不是谁说的话 —— 塞进 history 就只能塞成 user/agent，
+        两条都是假发言。用完即弃，所以它在下一轮之后就消失了。
+        """
+        ins = self.instructions()
+        note, self._retract_note = self._retract_note, ""
+        if not note:
+            return ins
+        # 给注记留位置：截断发生在尾巴上，直接拼接会把**刚加的这句**截掉 ——
+        # 那正好是「加了等于没加」，而且不报错。
+        room = max(200, MAX_INSTRUCTIONS - len(note) - 2)
+        return (ins[:room] + "\n\n" + note)[:MAX_INSTRUCTIONS]
 
     def _plugin_prompt(self) -> str:
         prog = self.rt.program(self.pid)
@@ -667,14 +690,19 @@ class Link:
         # 没有图时**原样传字符串**：这条路上一切照旧（SDK 自己包成 Message）。
         msg: str | aaas.Message = media.message(text, list(pics)) if pics else text
         try:
-            turn = await self._caller.send(msg, instructions=self.instructions(), history=base)
+            turn = await self._caller.send(msg, instructions=self._instructions_now(),
+                                           history=base)
         except Exception as exc:
             self._emit("turn.failed", {"error": f"{type(exc).__name__}: {exc}"})
             return None
         self._turn = turn
-        self._record_user(text, sys=sys, files=files)
+        # 轮号：这一轮之后可能被撤回，撤的是「这一轮」，所以必须有个名字。
+        # 老记录没有它 → 永远不可撤回（历史里的事早就定了）。
+        tid = str(getattr(turn, "turn_id", "") or "")
+        self._record_user(text, sys=sys, files=files, turn=tid)
         self._emit("turn.started", {"turnId": turn.turn_id})
         parts: list[str] = []
+        n_ok = 0                          # 这一轮**真的执行成功**的工具调用次数
         try:
             async for ev in turn:
                 kind = ev.kind
@@ -690,6 +718,11 @@ class Link:
                     self._emit("call.ready", {"name": ev.name, "args": ev.arguments,
                                               "callId": ev.call_id}, source="agent")
                 elif kind == "functionResult":
+                    # 数「真的动过手」的次数：撤回之后模型看不见这些调用，
+                    # 只有这个数能让它知道「世界可能已经不是原样了」。
+                    # 只认 ok —— error/rejected 是没造成后果的那两种。
+                    if str(getattr(ev, "status", "") or "") == "ok":
+                        n_ok += 1
                     self._emit("call.result", {"status": ev.status, "callId": ev.call_id,
                                                "text": "".join(p.text or "" for p in (ev.parts or ()))},
                                source="agent")
@@ -699,20 +732,60 @@ class Link:
             self._emit("turn.failed", {"error": f"{type(exc).__name__}: {exc}"})
         final = await turn.end()
         text_out = "".join(parts) or turn.text
-        self._record_agent(text_out)
+        self._record_agent(text_out, turn=tid)
         usage = final.usage.to_wire() if getattr(final, "usage", None) else None
         # 账单要能看见：stateless 每轮重发全史，会话长度就是成本。
         self.store.append_usage(self.pid, self.sid, usage)
         if usage:
             self._stat["tokensIn"] += int(usage.get("input") or 0)
             self._stat["tokensOut"] += int(usage.get("output") or 0)
+        retracted = self._retract_if_stopped(tid, final, n_ok)
         self._emit("turn.completed", {
             "status": final.status, "finishReason": final.finish_reason,
             "usage": usage,
             "text": text_out,
+            "turnId": tid,
+            # 这一轮算不算数，由服务端一次说清：界面不自己再判一遍
+            # （界面没有 _stop_asked，判不出来；判错的方向恰好是「把真答案撤掉」）。
+            "retracted": retracted,
             "error": (final.error.to_wire() if getattr(final, "error", None) else None),
         }, source="agent")
         return final
+
+    def _retract_if_stopped(self, tid: str, final, n_ok: int) -> bool:
+        """终态到了：若这一轮是我们受理过停止的、且真的被取消了 —— 撤回它。
+
+        **判据落在终态，不落在点击那一刻**（点击只是「请求」，见 :meth:`cancel`）。
+        于是界面不会出现「点了停止东西就没了，可它其实还在跑」：它在终态时
+        一次性地从「正文」切到「记号」，中间没有半态。
+
+        两条都要满足：
+
+        * ``status == "cancelled"`` —— 若这一轮在取消生效前已经跑完，答案是**真的**，
+          撤回它等于删掉一份真产出；而人按停止的意思是「别跑了」，不是「收回去」。
+        * ``tid ∈ _stop_asked`` —— 服务端自己取消（超时 / 上游关闭）不是人的意志。
+
+        写是谁负责的，撤回也由谁负责：只有一个写入者（这一轮的协程），
+        所以没有竞态、不需要跨线程锁，重复调用天然幂等（retract 自己判）。
+        """
+        asked = tid in self._stop_asked
+        self._stop_asked.discard(tid)          # 一轮只判一次，别让这个集合无限长
+        if not tid or not asked or getattr(final, "status", "") != "cancelled":
+            return False
+        if self.store.retract(self.pid, self.sid, tid, why="user-stop", tools=n_ok):
+            self._load(self.sid)               # 投影整份换掉（撤回是一次追加）
+            new_title = self.store.retitle_auto(self.pid, self.sid)
+            if new_title:
+                self.title = new_title
+        # 世界没有回退：那一轮里写过的文件、跑过的命令都还在，而模型看不见。
+        # 只在**真的动过手**时才提醒 —— 没执行过东西的撤回是干净的，
+        # 再补一句就是把噪音当成提醒。
+        if n_ok:
+            self._retract_note = (
+                f"[宿主] 上一轮被用户停止，已从对话历史里撤回；期间执行过 {n_ok} 次工具调用"
+                f"（调用了什么、结果是什么，都不在上文）。如果这个请求涉及同一件事，"
+                f"先查看当前状态再动手，不要假设文件还是原样。")
+        return True
 
     def cancel(self) -> dict:
         """请求取消这一轮。**只表示受理** —— 终态看事件（aaas §3.4 语义 3）。
@@ -766,6 +839,9 @@ class Link:
         # 可能已经换成下一轮了（本轮因取消结束、闸门放开、用户立刻发了下一句）——
         # 那时回执会声称「新的那一轮已受理取消」。取消的是哪一轮，必须当场记下。
         fut.add_done_callback(lambda f: self._cancel_done(f, turn_id))
+        # 只记**送出去**的那些：_cancel_done 里的失败（-32601 等）不改这个判断 ——
+        # 那时终态几乎不会是 cancelled，就算是我们也拦不住「服务端真的照做了」。
+        self._stop_asked.add(turn_id)
         return {"status": "cancelling", "message": "已请求取消"}
 
     def _cancel_done(self, fut, turn_id: str) -> None:
@@ -839,6 +915,8 @@ class Link:
         left, budget = media.HISTORY_IMAGES, media.HISTORY_BYTES
         plan: list[tuple[dict, list[dict]]] = []
         for h in reversed(self.history):          # 名额先给最近的
+            if h.get("retracted"):
+                continue                          # 撤回的那一轮：模型根本不该看见它
             keep: list[dict] = []
             for f in h.get("files") or ():
                 size = int(f.get("size") or 0)
@@ -876,21 +954,23 @@ class Link:
         return media.Image(name=str(ref.get("title") or ref.get("name") or "图"),
                            mime=str(ref.get("mime") or ""), raw=raw)
 
-    def _record_user(self, text: str, *, sys: bool = False, files=()) -> None:
+    def _record_user(self, text: str, *, sys: bool = False, files=(), turn: str = "") -> None:
         refs = list(files or ())
-        self.store.append_user(self.pid, self.sid, text, sys=sys, files=refs)
+        self.store.append_user(self.pid, self.sid, text, sys=sys, files=refs, turn=turn)
         new_title = self.store.title_once(self.pid, self.sid, text)
         if new_title:
             self.title = new_title
-        entry: dict = {"role": "user", "text": text, "ts": time.time(), "sys": sys}
+        entry: dict = {"role": "user", "text": text, "ts": time.time(), "sys": sys,
+                       "turn": str(turn or ""), "retracted": False}
         if refs:
             entry["files"] = refs
         self.history.append(entry)
         self._stat["turns"] = self._stat.get("turns", 0) + 1
 
-    def _record_agent(self, text: str) -> None:
-        self.store.append_agent(self.pid, self.sid, text)
-        self.history.append({"role": "agent", "text": text, "ts": time.time()})
+    def _record_agent(self, text: str, *, turn: str = "") -> None:
+        self.store.append_agent(self.pid, self.sid, text, turn=turn)
+        self.history.append({"role": "agent", "text": text, "ts": time.time(),
+                             "turn": str(turn or ""), "retracted": False})
 
     def _load(self, sid: str) -> None:
         """把展示镜像换成另一个会话。**整份替换**，不做增量 —— 增量一定会漏。"""

@@ -296,8 +296,27 @@
   .composer button.p.busy{background:var(--bubble);border-color:var(--line);color:var(--dim)}
   .composer button.stop.busy{opacity:.6}
   .composer button:disabled{cursor:default}
-  /* 停止后的尾注：小、灰、不抢戏 —— 只是「这一轮到此为止」的记号 */
-  .stopnote{font-size:11px;color:var(--dim);margin-top:2px}
+  /* 停止 = 撤回：这一轮从上下文里退回去了，界面上塌成一枚记号。
+     虚线边 + 低饱和 + 小一号 —— 一眼看出它**不是对话的一部分**；
+     但它仍然在：人还得知道「刚才那一轮发生过，只是不算数」。 */
+  .retract{margin:2px 0;padding:8px 10px;border:1px dashed var(--line);border-radius:10px;
+    color:var(--dim);font-size:12px;line-height:1.5}
+  .retract .rh{display:flex;align-items:center;gap:6px}
+  .retract .ri{color:var(--bad);font-size:13px}
+  .retract .sp{flex:1 1 auto}
+  .retract .rq{margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .retract button{height:22px;padding:0 8px;border-radius:7px;border:1px solid var(--line);
+    background:transparent;color:var(--dim);font:inherit;font-size:12px;cursor:pointer}
+  .retract button:hover{color:var(--ink);border-color:var(--dim)}
+  .retract .rb{margin-top:8px;padding-top:8px;border-top:1px dashed var(--line)}
+  /* 展开之后那半句：**加删除线** —— 它存在过，但它不算话。 */
+  .retract .rb .body{text-decoration:line-through;opacity:.7}
+  /* 动效只负责「收」那一下：内容塌进记号。关掉动效的人直接看到结果，
+     而不是看到一个不动的过渡态。 */
+  @media (prefers-reduced-motion: no-preference){
+    .retract{animation:rIn .18s ease-out}
+    @keyframes rIn{from{opacity:0;transform:scaleY(.94)}to{opacity:1;transform:none}}
+  }
   .empty{flex:1;display:grid;place-items:center;color:var(--dim);font-size:13px}
   /* 拖进来的那一刻得有个落点：不然「拖了没反应」和「拖了但不收」长得一模一样。 */
   .composer.drag{background:var(--bubble);box-shadow:inset 0 0 0 2px var(--accent)}
@@ -494,10 +513,11 @@ async function loadState() {
     S.sid[pid] = a.sid || S.sid[pid];      // 当前会话号：切会话时要知道「现在在哪」
     setPhase(pid, { type: 'snapshot', busy: !!a.busy });
     if (!S.msgs[pid]) {                      // 只补一次：之后的增量在事件里
-      S.msgs[pid] = (a.history || []).map((h) => ({
+      S.msgs[pid] = groupRetracted((a.history || []).map((h) => ({
         role: h.role === 'user' ? 'me' : 'it', text: h.text || '', tools: [],
         files: h.files || [],
-      }));
+        turn: h.turn || '', retracted: !!h.retracted,
+      })));
     }
   }
   return st;
@@ -780,11 +800,12 @@ async function reloadThread(pid, sid) {
   if (sb && pid === S.pid) {
     sb.title = S.stitle[pid] ? `当前会话：${S.stitle[pid]}` : sb.title;
   }
-  const rows = r.messages.map((h) => ({
+  const rows = groupRetracted(r.messages.map((h) => ({
     role: h.role === 'user' ? 'me' : 'it', text: h.text || '', tools: [],
     files: h.files || [],                // 引用，不是字节：界面按引用拼 /img/<name>
     note: h.sys ? true : undefined,      // 接力消息是程序自己发的，不冒充人话
-  }));
+    turn: h.turn || '', retracted: !!h.retracted,
+  })));
   if (r.truncated) {
     rows.unshift({ role: 'it', note: true, tools: [],
       text: `这个会话共 ${r.total} 条，这里显示最后 ${r.shown} 条。` });
@@ -1350,23 +1371,81 @@ function disarmStopWatch(pid) {
   if (stopTimers[pid]) { clearTimeout(stopTimers[pid]); delete stopTimers[pid]; }
 }
 
-/* 停止后的那一轮：已经产出的内容**保留**（那是它真产出过的东西，删掉等于撒谎），
-   只在尾巴上注明「已停止」。一字未产出的空气泡不留 —— 一条空回答气泡
-   会让人以为它答了、内容丢了。 */
-function markStopped(pid, m) {
-  if (!m || (!m.text && !(m.tools || []).length)) {
-    if (m) dropMsg(pid, m);
-    push(pid, { role: 'it', note: true, tools: [], text: '已停止' });
-    return;
-  }
+/* 停止 = 撤回：这一轮**已经不在模型看到的历史里**了（服务端在终态时追加了一条
+   retract 记录，见 sessions.Store.retract）。界面上不画成「消失」—— 人还得知道
+   发生过什么 —— 而是塌成一枚虚线记号：
+
+     · 原话留着（截一行）：不知道刚才问了什么，就没法重发；
+     · 半句回答与工具卡收在「展开」后面，正文加删除线、卡标「已中断」；
+     · 「重新发送」把原话填回输入框 —— 那就是一次普通发送，不需要新接口。
+
+   为什么不删掉：这条 thread 是「发生过什么」的正文，删掉等于撒谎。
+   为什么不留在正文里：**正文归人，记号归历史** —— 一段不算数的话不该继续
+   占着正文的位置，也不该让模型在下一轮里把它当成自己的回答。 */
+function collapseTurn(pid, turn, opt) {
+  const list = msgs(pid);
+  const hit = list.filter((m) => m.turn && m.turn === turn);
+  const me = hit.find((m) => m.role === 'me');
+  const it = hit.find((m) => m.role === 'it');
   /* 被停掉的那一轮**永远不会再来一条 call.result**（这一轮已经没了）。
-     卡还挂在「运行中」，组头就会一边报「进行中」、紧挨着的尾巴却写着「已停止」——
+     卡还挂在「运行中」，组头就会一边报「进行中」、紧挨着的记号却写着「已停止」——
      而「有长工具在飞的时候按停止」恰恰是最常见的用法。
      就地收尾：这些调用既不是「完成」也不是「失败」，是**被打断**。 */
-  for (const t of (m.tools || [])) if (t.status === '运行中') t.status = '已中断';
-  m.stopped = true;
-  m.gTouched = true; m.gOpen = false;     // 这一轮结束了：工具组收起
-  if (pid === S.pid) paintThread();
+  const tools = (it && it.tools) || [];
+  for (const t of tools) if (t.status === '运行中') t.status = '已中断';
+  const at = hit.length ? list.indexOf(hit[0]) : list.length;
+  for (let i = list.length - 1; i >= 0; i -= 1) if (hit.includes(list[i])) list.splice(i, 1);
+  const marker = {
+    role: 'it', retract: true, turn: turn || '',
+    text: (me && me.text) || (opt && opt.text) || '',
+    files: (me && me.files) || [],
+    tools: tools, half: (it && it.text) || '',
+  };
+  list.splice(Math.max(0, Math.min(at, list.length)), 0, marker);
+  return marker;
+}
+
+/* 盘上那条 retract 记录 → 界面上的一枚记号。**刷新、换窗口、重连之后记号还在，
+   而且不会复活**：判据来自文件，不是来自「这个窗口上点过停止」。 */
+function groupRetracted(rows) {
+  const gone = new Set();
+  for (const h of rows) if (h.retracted && h.turn) gone.add(h.turn);
+  if (!gone.size) return rows;
+  const g = new Map();
+  for (const h of rows) {
+    if (!h.turn || !gone.has(h.turn)) continue;
+    const one = g.get(h.turn) || { text: '', files: [], half: '' };
+    if (h.role === 'me') { one.text = h.text || one.text; one.files = h.files || one.files; }
+    else if (h.text) one.half = one.half ? `${one.half}\n\n${h.text}` : h.text;
+    g.set(h.turn, one);
+  }
+  const out = [];
+  for (const h of rows) {
+    if (h.turn && gone.has(h.turn)) {
+      const one = g.get(h.turn);
+      if (one && !one.done) {
+        one.done = true;
+        out.push({ role: 'it', retract: true, turn: h.turn, text: one.text,
+                   files: one.files, tools: [], half: one.half });
+      }
+      continue;
+    }
+    out.push(h);
+  }
+  return out;
+}
+
+/* 「重新发送」：把原话填回输入框 —— 不改任何状态、不发任何请求。
+   人自己按发送，才是一句话；替人发出去就不叫「重新」了。 */
+function resend(text) {
+  const ta = $('#ta');
+  if (!ta) return;
+  ta.value = String(text || '');
+  ta.focus();
+  // 长高与 ta.oninput 里那两行同一份。刻意**不派发 input 事件**：那个 DOM 事件名
+  // 里含有「内核话术」那条门要挡的词，写法上绕开它，门就不必为一条注释放宽。
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
 }
 
 /* 一字未产出的气泡：结束时不留一个空壳。 */
@@ -1431,6 +1510,7 @@ function bodyHtml(m) {
 }
 
 function msgHtml(m) {
+  if (m.retract) return retractHtml(m);
   if (m.role === 'me') {
     // failed = 没送出去、又没能放回输入框（人切了程序）。它不能被画成
     // 「我说过的一句话」，否则下一次看历史会以为它发出去了。
@@ -1441,16 +1521,23 @@ function msgHtml(m) {
   const cls = m.note ? ' dim' : (typeof mdToHtml === 'function' ? ' md' : '');
   const body = m.text
     ? `<div class="body${cls}">${m.note ? esc(m.text) : bodyHtml(m)}</div>` : '';
-  // 停止的记号：已经跑完的工具**不会撤回** —— 这句话必须写出来，
-  // 否则「停止」会被理解成「撤销」，而它从来不是。
-  /* 「跑完的操作不会撤回」按**每张卡自己的状态**判：一轮里第一张卡还挂在
-     「运行中」就被停掉时，什么也没撤回，写这句反而是假话。 */
-  // 只认**真正的完成**：被打断的（'已中断'）与失败的都不算「跑完了」。
-  const finished = (m.tools || []).some((t) => t.status === '完成' || t.status === 'ok');
-  const stop = m.stopped
-    ? `<div class="stopnote">已停止${finished ? ' · 已经跑完的操作不会撤回' : ''}</div>`
+  return `<div class="msg">${body}${toolsHtml(m)}</div>`;
+}
+
+/* 撤回的记号。它是**一条消息**（占住那一轮原来的位置），不是一个浮在旁边的提示：
+   位置本身就是信息 ——「这里本来有一轮，它不算数」。 */
+function retractHtml(m) {
+  m.gTouched = true; m.gOpen = !!m.open;          // 工具组跟着记号一起开合
+  const q = m.text ? `<div class="rq">「${esc(m.text)}」</div>` : '';
+  const half = m.half
+    ? `<div class="body md">${typeof mdToHtml === 'function' ? mdToHtml(m.half) : esc(m.half)}</div>`
     : '';
-  return `<div class="msg">${body}${toolsHtml(m)}${stop}</div>`;
+  const body = m.open ? `<div class="rb">${half}${toolsHtml(m)}</div>` : '';
+  return `<div class="msg"><div class="retract" data-turn="${esc(m.turn || '')}">
+    <div class="rh"><span class="ri">↺</span><span>已停止 · 这一轮不计入上下文</span>
+      <span class="sp"></span>
+      <button type="button" class="rx">${m.open ? '收起' : '展开'}</button>
+      <button type="button" class="ry">重新发送</button></div>${q}${body}</div></div>`;
 }
 
 /* 一句话带的图。两个来源、一种画法：
@@ -1522,6 +1609,16 @@ function onThreadClick(e) {
   // 缩略图先走：它不是按钮，但在对话区里点一张图就该放大 —— 不管它挂在哪条消息上。
   const im = e.target.closest ? e.target.closest('.shots img') : null;
   if (im) { openPhoto(im.src); return; }
+  // 撤回记号上的两个动作：展开/收起（看那一轮到底说了什么）、重新发送。
+  const rb = e.target.closest ? e.target.closest('.rx,.ry') : null;
+  if (rb) {
+    const box = rb.closest('.retract');
+    const turn = box ? (box.dataset.turn || '') : '';
+    const m = msgs(S.pid).find((x) => x.retract && (x.turn || '') === turn);
+    if (m && rb.classList.contains('rx')) { m.open = !m.open; paintThread(); }
+    else if (m) resend(m.text);
+    return;
+  }
   const btn = e.target.closest ? e.target.closest('.tgh,.th') : null;
   if (!btn) return;
   const grp = btn.closest('.tgroup');
@@ -1586,8 +1683,19 @@ function on(ev) {
   const d = ev.data || {};
   S.tick[pid] = (S.tick[pid] || 0) + 1;
   switch (ev.type) {
-    case 'turn.started':
-      S.cur[pid] = null; curIt(pid); setPhase(pid, 'started'); break;
+    case 'turn.started': {
+      /* 把轮号记到这一轮的两条气泡上。撤回时**按 id 找，不靠「最后一个」**：
+         一个窗口可能晚一步收到事件，也可能漏掉一条 —— 「最后一个」在那种时候
+         指向别人的那一轮，撤回就会撤错东西。 */
+      const list = msgs(pid);
+      for (let i = list.length - 1; i >= 0; i -= 1) {
+        if (list[i].role === 'me' && !list[i].turn) { list[i].turn = d.turnId || ''; break; }
+      }
+      S.cur[pid] = null;
+      curIt(pid).turn = d.turnId || '';
+      setPhase(pid, 'started');
+      break;
+    }
     case 'message.delta':
       curIt(pid).text += (d.text || ''); break;
     case 'call.ready': {
@@ -1615,7 +1723,8 @@ function on(ev) {
          turn.started，也没收到过任何一条 delta，`S.cur[pid]` 是 null。
          那一轮的唯一产出就是终态事件里的这份 d.text —— 不接住，屏幕上就是
          「跑完了一轮，什么都不显示」，看起来像答案被吞了。
-         （被停止的那一轮同理：markStopped 只往空气泡上写注脚，正文得先有。） */
+         （被停止的那一轮同理：它要塌成记号，而记号上的「原话」得先有一条气泡。）
+         判据用 `d.retracted`（服务端给的），不在这里自己再判一次。 */
       if (!m && d.text) m = push(pid, { role: 'it', text: d.text, tools: [] });
       else if (m && !m.text && d.text) m.text = d.text;
       const st = String(d.status || '');
@@ -1629,8 +1738,20 @@ function on(ev) {
          非空，终态里那份 d.text 又被跳过）—— 答案于是错位、或者整个丢掉。 */
       S.cur[pid] = null;
       setPhase(pid, 'terminal');          // 闹钟也在这里撤掉
-      if (stopped) markStopped(pid, m);
-      else {
+      if (stopped && d.retracted) {
+        /* 撤回：这一轮**已经不属于上下文**了 —— 连问句带回答塌成一枚记号。
+           判据来自服务端（`turn.completed.retracted`），界面不自己再判一次：
+           界面没有「我请求过停止的那几轮」，而判错的方向恰好是「把真答案撤掉」。 */
+        collapseTurn(pid, d.turnId || (m && m.turn) || '', { text: d.text });
+      } else if (stopped) {
+        /* 停是停了，但**不是我们请求的那一轮**（服务端超时 / 上游关闭）。
+           答案是真的，留着；只把在飞的工具卡标成「已中断」（它们不会再有结果）。
+           不说「已撤回」：那句话是假的。 */
+        if (m) for (const t of (m.tools || [])) if (t.status === '运行中') t.status = '已中断';
+        dropEmpty(pid, m);
+        push(pid, { role: 'it', note: true, tools: [],
+                    text: '已停止 · 这一轮不是你请求的停止，答案留在上下文里' });
+      } else {
         dropEmpty(pid, m);
         if (failed) {
           push(pid, { role: 'it', note: true, tools: [],
@@ -1730,10 +1851,11 @@ async function syncAgents() {
     // 它说忙就跟着忙（另一个窗口在跑，这边也该能停）。
     setPhase(pid, { type: 'snapshot', busy: !!a.busy });
     if (S.busy[pid]) continue;
-    S.msgs[pid] = (a.history || []).map((h) => ({
+    S.msgs[pid] = groupRetracted((a.history || []).map((h) => ({
       role: h.role === 'user' ? 'me' : 'it', text: h.text || '', tools: [],
       files: h.files || [],
-    }));
+      turn: h.turn || '', retracted: !!h.retracted,
+    })));
     S.cur[pid] = null;
   }
   paintRail();

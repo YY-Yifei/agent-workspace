@@ -1108,8 +1108,12 @@ def _run() -> int:
     check("终态读 status（不读就分不出「答完了」「被停止了」「失败了」）",
           "const stopped = st === 'cancelled';" in html
           and "st !== 'completed' && st !== 'cancelled'" in html, "")
-    check("停止后注明「已经跑完的操作不会撤回」（停止不是撤销）",
-          "已经跑完的操作不会撤回" in html, "")
+    # 停止 = 撤回：那一轮从模型看到的历史里退回去，界面上塌成一枚记号。
+    # 旧的那句尾注（「已经跑完的操作不会撤回」）连同正文一起消失了 —— 它不是被
+    # 「改成另一种说法」，而是被一个**不同的问题**取代：这一轮还算不算数。
+    check("停止后塌成一枚记号（不是正文 + 一句尾注）",
+          "function collapseTurn" in html and 'class="retract"' in html
+          and "stopnote" not in html and "markStopped" not in html, "")
     check("请求停止后等不到终态有兜底（否则界面永久「正在停止…」，只能重启）",
           "stopTimeout" in html and "STOP_WAIT_MS" in html, "")
     check("取消没被受理就退回去（不把「没停成」画成「停了」）",
@@ -1185,10 +1189,11 @@ def _run() -> int:
           "if (restoreDraft(pid, text)) {" in html, "")
     check("回填失败就把它留在对话里并标成没送出去（不静默丢字）",
           "mine.failed = true" in html and "m.failed ? ' failed' : ''" in html, "")
-    # 判据必须是「真的完成」，不能是「不等于运行中」：被停掉的那一轮会把残余的卡
-    # 收成「已中断」，而那不是跑完 —— 用它当判据，那句话就变成撒谎。
-    check("「跑完的操作不会撤回」只认真正的完成态（已中断/失败都不算）",
-          "t.status === '完成' || t.status === 'ok'" in html, "")
+    # 撤回的判据**只有一条**，而且不在界面里：服务端说这一轮算不算数
+    # （`turn.completed.retracted`）。界面若自己再判一遍，判错的方向恰好是
+    # 「把一份真答案撤掉」—— 它手上没有「我请求过停止的那几轮」这份名单。
+    check("撤回的判据由服务端给（界面不自己再判一遍）",
+          "stopped && d.retracted" in html and "collapseTurn(pid, d.turnId" in html, "")
     check("停掉那一轮时，残余的工具卡当场收尾（否则组头一直报「进行中」）",
           "if (t.status === '运行中') t.status = '已中断';" in html, "")
     check("停止的结果看机器码，不看中文串（改一个字不会静默走错分支）",
@@ -3121,6 +3126,242 @@ def _run() -> int:
               "")
     except Exception as exc:                          # noqa: BLE001
         check("G9 dev_host_services 从活代码反射", False, f"{type(exc).__name__}: {exc}")
+
+
+    # ---------------------------------------------------------------- [24] 停止 = 撤回
+    # 语义：人按停止 → 这一轮从**模型看到的历史**里消失；文件里的事一字不改。
+    # 五条断言验「模型看到什么」，三条护栏验「不许把关闭的东西弄坏」。
+    print("\n[24] 停止 = 撤回：上下文退到上一条消息，文件一字不改")
+    from . import sessions as _sess
+
+    class _Ev:
+        """一个事件替身。**字段要与 aaas 的真事件同形** —— 少一个（比如
+        ``functionCall.ready.arguments``），循环体就会抛 AttributeError，被
+        ``_one_turn`` 的 except 吃掉，后面的事件一条都数不到；那时门看起来
+        「跑完了」，验的却是替身而不是产品。"""
+
+        def __init__(self, kind: str, **kw) -> None:
+            self.kind = kind
+            self.text = kw.get("text", "")
+            self.name = kw.get("name", "")
+            self.arguments = kw.get("arguments", {})
+            self.call_id = kw.get("call_id", "")
+            self.status = kw.get("status", "")
+            self.parts = kw.get("parts", ())
+
+    class _Fin:
+        def __init__(self, status: str) -> None:
+            self.status = status
+            self.finish_reason = "stop" if status == "completed" else "cancelled"
+            self.usage = None
+            self.error = None
+
+    class _Turn:
+        def __init__(self, tid: str, events=(), status: str = "completed") -> None:
+            self.turn_id = tid
+            self.text = ""
+            self._events = list(events)
+            self._status = status
+            self._done = False
+
+        @property
+        def done(self) -> bool:
+            return self._done
+
+        def __aiter__(self):
+            async def _gen():
+                for ev in self._events:
+                    yield ev
+            return _gen()
+
+        async def end(self):
+            self._done = True
+            return _Fin(self._status)
+
+    class _CR40:
+        features = ("functions", "turn.cancel")
+        limits: dict = {}
+        session_id = "sess-40"
+        history_mode = "stateless"
+
+        def has(self, feature: str) -> bool:
+            return feature in self.features
+
+    class _Caller40:
+        def __init__(self) -> None:
+            self.turns: list = []
+            self.sent: list[dict] = []
+            self.cancelled: list[str] = []
+            self.connect_result = _CR40()
+
+        async def send(self, message, instructions=None, history=None):
+            self.sent.append({"message": message, "instructions": instructions,
+                              "history": list(history or [])})
+            return self.turns.pop(0)
+
+        async def cancel(self, turn_id, reason=""):
+            self.cancelled.append(turn_id)
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    class _RT40:
+        version = 0
+
+        def capabilities_of(self, pid):
+            return {}
+
+        def program(self, pid):
+            return object()
+
+        def dev_mode(self, pid):
+            return False
+
+        def publish(self, kind, **kw):
+            return None
+
+        def dispatch(self, *a, **kw):
+            raise AssertionError("这一节不执行工具")
+
+    # 每条 Link 一个**自己的工作区**：Store 里 pid 相同就会认成同一个会话，
+    # 共用一份的话，后面每一条门都会读到前面那条门的对话（门与门互相污染）。
+    roots40: list[Path] = []
+
+    def _l40() -> Link:
+        root = Path(tempfile.mkdtemp(prefix="aw-retract-"))
+        roots40.append(root)
+        l = Link(_RT40(), root, {"url": "ws://x"}, "assistant")
+        l._caller = _Caller40()
+        return l
+
+    def _run40(l: Link, turn, text: str, *, asked: bool = False):
+        """跑一轮。``asked=True`` 就是「人已经按过停止、请求受理了」。"""
+        l._caller.turns.append(turn)
+        if asked:
+            l._stop_asked.add(turn.turn_id)
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(l._one_turn(text))
+        finally:
+            loop.close()
+
+    def _texts(l: Link) -> list[str]:
+        return [str(m.text or "") for m in l._ctx()]
+
+    # ---- 门 1：零产出的撤回（最常见的那一种）
+    l1 = _l40()
+    _run40(l1, _Turn("t1", (), "cancelled"), "把那个配置改一下", asked=True)
+    check("门1 撤回门：零产出的一轮被停止 → 下一轮 _ctx 里没有那句 user，也没有空 agent",
+          _texts(l1) == [], str(_texts(l1)))
+    rows1, _b1 = l1.store.read("assistant", l1.sid)
+    # meta 不参与：标题的改名本来就是「再追一条 meta」（title_once 一条、
+    # 撤回后重取一条），它不是这一轮说过的话。
+    check("门1b 盘上仍是**完整记录**（撤回改的是投影，不是事实）",
+          [r.get("t") for r in rows1 if r.get("t") != "meta"] == ["user", "agent", "retract"],
+          str([r.get("t") for r in rows1]))
+
+    # ---- 门 2：吐了半句
+    l2 = _l40()
+    _run40(l2, _Turn("t2", (_Ev("message.delta", text="好的，我先看看——"),), "cancelled"),
+           "改一下", asked=True)
+    check("门2 半句门：吐了半句又被停止 → 那半句不进 _ctx（判据是 status，不是文本长度）",
+          not any("我先看看" in t for t in _texts(l2)), str(_texts(l2)))
+
+    # ---- 门 3：重发不出现两条同角色
+    l3 = _l40()
+    _run40(l3, _Turn("t3", (), "cancelled"), "帮我查一下", asked=True)
+    _run40(l3, _Turn("t3b", (_Ev("message.delta", text="查到了"),), "completed"), "帮我查一下")
+    check("门3 不重复门：停止后重发同一句 → 该句在 _ctx 里只出现一次（不出现两条连续 user）",
+          _texts(l3).count("帮我查一下") == 1, str(_texts(l3)))
+
+    # ---- 门 4：重载 / 重启不复活
+    st4 = _sess.Store(roots40[0])                          # 重开一个 Store = 重启
+    check("门4 重载门：新开一个 Store 重新投影 → 被撤回的那一轮仍然不在（重启不复活）",
+          not any("把那个配置改一下" in str(m.get("text") or "")
+                  for m in st4.messages("assistant", l1.sid, include_retracted=False))
+          and any(r.get("t") == "retract" for r in st4.read("assistant", l1.sid)[0]), "")
+
+    # ---- 门 5：计数与标题
+    check("门5 计数门：撤回的一轮不计入 turns", l1._stat.get("turns") == 0,
+          str(l1._stat))
+    check("门5b 标题不残留被撤回的首句（首句被撤回 → 退回默认标题）",
+          l1.title in ("", "新会话"), f"title={l1.title!r}")
+    l5 = _l40()
+    _run40(l5, _Turn("t5", (_Ev("message.delta", text="答"),), "completed"), "第一句")
+    l5.store.rename("assistant", l5.sid, "人改的名字")     # 人手动改名（auto 不该是 True）
+    _run40(l5, _Turn("t5b", (), "cancelled"), "第二句", asked=True)
+    check("门5c 人改过的标题一个字都不动（判据是 meta 里的 auto，不是字面比较）",
+          l5.title == "人改的名字", f"title={l5.title!r}")
+
+    # ---- 门 7（护栏）：跑完的一轮，按了停止也不撤回
+    l7 = _l40()
+    _run40(l7, _Turn("t7", (_Ev("message.delta", text="答案在此"),), "completed"),
+           "问一下", asked=True)
+    check("门7 不撒谎门（护栏）：已 completed 的一轮即使按过停止也不撤回 —— 没有 retract 行，答案仍在 _ctx 里",
+          not any(r.get("t") == "retract" for r in l7.store.read("assistant", l7.sid)[0])
+          and any("答案在此" in t for t in _texts(l7)), str(_texts(l7)))
+
+    # ---- 门 8（护栏）：幂等
+    _dup = l1.store.retract("assistant", l1.sid, "t1")
+    rows8 = l1.store.read("assistant", l1.sid)[0]
+    check("门8 幂等门（护栏）：同一轮重复撤回只落一条记录（连按三次停止也一样）",
+          _dup is False and sum(1 for r in rows8 if r.get("t") == "retract") == 1,
+          f"retract()={_dup}")
+
+    # ---- 门 9（护栏）：世界没回退，只提醒一次
+    l9 = _l40()
+    _run40(l9, _Turn("t9", (_Ev("functionCall.ready", name="plugin_write", call_id="c1"),
+                            _Ev("functionResult", call_id="c1", status="ok"),
+                            _Ev("functionResult", call_id="c2", status="error")),
+                     "cancelled"), "改一下文件", asked=True)
+    _run40(l9, _Turn("t9b", (_Ev("message.delta", text="好"),), "completed"), "再试一次")
+    _run40(l9, _Turn("t9c", (_Ev("message.delta", text="好"),), "completed"), "第三句")
+    ins1 = str(l9._caller.sent[1]["instructions"])
+    ins2 = str(l9._caller.sent[2]["instructions"])
+    check("门9 副作用门（护栏）：撤回的一轮真的动过手 → 下一轮 instructions 里有一句提示"
+          "（只数 ok：error 不算动过手）",
+          "上一轮被用户停止" in ins1 and "1 次工具调用" in ins1, ins1[-90:])
+    check("门9b 提示**用完即弃**（第三轮不再重复，也不进历史）",
+          "上一轮被用户停止" not in ins2
+          and not any("宿主" in t for t in _texts(l9)), ins2[-60:])
+    l9d = _l40()
+    _run40(l9d, _Turn("t9d", (), "cancelled"), "只是问了一句", asked=True)
+    _run40(l9d, _Turn("t9e", (_Ev("message.delta", text="好"),), "completed"), "再问")
+    check("门9c 没动过手的撤回**一个字都不加**（别把噪音当提醒）",
+          "上一轮被用户停止" not in str(l9d._caller.sent[1]["instructions"]), "")
+
+    # ---- 2.1：cancel 记下「我们请求过停止的是哪一轮」
+    lc = _l40()
+    lc._turn = _Turn("tc", (), "cancelled")          # 活着的一轮（done 仍是 False）
+    loop_c = asyncio.new_event_loop()
+    threading.Thread(target=loop_c.run_forever, daemon=True).start()
+    lc._loop = loop_c
+    try:
+        r = lc.cancel()
+        end_c = time.time() + 2.0
+        while time.time() < end_c and "tc" not in lc._stop_asked:
+            time.sleep(0.01)
+        check("门2.1 受理取消时记下**哪一轮**（判据要认人：服务端自己取消的不算）",
+              r.get("status") == "cancelling" and "tc" in lc._stop_asked, str(r))
+    finally:
+        loop_c.call_soon_threadsafe(loop_c.stop)
+        time.sleep(0.05)
+        lc._loop = None
+
+    # ---- 门 6：界面（静态那一半；DOM 那一半在 tests/e2e_browser_ui.py）
+    html40 = get(base, "/")[1].decode("utf-8", "replace")
+    check("门6 界面门：撤回落成 .retract 记号，且原话留着（不知道问了什么就设法重发）",
+          "function retractHtml" in html40 and "重新发送" in html40
+          and 'class="rq"' in html40, "")
+    check("门6b 重载也照样塌（按 turn 分组，三处投影同一份判据）",
+          "function groupRetracted" in html40 and html40.count("groupRetracted(") >= 4,
+          str(html40.count("groupRetracted(")))
+    check("门6c 残余的工具卡当场收成「已中断」（否则组头一直报「进行中」）",
+          "if (t.status === '运行中') t.status = '已中断';" in html40, "")
+
+    for _r in roots40:
+        shutil.rmtree(_r, ignore_errors=True)
 
     httpd.shutdown()
     if getattr(App, "native", None):

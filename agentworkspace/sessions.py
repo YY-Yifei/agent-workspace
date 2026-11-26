@@ -66,6 +66,15 @@ def _one_line(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str) + "\n"
 
 
+def _retracted_turns(rows: list[dict]) -> set[str]:
+    """哪些轮被撤回了。**唯一一条判据**，四个消费者共用（见 :meth:`Store.messages`）。
+
+    撤回是一条 ``{"t":"retract","turn":…}`` 记录，不是对旧行的修改 ——
+    append-only 是这份存储的第一条不变量（见模块 docstring 第 1 条）。
+    """
+    return {str(r.get("turn") or "") for r in rows if r.get("t") == "retract"} - {""}
+
+
 class Store:
     """一个工作区里的全部会话。**没有缓存**：每次都读盘，磁盘即状态。
 
@@ -149,25 +158,55 @@ class Store:
                 "title": image.name}
 
     def append_user(self, pid: str, sid: str, text: str, *, sys: bool = False,
-                    files: list[dict] | None = None) -> None:
+                    files: list[dict] | None = None, turn: str = "") -> None:
         """记一句「用户侧」发言。``sys=True`` 是程序自己发的接力消息，界面上要与人说的区分开。
 
         ``files`` 是随这句话一起发出去的图（引用，见 :meth:`save_image`）——
         它必须与这句话**同一条记录**：分开存就会出现「有图没有话」的半条历史。
         """
         entry: dict = {"t": "user", "text": text, "ts": _now(), "sys": bool(sys)}
+        if turn:
+            entry["turn"] = str(turn)
         if files:
             entry["files"] = list(files)
         self._append(pid, sid, entry, durable=True)
 
-    def append_agent(self, pid: str, sid: str, text: str) -> None:
-        self._append(pid, sid, {"t": "agent", "text": text, "ts": _now()}, durable=True)
+    def append_agent(self, pid: str, sid: str, text: str, *, turn: str = "") -> None:
+        entry: dict = {"t": "agent", "text": text, "ts": _now()}
+        if turn:
+            entry["turn"] = str(turn)
+        self._append(pid, sid, entry, durable=True)
 
     def append_call(self, pid: str, sid: str, name: str, args, result: str,
-                    status: str = "") -> None:
-        self._append(pid, sid, {"t": "call", "name": name, "args": args,
-                                "result": str(result or "")[:4000], "status": status,
-                                "ts": _now()})
+                    status: str = "", *, turn: str = "") -> None:
+        entry: dict = {"t": "call", "name": name, "args": args,
+                       "result": str(result or "")[:4000], "status": status,
+                       "ts": _now()}
+        if turn:
+            entry["turn"] = str(turn)
+        self._append(pid, sid, entry)
+
+    def retract(self, pid: str, sid: str, turn: str, *, why: str = "user-stop",
+                tools: int = 0) -> bool:
+        """把一轮从**模型看到的历史**里撤回。返回是否真的追加了一条。
+
+        撤回是**一次追加**，不是读-改-写：停止是并发动作（人点按钮的线程与正在
+        跑的协程是两条线），在这里改旧行就是「撤回」与「记录」抢同一个文件位置 ——
+        那正是这份存储最贵的一类故障（两份真相、半行 JSON）。
+
+        幂等：同一轮已经有 retract 记录就返回 ``False``，不追加第二条。
+        ``durable=True``：丢了它，重启后那两句会**复活**。
+        """
+        turn = str(turn or "")
+        if not turn:
+            return False
+        rows, _ = self.read(pid, sid)
+        if turn in _retracted_turns(rows):
+            return False
+        self._append(pid, sid, {"t": "retract", "turn": turn, "ts": _now(),
+                                "why": str(why or ""), "tools": int(tools or 0)},
+                     durable=True)
+        return True
 
     def append_usage(self, pid: str, sid: str, usage: dict | None) -> None:
         if not usage:
@@ -175,13 +214,21 @@ class Store:
         self._append(pid, sid, {"t": "usage", "in": usage.get("input"),
                                 "out": usage.get("output"), "ts": _now()})
 
-    def rename(self, pid: str, sid: str, title: str) -> str:
-        """改名 = 再追一条 meta。**不做读-改-写**：那会开出第二个真相。"""
+    def rename(self, pid: str, sid: str, title: str, *, auto: bool = False) -> str:
+        """改名 = 再追一条 meta。**不做读-改-写**：那会开出第二个真相。
+
+        ``auto=True`` 是程序自己取的名字（首句前 24 字）。这个标记必须写进数据：
+        撤回之后要「照新的首句重取标题」，而判据只能是「这个名字是不是我取的」——
+        靠「标题不等于默认标题」去猜，会把人改过的名字改回去。
+        """
         clean = " ".join(str(title or "").split())[:MAX_TITLE]
         if not clean:
             return ""
-        self._append(pid, sid, {"t": "meta", "sid": sid, "pid": pid,
-                                "title": clean, "retitle": _now()}, durable=True)
+        entry: dict = {"t": "meta", "sid": sid, "pid": pid,
+                       "title": clean, "retitle": _now()}
+        if auto:
+            entry["auto"] = True
+        self._append(pid, sid, entry, durable=True)
         return clean
 
     def title_once(self, pid: str, sid: str, text: str) -> str:
@@ -193,7 +240,30 @@ class Store:
         if self.meta(pid, sid).get("title") not in ("", DEFAULT_TITLE):
             return ""
         name = auto_title(text)
-        return self.rename(pid, sid, name) if name else ""
+        return self.rename(pid, sid, name, auto=True) if name else ""
+
+    def retitle_auto(self, pid: str, sid: str) -> str:
+        """标题若是**程序取的**、而它的出处被撤回了，就照新的首句重取。
+
+        返回新标题（没改则为空串）。人改过的名字一个字都不动 —— 判据是 meta 里的
+        ``auto``，不是「标题长什么样」。
+        """
+        rows, _ = self.read(pid, sid)
+        metas = [r for r in rows if r.get("t") == "meta"]
+        if not metas or not metas[-1].get("auto"):
+            return ""
+        gone = _retracted_turns(rows)
+        first = ""
+        for r in rows:
+            if r.get("t") == "user" and str(r.get("turn") or "") not in gone:
+                first = str(r.get("text") or "")
+                break
+        # 一句都不剩（唯一那一轮被撤回了）→ 退回默认标题。留着旧名字会让人
+        # 在会话列表里看见一个「这个会话里已经不存在的问题」。
+        want = auto_title(first) or DEFAULT_TITLE
+        if want == metas[-1].get("title"):
+            return ""
+        return self.rename(pid, sid, want, auto=True)
 
     def drop(self, pid: str, sid: str) -> Path | None:
         """移进 ``.trash/``，不硬删。返回落点；文件本来就不在则返回 None。"""
@@ -250,21 +320,38 @@ class Store:
         tail = next((r for r in reversed(rows) if r.get("t") == "meta"), {})
         out = {"sid": sid, "pid": pid,
                "title": tail.get("title") or head.get("title") or DEFAULT_TITLE,
+               "auto": bool(tail.get("auto")),
                "created": head.get("created") or 0.0,
                "updated": rows[-1].get("ts") if rows else 0.0}
         return out
 
-    def messages(self, pid: str, sid: str) -> list[dict]:
+    def messages(self, pid: str, sid: str, *, include_retracted: bool = True) -> list[dict]:
         """给人看的那一串：``user`` 与 ``agent``，带上 ``sys`` 标记与随行的图。
 
         ``files`` 是**引用**（``{name, mime, size}``），不是字节：界面拿它拼
         ``/api/p/<pid>/session/<sid>/img/<name>``，模型那一侧由 ``link._ctx``
         从盘上读回来。两处都从这一份引用出发，就不会有第二份真相。
+
+        每条多两个键：``turn``（属于哪一轮，老记录为空）与 ``retracted``
+        （这一轮被撤回了）。**一个判据贯穿四个消费者** —— 模型（``history``）、
+        界面（``messages``）、计数（``stats``）、连接层（``link._ctx``）——
+        不再有第二份「这条算不算被撤回」。``include_retracted=False`` 就是
+        「模型看到的那份」：撤回的那一轮整组消失。
         """
         rows, _ = self.read(pid, sid)
-        return [{"role": r["t"], "text": r.get("text", ""), "ts": r.get("ts"),
-                 "sys": bool(r.get("sys")), "files": list(r.get("files") or [])}
-                for r in rows if r.get("t") in CONTEXT_ROLES]
+        gone = _retracted_turns(rows)
+        out: list[dict] = []
+        for r in rows:
+            if r.get("t") not in CONTEXT_ROLES:
+                continue
+            turn = str(r.get("turn") or "")
+            hit = bool(turn) and turn in gone
+            if hit and not include_retracted:
+                continue
+            out.append({"role": r["t"], "text": r.get("text", ""), "ts": r.get("ts"),
+                        "sys": bool(r.get("sys")), "files": list(r.get("files") or []),
+                        "turn": turn, "retracted": hit})
+        return out
 
     def history(self, pid: str, sid: str) -> list[aaas.Message]:
         """投影成**模型实际会看到的那份**。只有 user/agent + 纯文本。
@@ -277,7 +364,7 @@ class Store:
         只是一个没有信息的空行。
         """
         out: list[aaas.Message] = []
-        for m in self.messages(pid, sid):
+        for m in self.messages(pid, sid, include_retracted=False):
             text = str(m.get("text") or "")
             if not text.strip():
                 continue
@@ -289,7 +376,11 @@ class Store:
         """轮数 / 累计 token。stateless 是**每轮重发全史**，会话长度就是账单 ——
         这个数得让人看得见。"""
         rows, bad = self.read(pid, sid)
-        turns = sum(1 for r in rows if r.get("t") == "user")
+        gone = _retracted_turns(rows)
+        # 被撤回的那一轮不算「说过一轮」：它从上下文里退回去了，计数跟着退。
+        # token 不撤 —— 撤回的是上下文，不是账单（真的花了）。
+        turns = sum(1 for r in rows if r.get("t") == "user"
+                    and str(r.get("turn") or "") not in gone)
         tin = tout = 0
         for r in rows:
             if r.get("t") == "usage":
