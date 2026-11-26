@@ -240,9 +240,25 @@ ctx.set("end_at", t);  ctx.get("done_count", 0)
 
 ## 8. 组合：插件调插件
 
-插件要复用别人的能力时，走同一个入口：`ctx.call("notes_search", {...})` → `dispatch()`。
+插件要复用别人的能力时，走同一个入口：`ctx.call("notes", "search", {...})` → `dispatch()`。
 于是权限、校验、事件、循环依赖检测全都自动继承，不需要第二套机制。
-（v1 只允许**单向**调用，A→B 时 B 不能回头调 A；检测到环直接 `rejected`。）
+
+三个面同一个名字（网页 `aw.call`、原生 `Native().call` 都是这个形状）：
+
+```python
+ctx.call("list")                      # 调自己的一个能力
+ctx.call("notes", "search", {"q": 1}) # 调别人的：pid + 函数名 + 参数
+```
+
+**为什么是 pid + 函数名，而不是 wire 名**（旧文档写的是 `ctx.call("notes_search", …)`）：
+wire 名是「名字拼起来」的结果，拆回去在有下划线的 pid 上根本不唯一
+（`a_b_c` 既可能是 `a_b`+`c`，也可能是 `a`+`b_c`，`dispatch` 里那段回核对就是
+为这件事写的）。网页那一面没法靠谱地拆，于是只能接受 pid + 函数名 ——
+那就让三面都只认这一种，别让一个面会、另一个面不会。
+
+环检测在 `dispatch` 里（不是 `ctx.call` 里）：A→B→A 时栈里还压着 A，直接
+`rejected` 并说出是哪一圈。放在门口的理由是 agent 的 `plugin_call` 走的是
+同一条路，同一件事只该有一份判据。
 
 ---
 

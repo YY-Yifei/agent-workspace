@@ -819,16 +819,74 @@ def _verify(pid: str) -> dict:
 
 
 _PROBE = r"""
-import importlib.util, sys, types
-class Ctx:
-    def __init__(self): self.d = {}
-    def get(self, k, default=None): return self.d.get(k, default)
-    def set(self, k, v): self.d[k] = v
-    def emit(self, *a, **k): pass
-spec = importlib.util.spec_from_file_location("probe", sys.argv[1])
+import importlib.util, pathlib, queue, shutil, sys, tempfile, threading
+
+sys.path.insert(0, sys.argv[2])                      # 宿主包根，由 toolbox 自己算
+from agentworkspace.kernel import Context, Plugin    # **真的那一份**，不是手抄的桩
+
+
+# 探针里的假 Runtime：只够 Context 活着。**为什么不再手写一个 class Ctx**：
+# 那是契约的第二份。它与 Context 的方法集合曾经恰好相等，纯属巧合 —— 加一个
+# ctx.call 时只改一边，校验就放行一个不存在的能力，然后在用户点按钮那一刻炸。
+# 用真的 Context，第二份就不存在。
+class _RT:
+    def __init__(self, plugins_dir):
+        self.plugins_dir = pathlib.Path(plugins_dir)
+        self._lock = threading.Lock()
+        self._store_locks = {}
+        self._subs = []
+        self._theme_pref = "auto"
+        self._theme_now = "dark"
+
+    def publish(self, *a, **k):
+        pass
+
+    def subscribe(self):
+        q = queue.Queue()
+        self._subs.append(q)
+        return q
+
+    def unsubscribe(self, q):
+        if q in self._subs:
+            self._subs.remove(q)
+
+    def plugin_subscribe(self, pid, cb, kinds=None):
+        return lambda: None
+
+    def state(self):
+        return {}
+
+    def dispatch(self, pid, fn, args=None, source="plugin", caller=None):
+        class _R:
+            def as_dict(self):
+                return {"status": "rejected", "text": "探针里不执行能力", "data": {}}
+        return _R()
+
+    def theme_now(self):
+        return self._theme_now
+
+    def theme_pref(self):
+        return self._theme_pref
+
+
+backend = pathlib.Path(sys.argv[1])
+# plugins_dir = 插件目录的上一级：ctx.dir 因此是**真的**那个目录。
+ctx = Context(_RT(backend.parent.parent), Plugin(backend.parent))
+spec = importlib.util.spec_from_file_location("probe", backend)
 mod = importlib.util.module_from_spec(spec)
-mod.__dict__["ctx"] = Ctx()
+mod.__dict__["ctx"] = ctx
 spec.loader.exec_module(mod)
+
+# 第四道校验顺带升级：不只是「import 不炸」，而是**状态读写真的通**。
+# 用临时目录，绝不碰用户那份 store.json。
+tmp = pathlib.Path(tempfile.mkdtemp(prefix="aw-probe-"))
+try:
+    probe = Context(_RT(tmp), Plugin(tmp / "probe"))
+    probe.set("k", 1)
+    assert probe.get("k") == 1, "ctx.set / ctx.get 没通"
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+
 names = [n for n, o in vars(mod).items()
          if not n.startswith("_") and callable(o)
          and getattr(o, "__module__", None) == "probe"]
@@ -838,13 +896,16 @@ print("FUNCS:" + ",".join(sorted(names)))
 
 def _import_probe(pdir: Path) -> list[str]:
     """在**子进程**里真正 import 一次：死了也不影响内核。"""
+    host = Path(__file__).resolve().parent.parent        # 宿主包根
     try:
-        proc = subprocess.run([sys.executable, "-c", _PROBE, str(pdir / "backend.py")],
+        proc = subprocess.run([sys.executable, "-c", _PROBE, str(pdir / "backend.py"),
+                               str(host)],
                               capture_output=True, text=True, encoding="utf-8",
                               errors="replace", timeout=20, cwd=str(pdir))
     except subprocess.TimeoutExpired:
         return ["backend.py 顶层执行超过 20 秒（import 时不要做重活）"]
     if proc.returncode != 0:
         tail = (proc.stderr or "").strip().splitlines()
-        return [f"backend.py 一 import 就失败：{tail[-1] if tail else '未知错误'}"]
+        return [f"backend.py 探针失败（一 import 就炸，或 ctx.set/get 没通）："
+                f"{tail[-1] if tail else '未知错误'}"]
     return []

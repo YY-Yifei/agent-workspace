@@ -38,6 +38,11 @@ PLUGIN_RE = re.compile(r"^/plugin/(?P<pid>[a-z][a-z0-9_]*)(?P<rest>/.*)?$")
 # 版本历史：人这一侧的「看一眼 / 退回去」。两个都只作用于 plugins/<pid>，
 # 与 static 路由一样按 pid 分段匹配 —— 不拼路径，就不会有越界。
 VERSIONS_RE = re.compile(r"^/api/p/(?P<pid>[a-z][a-z0-9_]*)/versions$")
+# 宿主对象的另外两条腿：状态（与后端 ctx.get/set 同一份 store.json）与「喊一声」。
+# 它们**不是**新的执行入口 —— 没有 handler、不 import 插件，只碰这一个 pid 的
+# 自己的数据；所以它们不必经过 dispatch，也不该被当成能力声明给模型。
+STORE_RE = re.compile(r"^/api/p/(?P<pid>[a-z][a-z0-9_]*)/store$")
+EMIT_RE = re.compile(r"^/api/p/(?P<pid>[a-z][a-z0-9_]*)/emit$")
 # 会话：列表 / 单个 / 四个动作。sid 的形状在这里就钉死（s_ + 8 位 hex）——
 # 它同时是路径分量，形状收紧了，越界就不必再靠 resolve 兜。
 SESSIONS_RE = re.compile(r"^/api/p/(?P<pid>[a-z][a-z0-9_]*)/sessions$")
@@ -139,6 +144,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "forbidden"}, 403)
             return self._file(target)
 
+        if path == "/aw.js":
+            # 宿主服务脚本。**三个占位现场替换**：pid 留空（页面自己按地址认），
+            # 外观填当前解析后的值 —— 插件页面因此拿到的就是宿主的答案，
+            # 不必再问一次系统、也不会出现「一个身体两种颜色」。
+            js = (App.web / "aw.js").read_text(encoding="utf-8")
+            js = (js.replace("__AW_PID__", "")
+                    .replace("__AW_THEME__", rt.theme_now())
+                    .replace("__AW_PREF__", rt.theme_pref()))
+            return self._send(200, js.encode("utf-8"),
+                              "application/javascript; charset=utf-8")
+
+        if path == "/api/theme":
+            # 给原生窗口与插件页面用的一问一答（网页那两个值就在 /aw.js 里）。
+            return self._json({"pref": rt.theme_pref(), "resolved": rt.theme_now()})
+
         if path == "/api/state":
             # 门只做搬运，**不重新发明** state 的形状：内核多一个字段（比如 devtools），
             # 界面就该收到它。这里曾经逐项挑着搬，于是新增字段静默消失。
@@ -163,6 +183,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "智能体池未装配"}, 503)
             return self._json({"url": hub.url, "theme": settings.load_theme(hub.root),
                                "agents": hub.status()})
+
+        m = STORE_RE.match(path)
+        if m:
+            pid = m.group("pid")
+            plugin = rt.plugins.get(pid)
+            if plugin is None:
+                return self._json({"error": f"没有程序 {pid}"}, 404)
+            q = parse_qs(urlsplit(self.path).query)
+            key = (q.get("key") or [""])[0]
+            if not key:
+                return self._json({"error": "缺 key"}, 400)
+            from .kernel import Context
+
+            return self._json({"key": key, "value": Context(rt, plugin).get(key)})
 
         m = VERSIONS_RE.match(path)
         if m:
@@ -303,6 +337,47 @@ class Handler(BaseHTTPRequestHandler):
                               source="human")
             return self._json(res.as_dict())
 
+        # 网页与原生程序共用的两条：写自己的 store、往事件流里喊一声。
+        # 与 CALL_RE 一样只认「这是一个已存在的程序」，越界的事它做不了：
+        # 路径里的 pid 就是它能碰的唯一一份数据。
+        m = STORE_RE.match(path)
+        if m:
+            pid = m.group("pid")
+            plugin = rt.plugins.get(pid)
+            if plugin is None:
+                return self._json({"error": f"没有程序 {pid}"}, 404)
+            body = body if isinstance(body, dict) else {}
+            if "key" not in body:
+                return self._json({"error": "缺 key"}, 400)
+            from .kernel import Context
+
+            Context(rt, plugin).set(str(body["key"]), body.get("value"))
+            return self._json({"ok": True, "key": str(body["key"])})
+
+        m = EMIT_RE.match(path)
+        if m:
+            pid = m.group("pid")
+            plugin = rt.plugins.get(pid)
+            if plugin is None:
+                return self._json({"error": f"没有程序 {pid}"}, 404)
+            body = body if isinstance(body, dict) else {}
+            from .kernel import Context
+
+            kind = str(body.get("kind") or "").strip()
+            if not kind:
+                return self._json({"error": "缺 kind"}, 400)
+            Context(rt, plugin).emit(kind, body.get("data") or {})
+            return self._json({"ok": True, "kind": kind})
+
+        # 宿主页面把「auto 解析成了什么」报回来。**只有页面知道系统深浅**
+        # （matchMedia 是页面的能力），所以这条路由是那个值进入宿主的唯一入口。
+        if path == "/api/theme/resolved":
+            body = body if isinstance(body, dict) else {}
+            changed = rt.set_theme(resolved=str(body.get("resolved") or ""),
+                                   pref=str(body.get("pref") or "") or None)
+            return self._json({"status": "ok", "changed": changed,
+                               "pref": rt.theme_pref(), "resolved": rt.theme_now()})
+
         # 原生程序：开/关它自己的窗口（网页程序不需要 —— 它就在宿主窗口里）
         m = OPEN_RE.match(path)
         if m:
@@ -406,6 +481,11 @@ class Handler(BaseHTTPRequestHandler):
             except (settings.BadURL, settings.BadTheme) as exc:   # 消息给人看的，原样回
                 return self._json({"status": "bad", "error": str(exc)}, 400)
             settings.save_theme(hub.root, theme)
+            # 人点的显式档位**不需要页面**就能解析：dark/light 就是答案本身。
+            # auto 则要等页面把 matchMedia 的结果报回来（POST /api/theme/resolved）——
+            # 宿主里没有第二个地方会问系统，因为那种「问法」只有页面有。
+            if theme in ("dark", "light"):
+                rt.set_theme(resolved=theme, pref=theme)
             pids = []
             if new_url is not None:
                 settings.save_url(hub.root, new_url)

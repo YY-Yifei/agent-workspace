@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import ast
 import enum
 import importlib.util
 import inspect
@@ -297,8 +298,49 @@ class Capability:
                 "metadata": {"plugin": self.pid, "fn": self.fn}}
 
 
+# --------------------------------------------------------------------- 宿主服务
+# **唯一真源**：插件在三个面上各能拿到什么。名字 → 哪些面必须真的有它。
+#
+# 三面是同一份契约的三个绑定：后端是模块全局 ``ctx``，网页是 ``window.aw``，
+# 原生是 ``sdk.Native``。名字**逐字相同**（包括下划线：``theme_pref``），
+# 因为「换个面就得换一套记法」本身就是第二份知识。
+#
+# 判据（每个名字都得过）：能写成一条 HTTP 路由，或一次 ``dispatch``。
+# 写不出来的东西不该在对象上 —— 那不是能力，那是内核。
+#
+# **明确不给**：任何写 ``config.json`` / ``dev.json`` 的东西。能写这两份就等于
+# 能给自己或別人拨权限（settings.py 开头那条边界），这条路不从「更体面的入口」上绕。
+SERVICES: dict[str, tuple[str, ...]] = {
+    "get":        ("backend", "web", "native"),   # 读自己的 store
+    "set":        ("backend", "web", "native"),   # 写自己的 store
+    "emit":       ("backend", "web", "native"),   # 往事件流里喊一声
+    "call":       ("backend", "web", "native"),   # 执行一个能力（走同一个 dispatch）
+    "theme":      ("backend", "web", "native"),   # 现在该画深还是浅（**解析后**）
+    "theme_pref": ("backend", "web", "native"),   # 人点的那一档（别拿它去画）
+    "on_theme":   ("backend", "web", "native"),   # 外观变了叫一声
+    "state":      ("backend", "web", "native"),   # 整份工作区状态
+    "dir":        ("backend", "web", "native"),   # 我自己的目录
+    "on_event":   ("backend", "web", "native"),   # 订阅事件流
+    "log":        ("backend",),                   # 留一句话（网页/原生用自己的终端）
+}
+FACES = ("backend", "web", "native")
+
+
+def services_of(face: str) -> set[str]:
+    """这个面**必须**有的名字。从表派生，不另存一份。"""
+    return {name for name, faces in SERVICES.items() if face in faces}
+
+
 class Context:
-    """注入进插件模块的宿主服务。极简：store + emit + 元信息。"""
+    """注入进插件模块的宿主服务 —— **门面，不是内核**。
+
+    刻意不给 ``Runtime``：拿到它就能绕过 ``dispatch`` 直接跑别人的 handler、
+    读别的程序的 store、改 ``dev.json``。这里的每个方法都能写成一条 HTTP 路由
+    或一次 ``dispatch`` —— 写不出来的不该在对象上。
+
+    名字与另外两个面（网页的 ``window.aw``、原生的 ``sdk.Native``）**逐字相同**；
+    清单只有一个真源（``SERVICES``），三面各自实现，集合由 selftest 双向比对。
+    """
 
     def __init__(self, runtime: "Runtime", plugin: "Plugin") -> None:
         self._rt = runtime
@@ -356,6 +398,61 @@ class Context:
     # -- 广播：插件自己也能喊一声
     def emit(self, kind: str, payload: dict | None = None) -> None:
         self._rt.publish(kind, pid=self._pid, data=payload or {}, source="plugin")
+
+    # -- 我自己的目录 ----------------------------------------------------
+    @property
+    def dir(self) -> Path:
+        """这个程序的目录（``data/`` 就在它下面）。**只读** —— 改代码走 dev_plugin_write。"""
+        return self._rt.plugins_dir / self._pid
+
+    # -- 调别人（也调自己）：落到**同一个** dispatch -----------------------
+    def call(self, pid: str, fn: str | None = None, args: dict | None = None) -> dict:
+        """执行一个能力，返回 ``{"status","text","data"}``。
+
+        ``ctx.call("list")`` 调自己；``ctx.call("dingtalk", "list")`` 调别人。
+        **不是一个新入口**：它照样过 schema 校验、照样发 ``call.ok``、照样进调用栈，
+        所以环形调用在 ``dispatch`` 里一处就挡住（A→B→A 不会把进程转死）。
+        """
+        if fn is None:
+            pid, fn = self._pid, pid
+        return self._rt.dispatch(pid, fn, args or {}, source="plugin",
+                                 caller=self._pid).as_dict()
+
+    # -- 外观：**宿主解析，插件只消费** -----------------------------------
+    def theme(self) -> str:
+        """现在到底该画深还是浅（``dark`` / ``light``）。解析后的值，直接能用。"""
+        return self._rt.theme_now()
+
+    def theme_pref(self) -> str:
+        """人点的那一档（``auto`` / ``dark`` / ``light``）。
+
+        **别拿它去画**：``auto`` 要问系统，而唯一免费、跨平台准确的问法是页面的
+        ``matchMedia``。插件自己解析就成了第二份判据，必然与宿主漂移。
+        """
+        return self._rt.theme_pref()
+
+    # -- 订阅 ------------------------------------------------------------
+    def on_theme(self, cb) -> "typing.Callable[[], None]":
+        """外观变了就叫一声。返回取消函数。"""
+        return self._rt.plugin_subscribe(self._pid, cb, kinds=("ui.theme",))
+
+    def on_event(self, cb, kinds: "tuple[str, ...] | None" = None):
+        """订阅事件流（``kinds`` 限定类型）。返回取消函数。
+
+        取消不劳你记：程序被卸载/重装时宿主按 pid 一并注销 —— 否则旧回调会
+        攥着旧 runtime 继续收事件，变成收事件、不改界面的「幽灵程序」。
+        """
+        return self._rt.plugin_subscribe(self._pid, cb, kinds=kinds)
+
+    # -- 看一眼全局 / 留一句话 -------------------------------------------
+    def state(self) -> dict:
+        """整份工作区状态（与 ``/api/state`` 同一份）。"""
+        return self._rt.state()
+
+    def log(self, msg) -> None:
+        """往事件流里留一句话（人看得见，别的订阅者也能收到）。"""
+        self._rt.publish("plugin.log", pid=self._pid, source="plugin",
+                         data={"msg": str(msg)})
 
 
 class Plugin:
@@ -500,6 +597,15 @@ class Runtime:
         # 各写各的 store.json 本来互不相干，一把全局锁会让「甲在写」变成「乙也得等」。
         self._store_locks: dict[str, threading.Lock] = {}
         self._rejected: dict[str, str] = {}                # 目录名 → 被拒的理由
+        # 外观：**解析后的那一档**活在宿主进程里，因为后端要能随时回答 ctx.theme()
+        # —— 不能每次都去问页面。真源仍是 config.json 的 ui.theme（人点的那一档），
+        # 页面解析 auto 之后把结果报回来（POST /api/theme/resolved）。
+        self._theme_pref = "auto"
+        self._theme_now = "dark"
+        # 插件侧的订阅（pid → 取消函数）。**必须按 pid 记**：scan() 会把 Plugin
+        # 整套换掉，而旧回调闭包攥着旧 runtime —— 不注销就是收事件、占内存、
+        # 却再也影响不到界面的幽灵程序。
+        self._plugin_subs: dict[str, list] = {}
 
     # -- 事件 ---------------------------------------------------------
     def subscribe(self) -> queue.Queue:
@@ -512,6 +618,78 @@ class Runtime:
         with self._lock:
             if q in self._subs:
                 self._subs.remove(q)
+
+    def plugin_subscribe(self, pid: str, cb, kinds=None):
+        """给插件用的订阅：返回**取消函数**，并按 pid 记在账上。
+
+        为什么不让插件自己 subscribe()：那就没人知道这条订阅属于谁，
+        ``scan()`` 换掉 Plugin 时也就无处注销。订阅的寿命必须与程序绑在一起。
+        """
+        q = self.subscribe()
+        stop = threading.Event()
+
+        def loop() -> None:
+            while not stop.is_set():
+                try:
+                    ev = q.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+                if kinds and ev.get("type") not in kinds:
+                    continue
+                try:
+                    cb(ev)
+                except Exception:            # 插件的回调炸了，别把订阅线程带走
+                    pass
+
+        threading.Thread(target=loop, name=f"aw-sub-{pid}", daemon=True).start()
+
+        def off() -> None:
+            if stop.is_set():
+                return
+            stop.set()
+            self.unsubscribe(q)
+
+        with self._lock:
+            self._plugin_subs.setdefault(pid, []).append(off)
+        return off
+
+    def drop_subs(self, pid: str) -> int:
+        """这个程序的订阅全部注销，返回注销了几条。
+
+        调它的地方只有两处：``scan()`` 重装同一个 pid、``scan()`` 发现目录没了。
+        「删插件」与「重装插件」在订阅这一侧是同一件事。
+        """
+        with self._lock:
+            offs = self._plugin_subs.pop(pid, [])
+        for off in offs:
+            try:
+                off()
+            except Exception:
+                pass
+        return len(offs)
+
+    # -- 外观 ---------------------------------------------------------
+    def theme_now(self) -> str:
+        """现在到底该画哪一档（``dark`` / ``light``）—— **解析后的**。"""
+        return self._theme_now
+
+    def theme_pref(self) -> str:
+        """人点的那一档（``auto`` / ``dark`` / ``light``）。"""
+        return self._theme_pref
+
+    def set_theme(self, resolved: str | None = None, pref: str | None = None) -> bool:
+        """改「现在画哪一档」。返回**是否真的变了** —— 没变就不广播。
+
+        变一次喊一次：这条事件是 ``on_theme`` 唯一的口粮，也是「一个身体两种颜色」
+        的解药（宿主改了，iframe 与原生窗口都跟着改）。重复喊等于把信号埋进噪音。
+        """
+        p = pref if pref in ("auto", "dark", "light") else self._theme_pref
+        r = resolved if resolved in ("dark", "light") else self._theme_now
+        if p == self._theme_pref and r == self._theme_now:
+            return False
+        self._theme_pref, self._theme_now = p, r
+        self.publish("ui.theme", source="system", data={"pref": p, "resolved": r})
+        return True
 
     def publish(self, kind: str, *, pid: str = "", fn: str = "", source: str = "system",
                 data: dict | None = None) -> None:
@@ -709,6 +887,10 @@ class Runtime:
                 stamp = self._stamp(d)
                 if old is not None and getattr(old, "_stamp", None) == stamp:
                     continue
+                if old is not None:
+                    # 这个 pid 的代码变了（或整份被换掉）：旧模块里的订阅闭包
+                    # 攥着旧 runtime，不注销就成了「收事件、不改界面」的幽灵。
+                    self.drop_subs(d.name)
                 p = Plugin(d)
                 self._load(p, taken)
                 p._stamp = stamp                            # type: ignore[attr-defined]
@@ -720,6 +902,7 @@ class Runtime:
                                    "error": p.error})
         for gone in [k for k in plugins if k not in seen]:
             del plugins[gone]
+            self.drop_subs(gone)                    # 程序没了，它的订阅也不该活着
             changed = True
             self.publish("plugin.removed", pid=gone)
         self.plugins = plugins                      # 整体换掉：读侧永远看不到中间态
@@ -1039,6 +1222,16 @@ class Runtime:
             # rejected 而不是 error：模型自己能改好参数再调一次
             return self._reject(pid, fn, source, err, started)
 
+        # 环检测。A→B→A 是**无限递归**，而 caller() 只看栈顶，判不出「A 已在栈里」。
+        # 判据放在这里而不是 ctx.call：agent 的 plugin_call 走的是同一条路，
+        # 同一件事只该有一份判据（放在门口，谁进来都过这道）。
+        chain = list(getattr(self._callers, "stack", None) or [])
+        if pid in chain:
+            return self._reject(pid, fn, source,
+                                "环形调用：" + " → ".join([*chain, pid])
+                                + "（程序不能调用自己，也不能绕回来）",
+                                started, caller=caller)
+
         # 没点名谁在动手，就**继承**上一层 —— plugin_call 引起的那层嵌套 dispatch
         # 正是这样。否则「谁在调」会在嵌套处退化成 source 字符串（'plugin'）。
         self._push_caller(caller if caller is not None else (self.caller() or source))
@@ -1104,6 +1297,74 @@ class Runtime:
 
 # --------------------------------------------------------------------- 插件体检
 # 写插件这件事可以被静态体检：只在需要时才调它，不必每步都看。
+
+def _binds_name(node, name: str) -> bool:
+    """这段作用域里是否自己定义了 ``name``（参数 / 赋值 / for / with / 解包）。
+
+    假阳性门的全部理由：插件完全可以自己写一个叫 ``ctx`` 的局部变量
+    （``ctx = parse(...)``）。那不是宿主注入的那个，替它报错就是误报机器。
+    """
+    args = getattr(node, "args", None)
+    if args is not None:
+        for a in [*args.posonlyargs, *args.args, *args.kwonlyargs]:
+            if a.arg == name:
+                return True
+        for extra in (args.vararg, args.kwarg):
+            if extra is not None and extra.arg == name:
+                return True
+
+    def targets(n) -> list[str]:
+        if isinstance(n, ast.Name):
+            return [n.id]
+        if isinstance(n, (ast.Tuple, ast.List)):
+            return [x for e in n.elts for x in targets(e)]
+        if isinstance(n, ast.Starred):
+            return targets(n.value)
+        return []
+
+    for n in ast.walk(node):
+        if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            tg = n.targets if isinstance(n, ast.Assign) else [n.target]
+            for t in tg:
+                if name in targets(t):
+                    return True
+        elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+            if name in targets(n.target):
+                return True
+        elif isinstance(n, ast.withitem) and n.optional_vars is not None:
+            if name in targets(n.optional_vars):
+                return True
+    return False
+
+
+def ctx_misuse(tree) -> list[str]:
+    """``backend.py`` 里用了契约上没有的 ``ctx.<attr>``（静态判断，不执行）。
+
+    挡的是**「文档写了、代码没有」**那种病：``docs/plugin-mechanism.md`` 曾承诺
+    ``ctx.call(...)`` 而 ``Context`` 上根本没有这个方法 —— 照着写的插件会通过
+    全部四道旧校验（探针只 exec_module，不调函数），然后在用户点按钮那一刻炸。
+    """
+    known = services_of("backend")
+    bad: list[str] = []
+
+    def watch(node, shadowed: bool) -> None:
+        for child in ast.walk(node):
+            if (isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name)
+                    and child.value.id == "ctx" and not shadowed
+                    and child.attr not in known):
+                bad.append(f"ctx.{child.attr} 不在宿主契约里")
+
+    scopes = [n for n in tree.body
+              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    for fn in scopes:
+        if not _binds_name(fn, "ctx"):
+            watch(fn, False)
+    # 模块级（函数之外）的语句：它们共享一个作用域
+    loose = ast.Module(body=[n for n in tree.body if n not in scopes], type_ignores=[])
+    if not _binds_name(loose, "ctx"):
+        watch(loose, False)
+    return sorted(set(bad))
+
 
 def check_plugin(path: Path) -> dict:
     """对一个插件目录做四道静态校验（不执行、不 import）。
@@ -1172,6 +1433,11 @@ def check_plugin(path: Path) -> dict:
                         errors.append(f"{node.name}() 的参数 {a.arg} 没有类型注解")
             if not fns:
                 errors.append("没有公开函数 —— 这个插件不提供任何能力")
+            misuse = ctx_misuse(tree)
+            if misuse:
+                errors.append("；".join(misuse) + "。宿主只给这些："
+                              + " / ".join("ctx." + n
+                                           for n in sorted(services_of("backend"))))
     ui_kind = "native" if ui_name.endswith(".py") else "web"
     return {"ok": not errors, "errors": errors, "functions": fns, "uiKind": ui_kind,
             "uiName": ui_name, "title": manifest.get("title", path.name)}

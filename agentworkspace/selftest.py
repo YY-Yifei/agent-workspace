@@ -607,9 +607,10 @@ def _run() -> int:
           r.get("status") == "ok" and r.get("dev") is True, str(r)[:140])
     dev_caps = sorted(rt.capabilities_of(pid))
     borrowed = [w for w in dev_caps if not w.startswith(pid + "_")]
-    check("打开后借到的**恰好**是这九项（多一项都算越界）",
-          borrowed == ["dev_diff", "dev_plugin_write", "dev_read", "dev_revert",
-                       "dev_search", "dev_show", "dev_tree", "dev_versions", "dev_write"],
+    check("打开后借到的**恰好**是这十项（多一项都算越界）",
+          borrowed == ["dev_diff", "dev_host_services", "dev_plugin_write", "dev_read",
+                       "dev_revert", "dev_search", "dev_show", "dev_tree",
+                       "dev_versions", "dev_write"],
           str(borrowed))
     check("借来的手里**没有**一件能动历史的危险动作（remote/push/branch/reset…）",
           not any(k in w for w in borrowed for k in
@@ -2940,6 +2941,186 @@ def _run() -> int:
           "")
     check("H15b 气泡里按引用拼图（而不是把 base64 塞进历史）",
           "/img/${f.name}" in html and "shotsHtml" in html, "")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # G 段：宿主与插件之间的那个对象（docs/plugin-host-object.md）
+    # 一条契约（kernel.SERVICES）、三个绑定（ctx / window.aw / sdk.Native）。
+    # 这一段守的全部是**同一件事**：三面不许各自漂。
+    # ═══════════════════════════════════════════════════════════════════
+    import subprocess
+
+    from . import sdk as _sdk
+
+    declared_b = kernel.services_of("backend")
+    actual_b = {n for n in dir(kernel.Context) if not n.startswith("_")}
+    check("G1 后端 ctx 导出的名字 == 契约表（双向）",
+          actual_b == declared_b,
+          f"多 {sorted(actual_b - declared_b)} / 少 {sorted(declared_b - actual_b)}")
+
+    declared_n = kernel.services_of("native")
+    _nat = _sdk.Native(base=base, pid="pomodoro", watch_host=False)
+    # 允许的「表外名字」要**逐个说明**，不是一张黑洞：text/data_dir 是本地便利
+    # （不回门），base/pid/dir 是它们自己的元信息。
+    NAT_EXTRA = {"text", "data_dir", "base", "pid"}
+    actual_n = {n for n in dir(_nat) if not n.startswith("_")}
+    check("G1b 原生 Native 导出的名字 == 契约表（双向）",
+          actual_n - declared_n == NAT_EXTRA and declared_n <= actual_n,
+          f"多 {sorted(actual_n - declared_n - NAT_EXTRA)} / 少 {sorted(declared_n - actual_n)}")
+
+    # 网页那一面：**真的把 aw.js 跑一遍再数**，不靠读源码猜。
+    aw_path = Path(__file__).resolve().parent / "web" / "aw.js"
+    aw_keys, aw_how = set(), "没有 node"
+    try:
+        out = subprocess.run(
+            ["node", "-e",
+             "require(" + json.dumps(str(aw_path)) + ");"
+             "console.log(Object.keys(globalThis.aw).join(','))"],
+            capture_output=True, text=True, timeout=60)
+        if out.returncode == 0:
+            aw_keys, aw_how = set(out.stdout.strip().split(",")), "node"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    if not aw_keys:                                   # 没有 node：退回静态读，并说出来
+        body = aw_path.read_text(encoding="utf-8")
+        blk = re.search(r"root\.aw = \{(.*?)\n  \};", body, re.S)
+        aw_keys = set(re.findall(r"^\s{4}([A-Za-z_][A-Za-z0-9_]*):", blk.group(1), re.M)
+                      if blk else ())
+        aw_how = "静态读（这台机器没有 node）"
+    declared_w = kernel.services_of("web")
+    check(f"G1c 网页 aw 导出的名字 == 契约表（{aw_how} 真数）",
+          aw_keys - {"version", "pid"} == declared_w,
+          f"多 {sorted(aw_keys - {'version', 'pid'} - declared_w)} / "
+          f"少 {sorted(declared_w - aw_keys)}")
+
+    tb_src = Path(toolbox.__file__).read_text(encoding="utf-8")
+    check("G2 探针里不再有手写的 class Ctx（契约的第二份由构造消除）",
+          not re.search(r"^\s*class Ctx\b", tb_src, re.M)
+          and "kernel import Context" in tb_src, "")
+
+    # 三、四两条：一个用了不存在的 ctx 方法；一个自己定义了局部 ctx。
+    gate_dir = Path(tempfile.mkdtemp(prefix="aw-ctxgate-"))
+    try:
+        def _fake_plugin(name: str, body: str) -> Path:
+            d = gate_dir / name
+            (d / "ui").mkdir(parents=True, exist_ok=True)
+            (d / "plugin.json").write_text(json.dumps({"title": name}), encoding="utf-8")
+            (d / "ui" / "index.html").write_text("<html></html>", encoding="utf-8")
+            (d / "backend.py").write_text(body, encoding="utf-8")
+            return d
+
+        ghost = _fake_plugin("ghost", 'def go() -> str:\n    """dot"""\n'
+                                     "    return str(ctx.call_anyone('x'))\n")
+        st = kernel.check_plugin(ghost)
+        check("G3 ctx.<不存在的方法> 在校验期就被挡（文档写了、代码没有的那种病）",
+              not st["ok"] and any("ctx.call_anyone" in e for e in st["errors"]),
+              str(st["errors"])[:160])
+        check("G3b 拒绝时把**真清单**一起给出来（否则读到的人还是不知道能用什么）",
+              any("ctx.theme" in e and "ctx.call" in e for e in st["errors"]),
+              str(st["errors"])[:160])
+
+        ok_one = _fake_plugin("fine", 'def go() -> str:\n    """dot"""\n'
+                                       "    ctx = {'a': 1}\n"
+                                       "    return str(ctx.get('a'))\n")
+        st2 = kernel.check_plugin(ok_one)
+        check("G4 插件自己定义的局部 ctx 不报（门别变成误报机器）",
+              st2["ok"], str(st2["errors"])[:160])
+    finally:
+        shutil.rmtree(gate_dir, ignore_errors=True)
+
+    # 环门：A→B→A 必须被拒，而且**不能把进程转死**（A 会无限递归下去）
+    cyc_a = rt.plugins_dir / "cyc_a"
+    cyc_b = rt.plugins_dir / "cyc_b"
+    try:
+        for name, other in (("cyc_a", "cyc_b"), ("cyc_b", "cyc_a")):
+            d = rt.plugins_dir / name
+            (d / "ui").mkdir(parents=True, exist_ok=True)
+            (d / "plugin.json").write_text(json.dumps({"title": name}), encoding="utf-8")
+            (d / "ui" / "index.html").write_text("<html></html>", encoding="utf-8")
+            (d / "backend.py").write_text(
+                'def ping() -> str:\n    """喊一声"""\n'
+                f"    return str(ctx.call('{other}', 'ping'))\n", encoding="utf-8")
+        rt.scan()
+        box: dict = {}
+
+        def _ring() -> None:
+            box["res"] = rt.dispatch("cyc_a", "ping", {})
+
+        th = threading.Thread(target=_ring, daemon=True)
+        th.start()
+        th.join(10)
+        res = box.get("res")
+        check("G5 A→B→A 被拒（环门加在 dispatch 上，agent 与插件共用一份判据）",
+              res is not None and "环形调用" in (res.text or ""),
+              f"{'超时' if th.is_alive() else ''}{(res.text if res else '')[:120]}")
+        check("G5b 而且没有把进程转死（10 秒内回来了）", not th.is_alive(), "还在转")
+
+        # 幽灵门：程序没了，它的订阅必须一起注销
+        hits: list = []
+        live = kernel.Context(rt, rt.plugins["cyc_a"])
+        live.on_theme(lambda ev: hits.append(ev))
+        rt.set_theme(resolved="dark", pref="dark")
+        time.sleep(0.2)
+        n1 = len(hits)
+        shutil.rmtree(cyc_a, ignore_errors=True)       # 卸载：目录没了
+        rt.scan()
+        rt.set_theme(resolved="light", pref="light")
+        time.sleep(0.2)
+        check("G6 程序没了，它的 on_theme 就不再收到事件（不会变成收事件的幽灵）",
+              n1 == 1 and len(hits) == n1, f"{n1} → {len(hits)}")
+    finally:
+        shutil.rmtree(cyc_a, ignore_errors=True)
+        shutil.rmtree(cyc_b, ignore_errors=True)
+        rt.scan()
+
+    # 主题门：一个值，三种读法，必须相等
+    seen_q = rt.subscribe()
+    try:
+        rt.set_theme(resolved="light", pref="light")
+        rt.set_theme(resolved="light", pref="light")   # 同值再来一次
+        while True:
+            try:
+                seen_q.get(timeout=0.3)
+            except queue.Empty:
+                break
+    finally:
+        rt.unsubscribe(seen_q)
+    # 上面那两条之后，最新一条 ui.theme 只该有一次「真的变了」
+    same = [e for e in rt.events if e["type"] == "ui.theme"][-2:]
+    check("G7 ui.theme 只在真的变了时广播（重复喊等于把信号埋进噪音）",
+          len(same) == 1 or len({json.dumps(e["data"], sort_keys=True) for e in same}) == 2, "")
+
+    code_t, body_t, _ = get(base, "/api/theme")
+    theme_http = json.loads(body_t)
+    check("G7b ctx.theme() 与 /api/theme 同值（一个值，两种读法）",
+          kernel.Context(rt, rt.plugins["pomodoro"]).theme() == theme_http["resolved"],
+          f"{kernel.Context(rt, rt.plugins['pomodoro']).theme()} vs {theme_http}")
+
+    code_js, body_js, heads = get(base, "/aw.js")
+    js = body_js.decode("utf-8")
+    check("G7c /aw.js 200，且把宿主**解析后**的主题填了进去（插件不必再问一次系统）",
+          code_js == 200 and f"'{theme_http['resolved']}'" in js
+          and "__AW_THEME__" not in js, f"{code_js} {len(js)}")
+
+    # store / emit：网页那两个方法与后端 ctx 是**同一份**数据、同一条事件流
+    post(base, "/api/p/pomodoro/store", {"key": "k39", "value": {"a": 1}})
+    _c, body_s, _ = get(base, "/api/p/pomodoro/store?key=k39")
+    got = json.loads(body_s).get("value")
+    check("G8 网页写的 store 与后端 ctx.get 是同一份（不是两份）",
+          got == {"a": 1} and kernel.Context(rt, rt.plugins["pomodoro"]).get("k39") == {"a": 1},
+          str(got))
+    post(base, "/api/p/pomodoro/emit", {"kind": "plug.evt", "data": {"n": 1}})
+    check("G8b emit 落进同一条事件流（aw.emit 与 ctx.emit 一模一样）",
+          any(e["type"] == "plug.evt" for e in rt.events), "")
+
+    from . import devtools as _dev
+    try:
+        hs = _dev.host_services()
+        check("G9 dev_host_services 从活代码反射（清单 == 契约表，不是抄的一份）",
+              set(hs["services"]) == set(kernel.SERVICES)
+              and all(k in hs["text"] for k in ("ctx.get", "aw.theme", "ctx.call")),
+              "")
+    except Exception as exc:                          # noqa: BLE001
+        check("G9 dev_host_services 从活代码反射", False, f"{type(exc).__name__}: {exc}")
 
     httpd.shutdown()
     if getattr(App, "native", None):

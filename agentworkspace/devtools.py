@@ -135,6 +135,41 @@ def tree(max_depth: int = 3) -> dict:
     return out
 
 
+def host_services() -> dict:
+    """写程序之前先调我：宿主到底给了你什么能力（一份清单，三面同名）。
+
+    为什么是「调一下」而不是「写进提示词」：写代码时才需要它，聊天时不需要 ——
+    与「每一步都得看见的才进提示词」是同一条判据。清单**从活代码反射**，
+    不另存一份文档（两份措辞必然漂移，然后有人照着旧的那份写）。
+    """
+    from .kernel import FACES, SERVICES, services_of
+
+    lines = ["三个面（后端 backend.py 的模块全局 ``ctx`` · 网页 ui/index.html 的"
+             "``window.aw`` · 原生 ui/app.py 的 ``sdk.Native``）名字**逐字相同**：", ""]
+    for name, faces in SERVICES.items():
+        where = " / ".join(faces)
+        lines.append(f"  {name:<12} {where}")
+    lines += [
+        "",
+        "明确没有：任何写 config.json / dev.json 的东西 —— 能写那两份就等于",
+        "能给自己或别人拨权限。也没有 Runtime 本体（那能绕过 dispatch）。",
+        "",
+        "常用三步：",
+        "  ctx.get('messages')                  # 你自己的 store，落盘、跨重启",
+        "  ctx.set('messages', [...]); ctx.emit('dingtalk.sent', {'n': 1})",
+        "  ctx.call('别的程序', '它的函数', {'x': 1})   # 走同一个 dispatch",
+        "",
+        "网页里：",
+        "  <script src=\"/aw.js\"></script>",
+        "  aw.theme()            // \"dark\" | \"light\" —— 宿主解析过的，直接能画",
+        "  aw.on_theme(t => paint(t))",
+        "  aw.get('messages')    // 与后端 ctx.get 是同一份 store",
+    ]
+    return {"text": "\n".join(lines),
+            "services": {n: list(f) for n, f in SERVICES.items()},
+            "faces": {f: sorted(services_of(f)) for f in FACES}}
+
+
 def read(path: str, offset: int = 1, limit: int = SHOW_LIMIT) -> dict:
     """读工作区内的文件，可分页。改自己前先读当前版。
 
@@ -336,6 +371,8 @@ def plugin_write(files: dict, why: str = "") -> dict:
 
     files: {文件名: 内容}，只收 plugin.json / backend.py / ui/**（data/ 不许碰）
     why: 为什么改（进历史，下一轮的你会读到）
+
+    宿主给了你什么（ctx.get / ctx.call / ctx.theme …）：dev_host_services。
 
     校验不过会**整份回滚**到提交前那一版，你什么也没改成。
     成功后会记一版历史：dev_versions 看得见，dev_revert 退得回。

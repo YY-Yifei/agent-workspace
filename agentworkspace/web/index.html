@@ -1751,6 +1751,7 @@ async function syncAgents() {
    那段注释说的「两条判据并存迟早要出事」。 */
 const THEME_KEY = 'aw-theme';
 let themeOpening = null;      // 打开面板时的那一档；非 null = 有没保存的预览
+let themeReported = null;     // 上一次告诉宿主的是哪一档（重复报等于把信号埋进噪音）
 
 function resolveTheme(pref) {
   if (pref === 'dark' || pref === 'light') return pref;
@@ -1767,7 +1768,23 @@ function applyTheme(pref) {
   document.documentElement.dataset.theme = t;
   try { localStorage.setItem(THEME_KEY, t); } catch (e) { /* 存不上就算了，不影响画 */ }
   paintThemeSeg();
+  reportTheme(p, t);
   return t;
+}
+
+/* 把「auto 到底解析成了什么」报回宿主。**只有页面知道系统深浅**（matchMedia 是
+   页面的能力），所以这条 POST 是那个值进入宿主的唯一入口 —— 后端、插件 iframe、
+   原生窗口都靠它答得上「现在该画哪一档」。
+   预览（themeOpening != null）不报：那是还没保存的一眼，报上去等于让所有插件
+   跟着一次没落盘的点击翻面。 */
+function reportTheme(pref, resolved) {
+  if (themeOpening != null || resolved === themeReported) return;
+  themeReported = resolved;
+  fetch('/api/theme/resolved', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ pref: pref, resolved: resolved })
+  }).catch(() => { /* 宿主不在：下次 state 到了会再报一遍 */ });
 }
 
 function paintThemeSeg() {
