@@ -276,10 +276,14 @@ class Result:
     data: dict = field(default_factory=dict)
     reason: str | None = None
     elapsed_ms: int = 0
+    # 二进制产物（现在只有截图）。**不能进 data**：bytes 过不了 JSON，
+    # 而 data 是要发给界面的。所以它单独一格，只有 link 那一条路读它。
+    images: list = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {"status": self.status, "text": self.text, "data": self.data,
-                "reason": self.reason, "elapsed_ms": self.elapsed_ms}
+                "reason": self.reason, "elapsed_ms": self.elapsed_ms,
+                "images": len(self.images)}
 
 
 @dataclass
@@ -1246,8 +1250,8 @@ class Runtime:
         finally:
             self._pop_caller()
 
-        text, data = self._split(value)
-        res = Result(status="ok", text=text, data=data,
+        text, data, images = self._split(value)
+        res = Result(status="ok", text=text, data=data, images=images,
                      elapsed_ms=int((time.perf_counter() - started) * 1000))
         self.publish("call.ok", pid=pid, fn=fn, source=source,
                      data={"text": text, "result": data, "caller": caller})
@@ -1265,19 +1269,27 @@ class Runtime:
         return f"未知程序 {pid}"
 
     @staticmethod
-    def _split(value) -> tuple[str, dict]:
-        """双面返回：dict 里的 "text" 给模型，其余给界面。"""
+    def _split(value) -> tuple[str, dict, list]:
+        """三面返回：``text`` 给模型，``data`` 给界面，``images`` 走 file part。
+
+        ``images`` 必须**从 data 里摘出去**：它是 bytes，``json.dumps`` 撞上去
+        要么炸要么靠 ``default=str`` 变成一坨 ``b'\x89PNG...'``。摘出来之后
+        它只走 ``link`` 那条 ``Part.image`` 的路 —— 一条数据一个去处。
+        """
         if value is None:
-            return "", {}
+            return "", {}, []
         if isinstance(value, str):
-            return value, {}
+            return value, {}, []
         if isinstance(value, dict):
             text = value.get("text")
-            rest = {k: v for k, v in value.items() if k != "text"}
+            rest = {k: v for k, v in value.items() if k not in ("text", "images")}
+            images = value.get("images") or []
+            if not isinstance(images, list):
+                images = [images]
             if text is None:
-                return json.dumps(rest, ensure_ascii=False, default=str), rest
-            return str(text), rest
-        return json.dumps(value, ensure_ascii=False, default=str), {"value": value}
+                return json.dumps(rest, ensure_ascii=False, default=str), rest, images
+            return str(text), rest, images
+        return json.dumps(value, ensure_ascii=False, default=str), {"value": value}, []
 
     def _reject(self, pid: str, fn: str, source: str, why: str, started: float,
                 caller: str | None = None) -> Result:

@@ -34,6 +34,23 @@ from . import media, sessions
 from .settings import DEFAULT_URL as _DEFAULT_URL
 from .kernel import Runtime
 
+
+def _image_parts(images) -> tuple:
+    """把内核 Result 上的二进制产物翻成协议里的 file part。
+
+    为什么这一层才翻：``Result`` 属于内核，它不该知道协议长什么样；
+    ``FunctionResult`` 才是协议。图到不了 agent 眼前，唯一的缺口就在这里 ——
+    在补上之前，``dev_page_shot`` 拍得再好，agent 也只收到一句「已截图」。
+    """
+    out = []
+    for im in images or []:
+        if isinstance(im, dict) and im.get("raw"):
+            out.append(Part.image(im["raw"], im.get("mime") or "image/png",
+                                  im.get("name") or None))
+        elif isinstance(im, (bytes, bytearray)):
+            out.append(Part.image(bytes(im), "image/png"))
+    return tuple(out)
+
 ASSISTANT = "assistant"
 
 # 提示词文件缺席时的兜底：短，且**不撒谎**（不承诺它其实没有的能力）。
@@ -492,7 +509,8 @@ class Link:
                 lambda: self.rt.dispatch(pid, fn, kwargs, source="agent", caller=self.pid))
             res = await asyncio.wrap_future(fut, loop=loop)
             return FunctionResult(status=res.status,
-                                  parts=(Part.t(res.text or ""),),
+                                  parts=(Part.t(res.text or ""),
+                                         *_image_parts(res.images)),
                                   reason=res.reason)
         return run
 

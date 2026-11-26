@@ -15,6 +15,7 @@
 | `dev_tree` `dev_read` `dev_search` | 改自己之前必须先读得到自己 |
 | `dev_write` | 「文件读写这些基本能力」。不碰 `plugins/**`、`dev.json`、`config.json` |
 | `dev_plugin_write` | 改**自己**。**没有 pid 参数** —— 改别人在签名上就不可能 |
+| `dev_page_open` `dev_page_eval` `dev_page_shot` `dev_page_check` `dev_page_close` | 在**真窗口、真引擎**里看自己的页面：跑 JS、截图、逐面检查 |
 
 | 没有 | 为什么 |
 |---|---|
@@ -22,6 +23,7 @@
 | `plugin_call` | 能操作别的程序 = 能绕过别的程序的隔离 |
 | `plugin_delete` | 删掉自己会连开关一起没了；删别人更不该有 |
 | `plugin_verify` | 重复：`dev_plugin_write` 本身就四道校验 + 整份回滚 |
+| `dev_page_open(url=…)` | 验的只能是自己那个页面。加一个 url 参数就成了通用爬虫 + 内网探测入口 |
 | `shell` | 开发者模式不等于一个终端 |
 
 用户的原话就是判据：**「只是赋予了文件读写这些基本能力，以及当前插件的修改、

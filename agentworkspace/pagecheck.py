@@ -1,0 +1,846 @@
+"""页面自查 —— 在**真窗口、真引擎**里把自己的页面看一遍。
+
+为什么要它：``selftest`` 只能断言「文件里有这行字」，``uiprobe`` 的断言写死在
+验收脚本里。而插件作者（那个 agent）需要的是**问页面一句真话**：这段 CSS 到底
+渲染成什么样、刚才那次改动有没有把按钮挤出屏幕、页面加载时那个
+``TypeError: S.pid is undefined`` 还在不在。
+
+引擎只有一个：**pywebview / WebView2**。这不是选择，是事实 —— 生产里插件页面
+就是它渲染的（``web/index.html`` 的 ``<iframe id="appframe">``，外面是 pywebview
+窗口）。换 Chrome 来验等于验另一台机器：字体、行高、滚动条宽度、以及 pywebview
+在 ``text_select=False`` 时往 ``<head>`` 末尾注入的 ``user-select:none``，全不一样。
+
+CDP 只是**挂在同一个窗口上的观察通道**，不是第二个引擎：
+
+    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<随机>
+      → Playwright ``connect_over_cdp`` 连上**那一个** WebView2 实例
+      → console / pageerror / requestfailed / Page.screenshot / evaluate 全都有
+
+三条实测约束（v1/v2 探针，不是推演）：
+
+  1. ``hidden=True`` 截不到图 —— 从没显示过的窗口不合成帧，``Page.screenshot``
+     会一直等到超时。所以窗口必须**可见**，但可以放在屏幕外
+     （``x=-3000, y=-3000``）：既合成帧，又不挡用户。
+  2. ``reload`` 会**再次**派发 pywebview 的 ``loaded`` 事件 —— 用 ``events.loaded``
+     起工作线程会让流程跑两遍，第二遍端口已经关了。所以用 ``webview.start(func)``。
+  3. attach 必须在**导航之前**：``Runtime.consoleAPICalled`` 是事件、不重放，
+     加载完再 attach 就一条也拿不到。而加载期恰恰最容易出错。这里的做法是
+     attach 之后 ``reload`` 一次 —— 同一批事件，页面一个字不动（不像 v2 那样
+     用 ``add_init_script`` 抢在导航前注脚本：那是**为了观察而改变观察对象**）。
+     代价写进报告：页面加载两次，第一次的 console 拿不到。
+
+三个进程，每个都有必须存在的理由：
+
+    宿主进程（agent 住的那一个）
+      └─ 本文件 --worker  ← ``webview.start()`` 一个进程只能调一次，所以必须独立
+            ├─ agentworkspace.main --serve   ← 窗口要加载一个 URL，那 URL 得有人服务
+            └─ 真窗口 → #p/<pid> → #appframe → /plugin/<pid>/
+
+用法（人）：
+    python -m agentworkspace.pagecheck --pid memo --check
+    python -m agentworkspace.pagecheck --pid memo --eval "document.title"
+    python -m agentworkspace.pagecheck --pid memo --shot out.png --eval "1+1"
+    python -m agentworkspace.pagecheck --worker --port 9000 --pid memo   # 给 devtools
+
+用法（agent）：``dev_page_open`` / ``dev_page_eval`` / ``dev_page_shot`` /
+``dev_page_check`` / ``dev_page_close`` —— 会话常驻，同一窗口连续问。
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CACHE = ROOT / ".dev-cache"
+DEAD_URL = "ws://127.0.0.1:9/"     # 故意连不上：验证不该碰真服务
+OFFSCREEN = -3000                  # 屏幕外坐标：可见（能合成帧）但不挡人
+MAX_VALUE = 4000                   # eval 返回值超过这个字符就落盘
+IDLE = 300                         # 没有命令这么久就自己收尸
+VIEWPORTS = {"pane": (1180, 800), "desktop": (1600, 900)}
+NARROW = 820                       # 窄屏：窗口这么宽时 pane ≈ 420
+
+# 值的序列化：在**页面里**做完再回来。
+# 为什么不能直接把值交给 Playwright：DOM 节点回来是 ``"ref: <Node>"``（不可用），
+# 循环引用直接抛错。而抛错会让 agent 去改**没写错的那一行** —— 比不给答案更坏。
+SERIALIZER = """(async (v) => {
+  v = await v;                       // 传进来的是 Promise 就先等它的值。
+                                     // 不等的话 `(async()=>42)()` 会序列化成
+                                     // `{}` —— 而 await 正是这套 eval 的卖点。
+  if (v === undefined) return {__t: 'undefined'};
+  if (v === null) return null;
+  const t = typeof v;
+  if (t === 'number' || t === 'string' || t === 'boolean') return v;
+  if (t === 'function') return {__t: 'function', name: v.name || ''};
+  if (typeof Node !== 'undefined' && v instanceof Node) {
+    return {__t: 'node', tag: v.tagName, id: v.id || '',
+            cls: String(v.className || '').slice(0, 120),
+            text: String(v.textContent || '').slice(0, 200),
+            html: String(v.outerHTML || '').slice(0, 300)};
+  }
+  try { return JSON.parse(JSON.stringify(v)); }
+  catch (e) { return {__t: 'unserializable', desc: String(v).slice(0, 200)}; }
+})((%s))"""
+
+FRAME_JS = """(() => {
+  const f = document.querySelector('#appframe');
+  if (!f) return {__no_frame__: true};
+  const d = f.contentDocument;
+  if (!d) return {__no_doc__: true};
+  return {frameW: f.clientWidth, frameH: f.clientHeight,
+          ready: d.readyState,
+          nodes: d.body ? d.body.querySelectorAll('*').length : 0,
+          scrollW: d.documentElement ? d.documentElement.scrollWidth : 0,
+          clientW: d.documentElement ? d.documentElement.clientWidth : 0,
+          scrollH: d.documentElement ? d.documentElement.scrollHeight : 0,
+          bg: d.body ? getComputedStyle(d.body).backgroundColor : null,
+          fg: d.body ? getComputedStyle(d.body).color : null,
+          title: d.title || ''};
+})()"""
+
+CLICK_JS = """(() => {
+  const f = document.querySelector('#appframe');
+  const d = f && f.contentDocument;
+  if (!d) return [];
+  const els = [...d.querySelectorAll('button, [role="button"], input[type="button"]')]
+      .slice(0, 8);
+  return els.map((el) => {
+    const label = (el.textContent || el.value || '').trim().slice(0, 40);
+    try { el.click(); return {tag: el.tagName, label, ok: true}; }
+    catch (e) { return {tag: el.tagName, label, ok: false, err: String(e)}; }
+  });
+})()"""
+
+DESKTOP_JS = """(() => {
+  const f = document.querySelector('#appframe');
+  const chat = document.querySelector('.chat');
+  return {winW: innerWidth, winH: innerHeight, dpr: devicePixelRatio,
+          frameW: f ? f.clientWidth : 0, frameH: f ? f.clientHeight : 0,
+          chatW: chat ? Math.round(chat.getBoundingClientRect().width) : 0,
+          docW: document.documentElement.scrollWidth};
+})()"""
+
+DEFAULT_AREAS = ("load", "console", "network", "overflow", "contrast", "narrow")
+
+
+# ------------------------------------------------------------------ 小工具
+
+def free_port() -> int:
+    """要一个当前空闲的端口。**不落盘、不写死** —— 它只活这一次会话。"""
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def plugin_of(ws: Path, pid: str) -> dict:
+    """这个程序有没有页面。没有不是错误 —— 是**没有**，报告里要如实说。"""
+    pdir = Path(ws) / "plugins" / pid
+    man = pdir / "plugin.json"
+    out = {"pid": pid, "dir": str(pdir), "exists": pdir.is_dir(), "has_ui": False,
+           "why": ""}
+    if not out["exists"]:
+        out["why"] = f"工作区里没有这个程序：{pdir}"
+        return out
+    try:
+        meta = json.loads(man.read_text(encoding="utf-8")) if man.exists() else {}
+    except Exception as exc:
+        out["why"] = f"plugin.json 读不动：{type(exc).__name__}: {exc}"
+        return out
+    entry = meta.get("ui") or ("ui/index.html" if (pdir / "ui" / "index.html").exists() else None)
+    if not entry:
+        out["why"] = "这个程序没有页面（plugin.json 没有 ui，也没有 ui/index.html）"
+        return out
+    index = pdir / str(entry)
+    if not index.exists():
+        out["why"] = f"plugin.json 指向的页面不存在：{entry}"
+        return out
+    out.update(has_ui=True, entry=str(entry), index=str(index))
+    return out
+
+
+def prepare(src: Path, pid: str, mode: str, tag: str) -> tuple[Path, bool]:
+    """(要跑的工作区, 是不是临时副本)。
+
+    ``copy``（默认）：复制一份到 ``.dev-cache/<pid>/ws``，aaas 指向一个连不上的
+    端口。理由不是安全 —— 是**别改用户的数据**：验证会写 config.json、会建会话、
+    会让程序真的跑起来。门要求真实工作区前后 sha256 逐字节相同。
+
+    ``real``：直接用真工作区（连的是你正在跑的那个宿主，见 ``--host-port``）。
+    """
+    if mode == "real":
+        return Path(src), False
+    dst = CACHE / pid / "ws"
+    if dst.exists():
+        shutil.rmtree(dst, ignore_errors=True)
+    ignore = shutil.ignore_patterns(".git", ".dev-cache", ".shell", "sessions",
+                                    "__pycache__", "*.pyc", ".backup")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dst, ignore=ignore, dirs_exist_ok=True)
+    cfg = dst / "config.json"
+    data = {}
+    if cfg.exists():
+        try:
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data.setdefault("aaas", {})["url"] = DEAD_URL
+    data["aaas"]["token"] = None
+    cfg.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    (CACHE / pid).mkdir(parents=True, exist_ok=True)
+    if tag:
+        (CACHE / pid / "tag.txt").write_text(tag, encoding="utf-8")
+    return dst, True
+
+
+def spawn_host(ws: Path, pid: str, log: Path) -> tuple[subprocess.Popen, int]:
+    """起一个只开门、不开窗的宿主，读到它的端口就返回。
+
+    为什么不让本进程直接 serve：窗口要加载一个 URL，而 ``webview.start()`` 会
+    占死主线程 —— 同一个进程里既当服务器又当 GUI 会互相等。用 CLI 还顺带复用了
+    它已经调好的全部装配（插件扫描、事件流、深链接）。
+    """
+    log.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(log, "w", encoding="utf-8", buffering=1)
+    argv = [sys.executable, "-X", "utf8", "-m", "agentworkspace.main",
+            "--serve", "--port", "0", "--no-browser",
+            "--workspace", str(ws), "--open", pid]
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    old = env.get("PYTHONPATH") or ""
+    env["PYTHONPATH"] = str(ROOT) if not old else (str(ROOT) + os.pathsep + old)
+    proc = subprocess.Popen(argv, cwd=str(ROOT), stdout=fh, stderr=subprocess.STDOUT,
+                            env=env)
+    t0 = time.time()
+    import re
+    while time.time() - t0 < 60:
+        txt = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+        m = re.search(r"\[门\] http://127\.0\.0\.1:(\d+)/", txt)
+        if m:
+            port = int(m.group(1))
+            if _http_ok(port):
+                return proc, port
+        if proc.poll() is not None:
+            raise RuntimeError("宿主退出了：" + txt[-600:])
+        time.sleep(0.25)
+    raise RuntimeError("宿主 60 秒内没有就绪：" + (log.read_text(encoding="utf-8")[-600:]
+                                              if log.exists() else ""))
+
+
+def _http_ok(port: int, path: str = "/api/state", timeout: float = 1.5) -> bool:
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout) as r:
+            r.read(64)
+        return True
+    except Exception:
+        return False
+
+
+def kill_tree(proc: subprocess.Popen | None, timeout: float = 20) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=timeout)
+    except Exception:
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=15)
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------------ 工作者
+
+class Worker:
+    """一个窗口、一个会话。命令从 socket 或脚本进来，事实从页面出去。"""
+
+    def __init__(self, pid: str, ws: Path, host_port: int, cdp_port: int,
+                 preset: str = "pane", width: int | None = None) -> None:
+        self.pid = pid
+        self.ws = Path(ws)
+        self.host_port = host_port
+        self.cdp_port = cdp_port
+        self.preset = preset
+        w, h = VIEWPORTS.get(preset, VIEWPORTS["pane"])
+        self.width = int(width or w)
+        self.height = h
+        self.plugin = plugin_of(self.ws, pid)
+        self.win = None
+        self.page = None
+        self.console: list[dict] = []
+        self.errors: list[str] = []
+        self.network: list[str] = []
+        self.aborted: list[str] = []          # 被导航/reload 打断的请求：不是页面的错
+        self.engine = ""
+        self.host: subprocess.Popen | None = None
+        self._pw = None
+        self._br = None
+        self._ready = False
+        self._closing = False
+        self._idle_at = time.time()
+        self._last = ""
+
+    # -- 起 ---------------------------------------------------------
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.host_port}/#p/{self.pid}"
+
+    def run(self, serve=None) -> None:
+        """起窗口 → 跑工作线程 → 等窗口关。``serve`` 就是工作线程里的那个循环。"""
+        import webview
+
+        self.win = webview.create_window(
+            f"页面自查 · {self.pid}", self.url(),
+            width=self.width, height=self.height,
+            x=OFFSCREEN, y=OFFSCREEN)
+        # func 只在 GUI 起来之后被调用**一次**；而 events.loaded 每次导航都会派发
+        # （reload 会再派一次 → 流程跑两遍，第二遍什么都连不上）。
+        webview.start(lambda: self._work(serve))
+
+    def _work(self, serve) -> None:
+        try:
+            self._attach()
+            self._ready = True
+        except Exception as exc:
+            self._last = f"{type(exc).__name__}: {exc}"
+            self._ready = False
+        if serve is not None:
+            try:
+                serve(self)
+            except Exception as exc:
+                self._last = f"{type(exc).__name__}: {exc}"
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+    def _wait_cdp(self, timeout: float = 40) -> None:
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            try:
+                with socket.create_connection(("127.0.0.1", self.cdp_port), 1):
+                    return
+            except Exception:
+                time.sleep(0.2)
+        raise RuntimeError(f"这段时间里没有出现 CDP 端口 {self.cdp_port}"
+                           "（窗口没起来？或者 WebView2 没起来）")
+
+    def _attach(self) -> None:
+        from playwright.sync_api import sync_playwright
+
+        self._wait_cdp()
+        self._pw = sync_playwright().start()
+        self._br = self._pw.chromium.connect_over_cdp(
+            f"http://127.0.0.1:{self.cdp_port}")
+        self.engine = self._br.version
+        ctx = self._br.contexts[0]
+        pages = [p for p in ctx.pages if f"127.0.0.1:{self.host_port}" in p.url] or ctx.pages
+        if not pages:
+            raise RuntimeError("CDP 连上了，但一个 page target 都没有")
+        self.page = pages[0]
+        self.page.on("console", self._on_console)
+        self.page.on("pageerror", lambda e: self.errors.append(str(e)))
+        self.page.on("requestfailed", self._on_failed)
+        self.page.on("response", self._on_response)
+        # attach 之后 reload：加载期的事件（更容易出错的那一批）现在收得到。
+        # 页面本身一个字不动 —— 代价是它加载了两次，第一次的 console 拿不到。
+        self.page.reload(wait_until="load")
+        self._settle()
+
+    def _on_failed(self, r) -> None:
+        """请求失败。**原因要记下来** —— 不然 `net::ERR_ABORTED`（我们自己 reload
+        打断了加载期正在飞的请求）会和真失败混成一栏，把页面判成有 bug。"""
+        try:
+            why = str(getattr(r, "failure", "") or "")
+        except Exception:
+            why = ""
+        if "ERR_ABORTED" in why:
+            self.aborted.append(f"{why} {r.url}")
+        else:
+            self.network.append(f"{why or 'failed'} {r.url}")
+
+    def _on_console(self, msg) -> None:
+        self.console.append({"type": msg.type, "text": msg.text})
+
+    def _on_response(self, r) -> None:
+        try:
+            if r.status >= 400:
+                self.network.append(f"{r.status} {r.url}")
+        except Exception:
+            pass
+
+    def _settle(self, ms: int = 900) -> None:
+        """等页面把该画的画完。Iframe 的加载不一定落在主 frame 的 load 之后。"""
+        t0 = time.time()
+        while time.time() - t0 < ms / 1000:
+            try:
+                r = self.page.evaluate(FRAME_JS)
+                if isinstance(r, dict) and r.get("nodes", 0) > 0 and r.get("ready") == "complete":
+                    return
+            except Exception:
+                pass
+            time.sleep(0.1)
+        self.page.wait_for_timeout(ms)
+
+    # -- 命令 -------------------------------------------------------
+    def _target(self, which: str = "page"):
+        """求值的对象：``page`` = 插件页面的那个 iframe，``host`` = 外壳。
+
+        为什么默认是 iframe：agent 要验的是**自己的页面**。让它每次都自己写
+        ``contentDocument`` 前缀，等于把「我在看哪一层」压在记忆里 —— 十个调用
+        写错一个，就会得到一个看起来很有道理、其实在说壳的结论。
+        """
+        if self.page is None:
+            return None
+        if which == "host":
+            return self.page
+        for f in self.page.frames:
+            if f is self.page.main_frame:
+                continue
+            if f"plugin/{self.pid}" in (f.url or ""):
+                return f
+        for f in self.page.frames:          # 兜底：本页确实只有一个子 frame
+            if f is not self.page.main_frame:
+                return f
+        return self.page
+
+    def eval(self, js: str, frame: str = "page") -> dict:
+        """跑一段 JS。表达式优先，语句兜底 —— 两条路都返回「值或为什么没有值」。"""
+        if self.page is None:
+            return {"ok": False, "error": self._why_not_ready()}
+        target = self._target(frame)
+        if target is None:
+            return {"ok": False, "error": self._why_not_ready()}
+        wrapped = False
+        try:
+            value = target.evaluate(SERIALIZER % js)
+        except Exception as exc:
+            if "SyntaxError" not in str(exc) and "Unexpected" not in str(exc):
+                return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:400]}"}
+            wrapped = True
+            try:
+                value = target.evaluate(js)
+            except Exception as exc2:
+                return {"ok": False, "wrapped": True,
+                        "error": f"{type(exc2).__name__}: {str(exc2)[:400]}"}
+        out = {"ok": True, "value": value, "wrapped": wrapped, "frame": frame}
+        if isinstance(value, str) and len(value) > MAX_VALUE:
+            out["value"] = value[:MAX_VALUE]
+            out["truncated"] = len(value)
+            out["spilled"] = self._spill(value, "eval")
+        return out
+
+    def _spill(self, text: str, slug: str) -> str:
+        d = CACHE / self.pid / "spill"
+        d.mkdir(parents=True, exist_ok=True)
+        name = f"{time.strftime('%Y%m%d-%H%M%S')}-{slug}.txt"
+        (d / name).write_text(text, encoding="utf-8")
+        return str(d / name)
+
+    def shot(self, full: bool = False) -> dict:
+        if self.page is None:
+            return {"ok": False, "error": self._why_not_ready()}
+        png = self.page.screenshot(full_page=bool(full))
+        d = CACHE / self.pid / "shots"
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{time.strftime('%Y%m%d-%H%M%S')}.png"
+        path.write_bytes(png)
+        facts = self._facts()
+        return {"ok": True, "path": str(path), "bytes": len(png),
+                "b64": base64.b64encode(png).decode(), "mime": "image/png",
+                "name": f"{self.pid}-page.png", "sizes": facts}
+
+    def _facts(self) -> dict:
+        try:
+            d = self.page.evaluate(DESKTOP_JS)
+        except Exception:
+            d = {}
+        d = d or {}
+        return {"inner": [d.get("winW"), d.get("winH")],
+                "dpr": d.get("dpr"),
+                "frame": [d.get("frameW"), d.get("frameH")],
+                "chatW": d.get("chatW"),
+                "requested": [self.width, self.height]}
+
+    def _why_not_ready(self) -> str:
+        return ("窗口没起来：" + self._last) if self._last else "窗口还没就绪"
+
+    def resize(self, width: int) -> dict:
+        if self.win is None:
+            return {"ok": False, "error": self._why_not_ready()}
+        try:
+            self.win.resize(int(width), self.height)
+            self.page.wait_for_timeout(400)
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {"ok": True, "sizes": self._facts()}
+
+    # -- 逐面看 -----------------------------------------------------
+    def check(self, areas=None, want_shot: bool = False,
+              allow_interactive: bool = True) -> dict:
+        if self.page is None:
+            return {"ok": False, "error": self._why_not_ready()}
+        # sync API 的事件是「下一次调用时 pump」的，不是后台线程派发的。
+        # 不 pump 这一下，只跑 network / console 那些**不碰 Playwright** 的面时，
+        # 队列里攒着的 console.error 与 404 一条都取不出来 —— 而报告会显示「全绿」。
+        try:
+            self.page.wait_for_timeout(80)
+        except Exception:
+            pass
+        picks = list(areas) if areas else list(DEFAULT_AREAS)
+        rows: list[dict] = []
+        skipped: list[dict] = []
+        if not self.plugin.get("has_ui"):
+            skipped.append({"name": "全部页面面", "why": self.plugin.get("why") or "没有页面"})
+            return {"ok": True, "pid": self.pid, "plugin": self.plugin,
+                    "engine": {"browser": self.engine, "engine": "webview2"},
+                    "sizes": self._facts(), "areas": rows, "skipped": skipped,
+                    "console": self.console, "network": self.network,
+                    "pageerrors": self.errors, "shot": None}
+
+        frame_open = bool(self.plugin.get("has_ui"))
+
+        def area(name: str):
+            def deco(fn):
+                if name in picks and frame_open:
+                    try:
+                        rows.append(fn())
+                    except Exception as exc:
+                        rows.append({"name": name, "ok": False,
+                                     "detail": f"这一面自己炸了：{type(exc).__name__}: {exc}"})
+                elif name not in picks:
+                    skipped.append({"name": name, "why": "这次没要求跑它"})
+                else:
+                    skipped.append({"name": name, "why": "这个程序没有页面"})
+                return fn
+            return deco
+
+        @area("load")
+        def _load() -> dict:
+            f = self.page.evaluate(FRAME_JS) or {}
+            ok = (not f.get("__no_frame__") and not f.get("__no_doc__")
+                  and (f.get("nodes") or 0) > 0 and (f.get("frameW") or 0) > 100)
+            return {"name": "页面真的画出来了（iframe 里有节点、有宽度）", "ok": bool(ok),
+                    "detail": json.dumps(f, ensure_ascii=False)[:400]}
+
+        @area("console")
+        def _console() -> dict:
+            bad = [c for c in self.console if c["type"] in ("error",)]
+            ok = not bad and not self.errors
+            return {"name": "页面没有 console.error、没有未捕获异常", "ok": ok,
+                    "detail": json.dumps({"console": bad[-6:], "pageerror": self.errors[-6:]},
+                                         ensure_ascii=False)[:600]}
+
+        @area("network")
+        def _network() -> dict:
+            detail = json.dumps(self.network[-8:], ensure_ascii=False)[:600]
+            if self.aborted:
+                detail += f"（另有 {len(self.aborted)} 个请求被 reload 打断，不算失败）"
+            return {"name": "没有失败 / 4xx / 5xx 的请求", "ok": not self.network,
+                    "detail": detail}
+
+        @area("overflow")
+        def _overflow() -> dict:
+            f = self.page.evaluate(FRAME_JS) or {}
+            sw, cw = f.get("scrollW") or 0, f.get("clientW") or 0
+            ok = cw > 0 and sw <= cw + 1
+            return {"name": "页面没有横向溢出（没有东西被挤出可视区）", "ok": ok,
+                    "detail": f"scrollWidth={sw} clientWidth={cw}"}
+
+        @area("contrast")
+        def _contrast() -> dict:
+            f = self.page.evaluate(FRAME_JS) or {}
+            ratio = _contrast_ratio(f.get("bg"), f.get("fg"))
+            return {"name": "文字与背景有对比度（不是同色、不是看不见）",
+                    "ok": ratio is None or ratio >= 2.0,
+                    "detail": f"bg={f.get('bg')} fg={f.get('fg')} 对比度={ratio}"}
+
+        @area("narrow")
+        def _narrow() -> dict:
+            before = self._facts()
+            self.resize(NARROW)
+            f = self.page.evaluate(FRAME_JS) or {}
+            homes = self.page.evaluate(DESKTOP_JS) or {}
+            self.resize(self.width)
+            self.page.wait_for_timeout(250)
+            sw, cw = f.get("scrollW") or 0, f.get("clientW") or 0
+            ok = cw >= 300 and sw <= cw + 1 and (homes.get("chatW") or 0) >= 240
+            return {"name": f"窄到 {NARROW}px 时不塌（页面与对话都还在，没横向溢出）",
+                    "ok": bool(ok),
+                    "detail": f"窄时 frameW={cw} scrollW={sw} chatW={homes.get('chatW')}"
+                              f"（原宽 {before.get('frame')}）"}
+
+        @area("interactive")
+        def _interactive() -> dict:
+            if not allow_interactive:
+                skipped.append({"name": "interactive",
+                                "why": "real 模式下不点你的真页面（点下去是真发消息）"})
+                return {"name": "跳过", "ok": True}
+            n0 = len(self.errors)
+            clicked = self.page.evaluate(CLICK_JS) or []
+            self.page.wait_for_timeout(500)
+            fresh = self.errors[n0:]
+            bad = [c for c in clicked if not c.get("ok")]
+            ok = not fresh and not bad
+            return {"name": "点一遍可点控件之后没有新报错", "ok": bool(ok),
+                    "detail": f"点了 {len(clicked)} 个；新报错 {fresh[:3]}；点击失败 {bad[:3]}"}
+
+        out = {"ok": True, "pid": self.pid, "plugin": self.plugin,
+               "engine": {"browser": self.engine, "engine": "webview2"},
+               "sizes": self._facts(), "areas": rows, "skipped": skipped,
+               "console": self.console, "network": self.network,
+               "aborted": self.aborted,
+               "pageerrors": self.errors, "shot": None}
+        if want_shot:
+            s = self.shot()
+            if s.get("ok"):
+                out["shot"] = s["path"]
+                out["_png"] = s["b64"]
+        return out
+
+    def destroy(self) -> None:
+        self._closing = True
+        try:
+            if self._br is not None:
+                self._br.close()
+        except Exception:
+            pass
+        try:
+            if self._pw is not None:
+                self._pw.stop()
+        except Exception:
+            pass
+        self._br = self._pw = None
+        try:
+            if self.win is not None:
+                self.win.destroy()
+        except Exception:
+            pass
+        self.win = None
+        kill_tree(self.host)
+        self.host = None
+
+
+def _contrast_ratio(bg: str | None, fg: str | None) -> float | None:
+    """两个 CSS 颜色的对比度。算不出来就说算不出来（None），不猜。"""
+    def lum(c: str) -> float | None:
+        if not c:
+            return None
+        nums = [int(float(x)) for x in c.replace("rgba(", "").replace("rgb(", "")
+                .replace(")", "").split(",")[:3]]
+        if len(nums) < 3:
+            return None
+        def f(v: float) -> float:
+            v = v / 255
+            return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+        r, g, b = (f(v) for v in nums)
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    try:
+        a, b = lum(bg), lum(fg)
+    except Exception:
+        return None
+    if a is None or b is None:
+        return None
+    hi, lo = max(a, b), min(a, b)
+    return round((hi + 0.05) / (lo + 0.05), 2)
+
+
+# ------------------------------------------------------------------ 两种入口
+
+def serve_socket(w: Worker, conn: socket.socket) -> None:
+    """给 devtools 用：一行一个 JSON 命令，一行一个 JSON 回答。"""
+    def send(obj: dict) -> None:
+        conn.sendall((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+
+    send({"ok": bool(w._ready), "event": "ready", "engine": w.engine,
+          "error": None if w._ready else w._why_not_ready(),
+          "plugin": w.plugin, "sizes": w._facts() if w._ready else {}})
+    if not w._ready:
+        return
+    buf = b""
+    conn.settimeout(IDLE)
+    while not w._closing:
+        try:
+            chunk = conn.recv(65536)
+        except socket.timeout:
+            break
+        except Exception:
+            break
+        if not chunk:
+            break
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            if not line.strip():
+                continue
+            try:
+                req = json.loads(line.decode("utf-8"))
+            except Exception as exc:
+                send({"ok": False, "error": f"请求不是 JSON：{exc}"})
+                continue
+            op = req.get("op")
+            if op == "eval":
+                send(w.eval(req.get("js") or "", req.get("frame") or "page"))
+            elif op == "shot":
+                send(w.shot(bool(req.get("full"))))
+            elif op == "check":
+                send(w.check(req.get("areas"), bool(req.get("shot")),
+                             allow_interactive=not req.get("real")))
+            elif op == "resize":
+                send(w.resize(int(req.get("width") or NARROW)))
+            elif op == "info":
+                send({"ok": True, "engine": w.engine, "plugin": w.plugin,
+                      "sizes": w._facts(), "url": w.url()})
+            elif op == "close":
+                send({"ok": True, "closed": True})
+                w._closing = True
+            else:
+                send({"ok": False, "error": f"不认识的 op：{op!r}"})
+
+
+def serve_script(w: Worker, box: dict) -> None:
+    """给人用：把命令行要求的那几步跑完，结果放 box。"""
+    box["engine"] = w.engine
+    box["plugin"] = w.plugin
+    if box.get("check"):
+        box["report"] = w.check(box.get("areas"), bool(box.get("shot_out")),
+                                allow_interactive=not box.get("real"))
+        # 脚本入口只给路径：base64 进终端是 200KB 噪声，而图已经落盘了
+        box["report"].pop("_png", None)
+    if box.get("js"):
+        box["eval"] = w.eval(box["js"], box.get("frame") or "page")
+    if box.get("shot_out"):
+        s = w.shot()
+        if s.get("ok"):
+            Path(box["shot_out"]).write_bytes(base64.b64decode(s["b64"]))
+            box["shot"] = s["path"]
+        else:
+            box["shot_error"] = s.get("error")
+    box["sizes"] = w._facts()
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="agentworkspace.pagecheck",
+                                 description="在真窗口真引擎里看自己的页面")
+    ap.add_argument("--pid", required=True, help="哪个程序的页面")
+    ap.add_argument("--workspace", default=None, help="真工作区路径（默认仓库 workspace/）")
+    ap.add_argument("--mode", default="copy", choices=("copy", "real"),
+                    help="copy=复制一份跑（默认，不碰你的数据）；real=连你正在跑的宿主")
+    ap.add_argument("--host-port", type=int, default=0,
+                    help="real 模式要：正在运行的那个宿主的端口")
+    ap.add_argument("--viewport", default="pane", choices=tuple(VIEWPORTS))
+    ap.add_argument("--width", type=int, default=0, help="窗口宽度（覆盖 viewport）")
+    ap.add_argument("--eval", dest="js", default="", help="跑一段 JS，打印结果")
+    ap.add_argument("--frame", default="page", choices=("page", "host"),
+                    help="在哪一层求值：page=插件页面（默认） / host=外壳")
+    ap.add_argument("--check", action="store_true", help="逐面检查并打印报告")
+    ap.add_argument("--areas", default="", help="只跑这几面，逗号分隔")
+    ap.add_argument("--shot", dest="shot_out", default="", help="截一张图存到这个路径")
+    ap.add_argument("--json", action="store_true", help="打印完整 JSON（默认也是 JSON）")
+    ap.add_argument("--worker", action="store_true", help="常驻会话模式（给 devtools）")
+    ap.add_argument("--port", type=int, default=0, help="worker 模式：命令端口")
+    ap.add_argument("--no-relaunch", action="store_true", help="不要重投到交互式会话")
+    args = ap.parse_args(argv)
+
+    # 会话 0（服务/无窗口站）起不了 WebView2 → 重投到交互式桌面。
+    # 这条判断必须在**起窗口之前**做，而且 --no-relaunch 之后不再重投（否则无限套娃）。
+    if not args.no_relaunch:
+        from . import qa
+        _, visible = qa.station()
+        if not visible:
+            again = [x for x in (argv if argv is not None else sys.argv[1:])]
+            code = qa.relaunch_in_active_session(
+                [sys.executable, "-X", "utf8", "-m", "agentworkspace.pagecheck",
+                 *again, "--no-relaunch"])
+            if code is not None:
+                return code
+
+    box: dict = {}
+    listener = None
+    conn = None
+    # 端口先占住：之后**任何一步**失败，都能用同一份协议把原因说出来。
+    # 反过来的次序（先把活干完再 bind）在失败时只剩「退出码 1」可看 ——
+    # 而重投到交互式会话之后，stdout 已经不在 devtools 手里了。
+    if args.worker:
+        listener = socket.socket()
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", args.port))
+        listener.listen(1)
+        listener.settimeout(90)
+
+    src = Path(args.workspace) if args.workspace else (ROOT / "workspace")
+    host = None
+    host_port = args.host_port
+    w = None
+    try:
+        ws, temp = prepare(src, args.pid, args.mode, tag="pagecheck")
+        cdp = free_port()
+        # 必须在 import webview **之前**设：WebView2 在创建环境时读它。
+        os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = \
+            f"--remote-debugging-port={cdp}"
+        if args.mode == "copy":
+            host, host_port = spawn_host(ws, args.pid, CACHE / args.pid / "host.log")
+        elif not host_port:
+            raise RuntimeError("real 模式要给 --host-port（宿主端口）")
+
+        w = Worker(args.pid, ws, host_port, cdp, args.viewport, args.width or None)
+        w.host = host
+        if listener is not None:
+            conn, _ = listener.accept()        # 先握手，让对面知道进程活着
+            w.run(lambda wk: serve_socket(wk, conn))
+        else:
+            box.update(check=args.check, js=args.js, shot_out=args.shot_out,
+                       frame=args.frame,
+                       areas=[a for a in args.areas.split(",") if a.strip()] or None,
+                       real=(args.mode == "real"))
+            w.run(lambda wk: serve_script(wk, box))
+    except Exception as exc:                   # noqa: BLE001
+        why = f"{type(exc).__name__}: {exc}"
+        if listener is not None:
+            try:
+                if conn is None:
+                    listener.settimeout(20)
+                    conn, _ = listener.accept()
+                conn.sendall((json.dumps({"ok": False, "event": "ready",
+                                          "error": why}, ensure_ascii=False)
+                              + "\n").encode("utf-8"))
+            except Exception:
+                pass
+            return 1
+        raise
+    finally:
+        for s in (conn, listener):
+            try:
+                if s is not None:
+                    s.close()
+            except Exception:
+                pass
+        kill_tree(host)
+        if temp:
+            pass                                # 副本留着给人看：截图/日志都在里面
+
+    if listener is not None:
+        return 0 if (w is not None and w._ready) else 1
+    print(json.dumps(box, ensure_ascii=False, indent=2, default=str), flush=True)
+    if box.get("eval") and not box["eval"].get("ok"):
+        return 1
+    return 0 if not box.get("shot_error") else 1
+
+
+def __main__(argv: list[str] | None = None) -> int:
+    """命令行入口。"""
+    return main(argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(__main__())

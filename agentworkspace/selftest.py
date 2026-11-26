@@ -607,10 +607,11 @@ def _run() -> int:
           r.get("status") == "ok" and r.get("dev") is True, str(r)[:140])
     dev_caps = sorted(rt.capabilities_of(pid))
     borrowed = [w for w in dev_caps if not w.startswith(pid + "_")]
-    check("打开后借到的**恰好**是这十项（多一项都算越界）",
-          borrowed == ["dev_diff", "dev_host_services", "dev_plugin_write", "dev_read",
-                       "dev_revert", "dev_search", "dev_show", "dev_tree",
-                       "dev_versions", "dev_write"],
+    check("打开后借到的**恰好**是这十五项（多一项都算越界）",
+          borrowed == ["dev_diff", "dev_host_services", "dev_page_check", "dev_page_close",
+                       "dev_page_eval", "dev_page_open", "dev_page_shot",
+                       "dev_plugin_write", "dev_read", "dev_revert", "dev_search",
+                       "dev_show", "dev_tree", "dev_versions", "dev_write"],
           str(borrowed))
     check("借来的手里**没有**一件能动历史的危险动作（remote/push/branch/reset…）",
           not any(k in w for w in borrowed for k in
@@ -1718,7 +1719,10 @@ def _run() -> int:
            if re.search(r"\*\*[^*\n]+\*\*|`", t)]
     check("模型可见文字里没有 markdown 强调 / 反引号（tool schema 不渲染它，只是白花 token）",
           not _md, str(_md[:4]))
-    for _pid, _lim in (("assistant", 600), ("dev", 660)):
+    # dev 的预算随能力面走：第 43 轮加了 5 个页面动词（10 → 15 个，+50%），
+    # 660 → 1000 是同一个比例。**别在没加动词的时候动这个数** —— 它存在的意义
+    # 就是「加一句就得先删一句」，随手调大等于把这条门删了。
+    for _pid, _lim in (("assistant", 600), ("dev", 1000)):
         _n = sum(len(c.description)
                  + sum(len(s.get("description") or "")
                        for s in (c.parameters.get("properties") or {}).values())
@@ -2303,6 +2307,57 @@ def _run() -> int:
               toolbox._RT is _prev_tb and _devtools._RT is _prev_dv,
               f"toolbox._RT={getattr(toolbox._RT, 'root', None)!r}")
         shutil.rmtree(tmp6, ignore_errors=True)
+
+    # D10 段：页面自查（dev_page_*）—— **不起窗口**的那一半。
+    # 起窗口的 21+20 项在 _tmp/p43_gates.py 与 _tmp/p43_e2e.py：它们必须在交互式
+    # 桌面里跑，而 selftest 可能在 Session 0（那里起不了 WebView2）。这里只验
+    # 「不需要窗口也能证伪」的东西 —— 签名、边界、算术、管道。
+    print("\n[D10] 页面自查：签名 / 边界 / 管道（真窗口那一半见 _tmp/p43_*.py）")
+    import inspect as _insp
+
+    from . import devtools as _dt
+    from . import link as _lk
+    from . import pagecheck as _pc
+
+    sig_o = set(_insp.signature(_dt.page_open).parameters)
+    check("D10a dev_page_open 没有 url 参数（验的只能是自己那个页面，不是通用爬虫）",
+          "url" not in sig_o and {"workspace", "viewport"} <= sig_o, sorted(sig_o))
+    sig_e = set(_insp.signature(_dt.page_eval).parameters)
+    check("D10b dev_page_eval 默认在自己的页面里求值（frame: page / host）",
+          sig_e == {"js", "sid", "frame"}, sorted(sig_e))
+    check("D10c 求值器会 await（不 await 的话 (async()=>42)() 会序列化成 {}）",
+          "await" in _pc.SERIALIZER and "async" in _pc.SERIALIZER, "")
+
+    p_ok = _pc.plugin_of(Path("workspace"), "dingtalk")
+    p_no = _pc.plugin_of(Path("workspace"), "no-such-plugin")
+    check("D10d 有页面的程序认得出（entry 指向真文件）",
+          p_ok["has_ui"] and Path(p_ok.get("index") or "").exists(), p_ok.get("why"))
+    check("D10e 不存在的程序说「没有这个程序」，不说「页面有问题」",
+          not p_no["has_ui"] and "没有这个程序" in p_no["why"], p_no.get("why"))
+
+    check("D10f 对比度算得对（黑白 21:1，同色 1:1）",
+          _pc._contrast_ratio("rgb(0,0,0)", "rgb(255,255,255)") == 21.0
+          and _pc._contrast_ratio("rgb(9,9,9)", "rgb(9,9,9)") == 1.0,
+          f"{_pc._contrast_ratio('rgb(0,0,0)', 'rgb(255,255,255)')}")
+
+    _t, _d, _im = kernel.Runtime._split(
+        {"text": "a", "images": [{"raw": b"x"}], "k": 1})
+    check("D10g 三态拆分：images 从 data 里摘出去（否则 json.dumps 撞上 bytes）",
+          _t == "a" and _im == [{"raw": b"x"}] and _d == {"k": 1},
+          f"{_t} / {_d} / {_im}")
+
+    _parts = _lk._image_parts([{"raw": b"\x89PNG", "mime": "image/png", "name": "p.png"}])
+    check("D10h 图能翻成 Part.image（这条断了，agent 永远看不见截图）",
+          len(_parts) == 1 and _parts[0].file is not None, _parts)
+
+    _miss = _dt.page_eval("1+1")
+    check("D10i 没开会话时给一句人话（不抛异常、不说「未知」）",
+          "dev_page_open" in str(_miss.get("text")), _miss)
+
+    _env = _dt._child_env()
+    check("D10j 子进程 env 里钉着包根（工作区里 cwd 不含包，全靠它）",
+          str(Path(_pc.__file__).resolve().parent.parent) in str(_env.get("PYTHONPATH")),
+          _env.get("PYTHONPATH"))
 
     # E 段：事件日志必须有**上界**。
     # 旧实现只 append、从不轮转：真实工作区的 workspace/logs/events.jsonl 已经

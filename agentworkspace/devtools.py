@@ -11,6 +11,24 @@
     写：``dev_write``         —— 工作区内的普通文件（不碰程序目录、不碰开关）
     改：``dev_plugin_write``  —— 改**自己**：**没有 pid 参数**，改别人在签名上就不可能
     退：``dev_revert``        —— 回到某一版：语义是「把那一版再提交一次」，不是 reset
+    验：``dev_page_open`` ``dev_page_eval`` ``dev_page_shot`` ``dev_page_check``
+        ``dev_page_close``    —— 在**真窗口、真引擎**里看自己的页面
+
+「验」这一组为什么是五个而不是十个：``wait`` / ``click`` / ``scroll`` / ``read``
+全是 ``dev_page_eval`` 的特例。每多一个动词，就要在提示词解释一次、schema 写
+一遍、selftest 验一次 —— 而它们都只是「跑一段 JS」。万能动词 + 一条语义说明，
+比十个别名准确。
+
+为什么 ``dev_page_eval`` 可以跑任意 JS：**这个能力本来就在仓库里**。
+``uiprobe._probe()`` 里有十余处 ``win.evaluate_js(...)``（读 DOM、点按钮、
+派发键盘事件），它早就在对真窗口做任意 JS —— 缺的只是把 JS 从文件挪到参数里。
+而那份写死的必然腐烂：``#setbtn`` / ``#setmsg`` 这些选择器，插件页面改一次名
+就静默失效一次（它有 skip 分支，所以是**静默**）。
+
+「eval 会读到 ``S.settings.token``」不是理由：``dev_read("config.json")``
+今天就能拿到同一份 token，而 ``config.json`` 就在工作区根。真正的边界是
+**开发者模式本身**（``_me()`` 拿不到 caller 就直接说这条路只给开发者模式用），
+不是某个动词的粒度。用错的理由守对的事，守不住的从来不是那件事。
 
 没有 ``plugin_list`` / ``plugin_call`` / ``plugin_delete`` / ``plugin_verify`` /
 ``shell`` —— 开发者模式是「给你一把改自己的螺丝刀」，不是「给你一整套造别人
@@ -34,6 +52,12 @@ reset / clean / rebase，没有任意 sha，也不跨插件。跨机器同步是
 
 from __future__ import annotations
 
+import base64
+import json
+import os
+import socket
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -413,3 +437,340 @@ def revert(version: str, paths: list[str] | None = None, why: str = "") -> dict:
         + " —— 那是校验挡住或你只要了部分文件）" if remain else
         "\n（工作树已与那一版一致。）")
     return out
+
+
+# ------------------------------------------------------------------ 验
+# 一个页面会话 = 一个真窗口（pywebview / WebView2）+ 一条 CDP 观察通道。
+# 常驻的理由不是省事：一次性批跑做不了「看一眼 → 改一处 → 再看一眼」，
+# 而那正是页面调试的全部内容。
+
+_PAGE: dict[str, dict] = {}        # sid → 会话
+PAGE_IDLE = 300                    # 没有命令这么久就自己收尸
+PAGE_READY = 150                   # 起窗口 + 连 CDP 的上限（秒）
+PAGE_CMD = 180                     # 单条命令的上限（截图/逐面检查会慢）
+
+
+def _page_reap() -> None:
+    """把闲置太久的会话收掉。**每次调用都做** —— 没有后台线程，就没有「忘了关」。"""
+    now = time.time()
+    for sid, s in list(_PAGE.items()):
+        if now - s["at"] > PAGE_IDLE:
+            _page_kill(sid)
+
+
+def _page_kill(sid: str) -> None:
+    s = _PAGE.pop(sid, None)
+    if not s:
+        return
+    for key in ("sock", "fh"):
+        try:
+            s[key].close()
+        except Exception:
+            pass
+    proc = s.get("proc")
+    if proc is not None and proc.poll() is None:
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=20)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def _page_pick(sid: str) -> str:
+    """没点名就用唯一那个会话；有多个就**如实说**，别猜。"""
+    if sid:
+        if sid not in _PAGE:
+            raise ValueError(f"没有这个页面会话：{sid!r}（现有：{sorted(_PAGE) or '无'}）")
+        return sid
+    if len(_PAGE) == 1:
+        return next(iter(_PAGE))
+    if not _PAGE:
+        raise ValueError("还没有页面会话：先 dev_page_open()")
+    raise ValueError(f"有 {len(_PAGE)} 个页面会话，得点名：{sorted(_PAGE)}")
+
+
+def _page_cmd(sid: str, req: dict, timeout: float = PAGE_CMD) -> dict:
+    s = _PAGE[sid]
+    s["at"] = time.time()
+    s["sock"].settimeout(timeout)
+    s["sock"].sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+    buf = s["buf"]
+    while b"\n" not in buf:
+        chunk = s["sock"].recv(1 << 20)
+        if not chunk:
+            raise ValueError("页面会话断了（窗口被关掉了？）")
+        buf += chunk
+    line, s["buf"] = buf.split(b"\n", 1)
+    return json.loads(line.decode("utf-8"))
+
+
+def _page_log_tail(sid: str, n: int = 900) -> str:
+    s = _PAGE.get(sid) or {}
+    log = s.get("log")
+    try:
+        return Path(log).read_text(encoding="utf-8", errors="replace")[-n:] if log else ""
+    except Exception:
+        return ""
+
+
+def _child_env() -> dict:
+    """给子进程的环境：把**包根**钉进 PYTHONPATH，其余原样继承。"""
+    import agentworkspace as pkg
+
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    root = str(Path(pkg.__file__).resolve().parent.parent)
+    old = env.get("PYTHONPATH") or ""
+    env["PYTHONPATH"] = root if not old else (root + os.pathsep + old)
+    return env
+
+
+def page_open(viewport: str = "pane", workspace: str = "copy") -> dict:
+    """开一个真窗口看自己的页面，之后一直用它。
+
+    引擎是 pywebview / WebView2 —— 生产里插件页面就是它渲染的，不是 Chrome。
+    窗口开在屏幕外（x=-3000）：既合成帧（能截图），又不挡你。
+
+    viewport: pane（默认，1180 宽，与生产一致）或 desktop（1600 宽）
+    workspace: copy（默认，复制一份跑，不碰你的数据）或 real（连你正在跑的宿主）
+    """
+    _page_reap()
+    me = _me()
+    root = _rt().root.resolve()
+    from . import pagecheck
+
+    port = pagecheck.free_port()
+    argv = [sys.executable, "-X", "utf8", "-m", "agentworkspace.pagecheck",
+            "--worker", "--port", str(port), "--pid", me,
+            "--workspace", str(root), "--mode", workspace, "--viewport", viewport]
+    if workspace == "real":
+        hp = int(getattr(_rt(), "port", 0) or 0)
+        if not hp:
+            return {"text": "real 模式要连你正在跑的那个宿主，但这个宿主不是带界面启动的"
+                            "（没有端口）。改用 workspace=\"copy\"。"}
+        argv += ["--host-port", str(hp)]
+
+    log = root / ".dev-cache" / me / "worker.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(log, "w", encoding="utf-8", buffering=1)
+    # cwd 是工作区（不是包所在的仓库根），所以 `-m agentworkspace.pagecheck`
+    # 得靠 PYTHONPATH 才 import 得到。生产装了包时这条是多余的，开发时是必需的 ——
+    # 而开发者模式主要在开发时用。
+    proc = subprocess.Popen(argv, cwd=str(root), stdout=fh, stderr=subprocess.STDOUT,
+                            env=_child_env())
+
+    sid = f"page{len(_PAGE) + 1}"
+    _PAGE[sid] = {"proc": proc, "fh": fh, "log": log, "at": time.time(),
+                  "buf": b"", "sock": None, "real": workspace == "real",
+                  "viewport": viewport}
+
+    # 连上去：worker 先 bind 再干活，所以这一步很快（真正的等待在 ready 上）
+    t0 = time.time()
+    sock = None
+    while time.time() - t0 < 60:
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), 2)
+            break
+        except Exception:
+            if proc.poll() is not None:
+                _page_kill(sid)
+                return {"text": f"页面自查进程起不来（退出码 {proc.returncode}）：\n"
+                                f"{_page_log_tail(sid)}"}
+            time.sleep(0.2)
+    if sock is None:
+        _page_kill(sid)
+        return {"text": "60 秒内没连上页面自查进程（它可能卡在起窗口那一步）"}
+    _PAGE[sid]["sock"] = sock
+
+    # 等 ready：起宿主 + 起窗口 + 连 CDP + reload，全在这一步里
+    sock.settimeout(PAGE_READY)
+    buf = b""
+    try:
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    except socket.timeout:
+        _page_kill(sid)
+        return {"text": f"{PAGE_READY} 秒内窗口没就绪：\n{_page_log_tail(sid)}"}
+    if b"\n" not in buf:
+        _page_kill(sid)
+        return {"text": f"页面自查进程没回话就退了：\n{_page_log_tail(sid)}"}
+    line, rest = buf.split(b"\n", 1)
+    _PAGE[sid]["buf"] = rest
+    hello = json.loads(line.decode("utf-8"))
+    if not hello.get("ok"):
+        why = hello.get("error") or "窗口没起来"
+        _page_kill(sid)
+        return {"text": f"窗口没起来：{why}\n\n{_page_log_tail(sid)}"}
+
+    plugin = hello.get("plugin") or {}
+    sizes = hello.get("sizes") or {}
+    lines = [f"页面会话 {sid} 开好了（{me} · 真窗口 · WebView2 {hello.get('engine')}）",
+             f"  窗口 {sizes.get('requested')} → 实测 {sizes.get('inner')}"
+             f"（dpr {sizes.get('dpr')}）；页面区 {sizes.get('frame')}"]
+    if not plugin.get("has_ui"):
+        lines.append(f"  ⚠ {plugin.get('why') or '这个程序没有页面'}")
+    else:
+        lines.append(f"  页面：{plugin.get('entry')}")
+    lines += ["", "接着用：dev_page_eval(js) / dev_page_shot() / dev_page_check() / "
+                   "dev_page_close()"]
+    return {"text": "\n".join(lines), "sid": sid, "engine": hello.get("engine"),
+            "plugin": plugin, "sizes": sizes}
+
+
+def page_eval(js: str, sid: str = "", frame: str = "page") -> dict:
+    """在自己的页面里跑一段 JS，把结果拿回来。
+
+    语义（每条都是会踩的坑）：
+      * **表达式优先**：``1+1`` → 2，``document.title`` → 字符串。
+      * **语句兜底**：``let a=1; a*2`` 会先当表达式跑（SyntaxError），再包成
+        函数重跑，返回里带 ``wrapped: true`` 告诉你发生过什么。
+      * **await 直接可用**：``await fetch('/api/state').then(r=>r.json())``。
+        （``uiprobe`` 里那套轮询是「没得 await 时的妥协」，不是方法。）
+      * **DOM 节点不报错**：返回 ``{__t:'node', tag, id, cls, text, html}``。
+        返回 ``{ok:false}`` 只会让你去改**没写错的那一行**。
+      * **导航会毁掉执行上下文**：``location.reload()`` 之后返回
+        ``navigated: true`` —— 那是事实，不是错误。
+      * 返回值超过 4000 字符会落盘，返回里给路径。
+
+    默认在**你自己的页面**（那个 iframe）里求值 —— 所以 ``document.title``
+    拿到的是你页面的标题，``document.querySelector('#btn')`` 找的是你页面上的按钮。
+    要看外壳（左侧栏、对话面板）时传 ``frame="host"``。
+
+    js: 要跑的 JS
+    sid: 页面会话（只有一个时可以不给）
+    frame: page（默认，自己的页面）或 host（外壳）
+    """
+    try:
+        sid = _page_pick(sid)
+        r = _page_cmd(sid, {"op": "eval", "js": js, "frame": frame})
+    except Exception as exc:
+        return {"text": f"{type(exc).__name__}: {exc}"}
+    if not r.get("ok"):
+        err = str(r.get("error") or "")
+        if "Execution context was destroyed" in err or "navigat" in err.lower():
+            return {"text": "这段 JS 让页面导航走了（执行上下文被销毁）—— 这是事实，"
+                            "不是错误。窗口还在，接着 eval 就行。", "navigated": True}
+        return {"text": f"这段 JS 没跑成：{err}"}
+    value = r.get("value")
+    text = json.dumps(value, ensure_ascii=False, default=str)
+    if r.get("truncated"):
+        text += f"\n（原值 {r['truncated']} 字符，已截断；全文：{r.get('spilled')}）"
+    if r.get("wrapped"):
+        text += "\n（这是一条**语句**，不是表达式：我把它包成函数跑了一遍）"
+    return {"text": text, "value": value, "wrapped": bool(r.get("wrapped")),
+            "frame": r.get("frame") or frame}
+
+
+def page_shot(sid: str = "", full: bool = False) -> dict:
+    """截一张页面图，图会进你的上下文（你能真的看见它）。
+
+    为什么单独一个动词而不是 ``page_check(shot=True)``：一张 1180×800 的 PNG
+    base64 之后约 270KB，8 个面就是 2MB —— 上下文会直接溢出。想「看」就单独取
+    一张；判断一个面长得对不对，一张就够。
+
+    sid: 页面会话（只有一个时可以不给）
+    full: 截整页（含滚动出去的部分）
+    """
+    try:
+        sid = _page_pick(sid)
+        r = _page_cmd(sid, {"op": "shot", "full": bool(full)})
+    except Exception as exc:
+        return {"text": f"{type(exc).__name__}: {exc}"}
+    if not r.get("ok"):
+        return {"text": f"截图没成：{r.get('error')}"}
+    raw = base64.b64decode(r["b64"])
+    sizes = r.get("sizes") or {}
+    return {"text": f"截了一张 {r['bytes']} 字节的图（窗口实测 {sizes.get('inner')}，"
+                    f"页面区 {sizes.get('frame')}）；文件：{r.get('path')}",
+            "images": [{"raw": raw, "mime": "image/png",
+                        "name": r.get("name") or "page.png"}],
+            "path": r.get("path"), "bytes": r["bytes"]}
+
+
+def page_check(sid: str = "", areas: str = "", shot: bool = False) -> dict:
+    """逐面看一遍自己的页面，给一份能判对错的报告。
+
+    默认六面（``load`` / ``console`` / ``network`` / ``overflow`` / ``contrast`` /
+    ``narrow``）。``console`` 与 ``network`` 必须放在最前面：**页面白屏时截图
+    出来是一张干净的空白**，DOM 里什么都不缺 —— ``TypeError: S.pid is undefined``
+    只在这两条通道里留痕。那是最坏的一种假通过。
+
+    没跑的、跑不了的，都会**显式**出现在「跳过」里 —— 缺口可见，不能假装完整。
+
+    sid: 页面会话（只有一个时可以不给）
+    areas: 只跑这几面，逗号分隔（空 = 默认六面）
+    shot: 顺带截一张图（会进上下文，慎用）
+    """
+    try:
+        sid = _page_pick(sid)
+        s = _PAGE[sid]
+        r = _page_cmd(sid, {"op": "check",
+                            "areas": [a.strip() for a in areas.split(",") if a.strip()] or None,
+                            "shot": bool(shot), "real": bool(s.get("real"))},
+                      timeout=PAGE_CMD * 2)
+    except Exception as exc:
+        return {"text": f"{type(exc).__name__}: {exc}"}
+    if not r.get("ok"):
+        return {"text": f"检查没跑成：{r.get('error')}"}
+
+    eng = r.get("engine") or {}
+    sizes = r.get("sizes") or {}
+    plugin = r.get("plugin") or {}
+    lines = [f"页面自查 · {r.get('pid')}（真窗口 · WebView2 {eng.get('browser')}）",
+             f"窗口 {sizes.get('requested')} → 实测 {sizes.get('inner')}"
+             f"（dpr {sizes.get('dpr')}）；页面区 {sizes.get('frame')}"]
+    if not plugin.get("has_ui"):
+        lines.append(f"⚠ {plugin.get('why') or '这个程序没有页面'}")
+    rows = r.get("areas") or []
+    if rows:
+        lines.append("")
+    for a in rows:
+        mark = "✓" if a.get("ok") else "✗"
+        lines.append(f"{mark} {a.get('name')}")
+        if a.get("detail") and not a.get("ok"):
+            lines.append(f"    {a.get('detail')}")
+    skipped = r.get("skipped") or []
+    if skipped:
+        lines.append("")
+        lines.append("跳过：" + "；".join(f"{s.get('name')}（{s.get('why')}）"
+                                        for s in skipped))
+    bad = [c for c in (r.get("console") or []) if c.get("type") == "error"]
+    lines.append("")
+    lines.append(f"console 错误 {len(bad)} 条 · 未捕获异常 {len(r.get('pageerrors') or [])} 条"
+                 f" · 请求失败 {len(r.get('network') or [])} 条")
+    for c in bad[-5:]:
+        lines.append(f"  [console] {c.get('text')}")
+    for e in (r.get("pageerrors") or [])[-5:]:
+        lines.append(f"  [异常] {e}")
+    for n in (r.get("network") or [])[-5:]:
+        lines.append(f"  [请求] {n}")
+    out = {"text": "\n".join(lines), "report": r,
+           "ok": all(a.get("ok") for a in rows) if rows else False}
+    if r.get("_png"):
+        out["images"] = [{"raw": base64.b64decode(r["_png"]), "mime": "image/png",
+                          "name": f"{r.get('pid')}-page.png"}]
+    return out
+
+
+def page_close(sid: str = "") -> dict:
+    """关掉页面会话（窗口、宿主、CDP 端口一起收）。
+
+    sid: 页面会话（只有一个时可以不给）
+    """
+    _page_reap()
+    try:
+        sid = _page_pick(sid)
+    except Exception as exc:
+        return {"text": str(exc)}
+    try:
+        _page_cmd(sid, {"op": "close"}, timeout=30)
+    except Exception:
+        pass
+    _page_kill(sid)
+    return {"text": f"页面会话 {sid} 关了（窗口、宿主、CDP 端口一起收）。"
+                    f"还剩 {len(_PAGE)} 个。"}
