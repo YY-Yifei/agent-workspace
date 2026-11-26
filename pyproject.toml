@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "open-agent-workspace"
-version = "0.4.5"
+version = "0.4.6"
 description = "桌面 Agent 工作区内核：一个目录约定、一条 dispatch、一条事件流、一份能力面"
 readme = "README.md"
 requires-python = ">=3.10"

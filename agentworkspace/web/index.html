@@ -150,7 +150,11 @@
   .gutter::before{content:"";position:absolute;inset:0 2px;background:var(--line);
     border-radius:3px;transition:background .12s}
   .gutter:hover::before,.gutter:focus-visible::before,.gutter.drag::before{background:var(--accent)}
-  .chat header{display:flex;align-items:baseline;gap:8px;padding:12px 16px;
+  /* 对齐用 center，不用 baseline。baseline 会把「没有文字的滑块」按它的底边
+     对齐（inline-flex 的首行基线），于是那枚开关比同排的按钮高出 3px —— 一条
+     顶端参差的行比一排居中的行难读。标题与描述同字号，center 与 baseline
+     对它们没有任何区别。 */
+  .chat header{display:flex;align-items:center;gap:8px;padding:12px 16px;
     border-bottom:1px solid var(--line);font-size:13px;color:var(--dim)}
   .chat header b{color:var(--ink);font-weight:600;font-size:13px;white-space:nowrap;
     flex:0 0 auto}
@@ -403,6 +407,8 @@
     border:1px solid var(--line);background:transparent;color:var(--dim);font:inherit;
     font-size:12px;cursor:pointer}
   .vbtn:hover{border-color:var(--accent);color:var(--accent)}
+  .vbtn[disabled]{opacity:.55;cursor:default}
+  .vbtn[disabled]:hover{border-color:var(--line);color:var(--dim)}
 </style>
 </head>
 <body>
@@ -626,6 +632,8 @@ function paintStage(force) {
   stage.innerHTML = `<div class="split${solo ? ' solo' : ''}">${pane}${gutter}
     <aside class="chat">
       <header>${esc(p.icon || '')}<b>${esc(p.title)}</b><span>${esc(p.description || '')}</span>
+        <button type="button" class="vbtn" id="newbtn"
+                title="新建会话（直接开，不用先打开会话面板）" aria-label="新建会话">＋</button>
         <button type="button" class="vbtn" id="sessbtn" title="会话：新建 / 切换 / 改名 / 删除">会话</button>
         ${p.id === 'assistant' ? '' : `<label class="dev${p.dev ? ' on' : ''}" title="打开后它能读写工作区里的文件、改自己的代码（碰不到别的程序）"><input type="checkbox" id="devsw"${p.dev ? ' checked' : ''}><i></i>开发者</label><button type="button" class="vbtn" id="verbtn" title="看这个程序的版本历史 / 退回去">版本</button>`}
       </header>
@@ -753,9 +761,12 @@ function wireSessions() {
   b.title = t ? `当前会话：${t}` : '会话：新建 / 切换 / 改名 / 删除';
   b.onclick = () => openSessions(S.pid);
   const n = $('#snew');
-  if (n) n.onclick = () => doNewSession(S.pid);
+  if (n) n.onclick = () => doNewSession(S.pid, true);     // 面板已经开着：顺手那一下
   const c = $('#sclose');
   if (c) c.onclick = closeSessions;
+  // header 上那一下：新建会话是常用操作，不该先开面板再点一次。
+  const q = $('#newbtn');
+  if (q) q.onclick = () => doNewSession(S.pid, false);
 }
 
 function setSHint(text, cls) {
@@ -793,7 +804,10 @@ async function jpost(url, body) {
 async function reloadThread(pid, sid) {
   const r = await fetch(`/api/p/${pid}/session/${sid}?limit=200`)
     .then((x) => x.json()).catch(() => null);
-  if (!r || r.error || !r.messages) return;
+  // 判的是**形状**，不是真假：新建/切换到的空会话回的正是 `messages: []`，
+  // 而 `[]` 是假值 —— 写成 `!r.messages` 就会在「最该重载」的那一次提前返回，
+  // 屏幕上还挂着上一个会话的对话（提示语却说「新会话已开」）。
+  if (!r || r.error || !Array.isArray(r.messages)) return;
   S.sid[pid] = r.sid || sid;
   if (r.title) S.stitle[pid] = r.title;
   const sb = $('#sessbtn');                       // 切完会话，悬停里那句也得跟着换
@@ -810,8 +824,11 @@ async function reloadThread(pid, sid) {
     rows.unshift({ role: 'it', note: true, tools: [],
       text: `这个会话共 ${r.total} 条，这里显示最后 ${r.shown} 条。` });
   }
-  S.msgs[pid] = rows;
+  const old = S.msgs[pid] || [];
+  S.msgs[pid] = rows;                    // 盘上的引用接住了这些位置
   S.cur[pid] = null;
+  // 换整份对话 = 旧气泡全部消失，它们是那些 blob 的最后一个主人。
+  for (const m of old) for (const f of (m.files || [])) releaseBlob(f.url);
   if (pid === S.pid) paintThread();
 }
 
@@ -881,13 +898,29 @@ async function doSwitch(pid, sid) {
   setSHint(r.message || '已切换', 'ok');
 }
 
-async function doNewSession(pid) {
-  setSHint('正在新建…');
-  const r = await jpost(`/api/p/${pid}/session/new`, {});
-  if (r.status !== 'ok') { setSHint(r.message || '新建失败', 'bad'); return; }
-  await reloadThread(pid, r.sid);
-  await openSessions(pid);
-  setSHint('新会话已开；之前的对话还在，随时能切回去。', 'ok');
+/* 新建会话。两条入口、同一套动作：header 上的「＋」是**一次点击**（那条常用的），
+   面板里那颗按钮是「已经打开面板了，顺手」。
+   差别只有一处 —— 结果往哪儿说：面板开着就说在面板里，否则说在对话里。
+   不说的那一种，「点了＋，屏幕空了」看着像丢了东西。 */
+async function doNewSession(pid, fromPanel) {
+  const q = $('#newbtn');
+  if (q) q.disabled = true;              // 一次点击 = 一次；等回执时连点就是两个会话
+  try {
+    if (fromPanel) setSHint('正在新建…');
+    const r = await jpost(`/api/p/${pid}/session/new`, {});
+    const ok = r.status === 'ok';
+    // busy（这一轮还在跑）也是「没新建」：屏幕不动而提示说「已新建」，
+    // 人就会在旧对话里接着说下一句。
+    const msg = ok ? '新会话已开；之前那段对话还在，随时能从「会话」里切回去。'
+      : (r.message || '新建失败');
+    if (ok) await reloadThread(pid, r.sid);
+    if (fromPanel) setSHint(msg, ok ? 'ok' : 'bad');
+    else if (pid === S.pid) push(pid, { role: 'it', note: true, tools: [], text: msg });
+    if (ok && pid === S.pid) { const ta = $('#ta'); if (ta) ta.focus(); }
+    return r;
+  } finally {
+    if (q) q.disabled = false;
+  }
 }
 
 /* 删除按两下。一步就删的东西，在「极简」的界面里迟早会被误触 —— 而这里删掉的是
@@ -1088,16 +1121,33 @@ function paintPends(pid) {
   paintComposer(pid);                        // 只有图也能发：按钮的可按性跟着它动
 }
 
+/* 一张图的 blob URL 有**几个主人**：输入框上的预览条、对话里的那条气泡
+   （发出去之后 URL 跟着那句话一起走）。谁都不许在别人还显示着它的时候吊销 ——
+   已经解码的那张照样看得见，可下一次重绘（每个 delta 都会重绘一次）新建的
+   <img> 再去取同一个 URL 就取不到了，浏览器画成「破图标 + alt 文本」，
+   也就是「上传了图，发出去就看不见了」。所以吊销只有一个时机：
+   **最后一个主人离开**。 */
+function releaseBlob(url) {
+  if (!url || !String(url).startsWith('blob:')) return;   // 盘上那个地址不是我们造的
+  for (const list of Object.values(S.msgs)) {
+    for (const m of list) if ((m.files || []).some((f) => f.url === url)) return;
+  }
+  for (const list of Object.values(S.pend)) {
+    if ((list || []).some((p) => p.url === url)) return;
+  }
+  URL.revokeObjectURL(url);
+}
+
 function dropPic(pid, i) {
-  const list = pendpics(pid);
-  const gone = list.splice(i, 1)[0];
-  if (gone && gone.url) URL.revokeObjectURL(gone.url);
+  const gone = pendpics(pid).splice(i, 1)[0];
+  if (gone) releaseBlob(gone.url);       // 发出去过的那张：气泡还在用，就不吊销
   paintPends(pid);
 }
 
 function clearPics(pid) {
-  for (const p of pendpics(pid)) if (p.url) URL.revokeObjectURL(p.url);
-  S.pend[pid] = [];
+  const gone = pendpics(pid);
+  S.pend[pid] = [];                      // 先松手，再判「还有没有别人用它」
+  for (const p of gone) releaseBlob(p.url);
   paintPends(pid);
 }
 
@@ -1299,6 +1349,9 @@ function dropMsg(pid, m) {
      终态去改一条与它无关的消息。 */
   const cur = S.cur[pid];
   if (cur != null) S.cur[pid] = (cur === i) ? null : (cur > i ? cur - 1 : cur);
+  // 这条消息带走的 blob：从对话里摘掉之后，它是**那些图的主人之一又少了一个**。
+  // 没送出去的那种不在这里吊销 —— 同一批 URL 还挂在预览条上，等着重发。
+  for (const f of (m.files || [])) releaseBlob(f.url);
   if (pid === S.pid) paintThread();
 }
 

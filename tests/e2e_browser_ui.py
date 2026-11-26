@@ -88,6 +88,8 @@ STATE = {
 }
 
 POSTED: dict = {}          # 页面对 /api/settings 的**请求体**，门要查它真交了什么
+CHAT: dict = {"posted": []}          # 页面对 /chat 的请求体（门要查图真的随这一轮出去了）
+NEW_SESSION: dict = {"empty": False, "sid": "s_0000feed"}   # 新建会话之后线程该是空的
 
 #: [E] 停止=撤回那一节用的会话内容。``collapse`` 为真时，第一轮被撤回 ——
 #: 这正是盘上 ``{"t":"retract","turn":"t-e2e-1"}`` 投影出来的那份 rows。
@@ -132,12 +134,41 @@ def open_page(ctx, base: str):
         status=200, content_type="application/json", body=json.dumps(STATE)))
     page.route("**/api/p/pomodoro/sessions", lambda r: r.fulfill(
         status=200, content_type="application/json", body=json.dumps(SESSIONS)))
-    for act in ("switch", "new", "delete", "rename"):
-        page.route(f"**/api/p/pomodoro/session/{act}", lambda r, a=act: r.fulfill(
+    def on_act(route, act):
+        if act == "new":
+            NEW_SESSION["empty"] = True
+        return route.fulfill(
             status=200, content_type="application/json",
-            body=json.dumps({"status": "ok", "sid": SID, "title": "番茄钟怎么用",
-                             "message": f"{a} ok"})))
+            body=json.dumps({"status": "ok",
+                             "sid": NEW_SESSION["sid"] if act == "new" else SID,
+                             "title": "新会话" if act == "new" else "番茄钟怎么用",
+                             "message": f"{act} ok"}))
+
+    # 闭包工厂，不用 `lambda r, a=act`：Playwright 按**参数个数**决定传什么，
+    # 两个参数的 handler 收到的是 (route, request) —— 那个 `a` 会被 request 顶掉，
+    # `act == "new"` 永远是假（门的红就变成路由的红，不是产品的红）。
+    def _binder(act):
+        def _handler(route):
+            return on_act(route, act)
+        return _handler
+
+    for act in ("switch", "new", "delete", "rename"):
+        page.route(f"**/api/p/pomodoro/session/{act}", _binder(act))
+    def on_chat(route):
+        """发一句话：受理。门要的是「受理之后气泡里的图还在不在」。"""
+        CHAT["posted"].append(json.loads(route.request.post_data or "{}"))
+        return route.fulfill(status=200, content_type="application/json",
+                             body=json.dumps({"status": "sent", "pid": "pomodoro"}))
+
     def on_session(route):
+        # 新建会话之后，那个会话是**空的** —— 门要证明「一次点击真的换了一份空历史」。
+        if NEW_SESSION["empty"]:
+            return route.fulfill(
+                status=200, content_type="application/json",
+                body=json.dumps({"pid": "pomodoro", "sid": NEW_SESSION["sid"],
+                                 "title": "新会话", "active": True, "messages": [],
+                                 "total": 0, "shown": 0, "truncated": False,
+                                 "turns": 0, "tokensIn": 0, "tokensOut": 0, "bad": 0}))
         rows = [dict(r) for r in RETRACT_ROWS["rows"]]
         if RETRACT_ROWS.get("collapse"):
             for r in rows[:2]:                 # 第一轮整组被撤回
@@ -149,8 +180,10 @@ def open_page(ctx, base: str):
                              "shown": len(rows), "truncated": False,
                              "turns": 0, "tokensIn": 0, "tokensOut": 0, "bad": 0}))
 
-    # 重载会话那一条：带上 ?limit=200（正则，别让 img 那些也落进来）
-    page.route(re.compile(r"/session/" + SID + r"\?limit="), on_session)
+    # 重载会话那一条：带上 ?limit=200（正则，别让 img 那些也落进来）。
+    # sid 用形状而不是字面量：新建会话之后是**另一个** sid，钉死旧的就接不住它，
+    # 请求会落到兜底 `{}` —— 那时门红的是路由，不是产品。
+    page.route(re.compile(r"/session/s_[0-9a-f]{8}\?limit="), on_session)
     page.route(f"**/session/{SID}/img/*.png", lambda r: r.fulfill(
         status=200, content_type="image/png",
         body=_png(300, 200) if PIC_A in r.request.url else _png(200, 300)))
@@ -166,6 +199,7 @@ def open_page(ctx, base: str):
                              "theme": POSTED.get("theme", "auto"),
                              "reconnected": [], "agents": {}}))
 
+    page.route("**/api/p/pomodoro/chat", on_chat)
     page.route("**/api/settings", on_settings)
     page.goto(f"{base}/#p/pomodoro")
     page.wait_for_selector("#thread .msg", timeout=15000)
@@ -546,6 +580,174 @@ def gates_retract(page) -> dict:
           n2 == 0, str(n2))
 
 
+def gates_ui_fixes(page) -> None:
+    """[G] 三处界面问题：新建会话一次点击 / 图片发出去还是图 / 开关垂直居中。
+
+    三条都走**真浏览器**：判据是「屏幕上画成了什么」（naturalWidth、几何中心、
+    请求次数），不是「源码里有没有那个字符串」。
+    """
+    print("\n[G] 三处界面问题")
+
+    # ---- G1 图片：发出去之后，气泡里还得是**图**，不是「破图标 + 文件名」
+    # 病根：待发图的 blob URL 被预览条和气泡**两个主人**共用，预览条清空时
+    # 把它吊销了 —— 已经解码的那张还看得见，可下一次重绘（每个 delta 都会重绘）
+    # 新建的 <img> 再去取同一个 URL 就取不到了，浏览器画成破图标 + alt 文本。
+    # 所以这条门必须**在发送之后重绘一次**：不重绘的话，旧实现也是绿的。
+    page.evaluate("clearPics('pomodoro')")
+    page.set_input_files("#pickf", {"name": "image.png", "mimeType": "image/png",
+                                    "buffer": _png(40, 30)})
+    page.wait_for_timeout(200)
+    pend = page.evaluate("""() => {
+      const im = document.querySelector('.pends img');
+      return im ? {w: im.naturalWidth, h: im.naturalHeight} : null;
+    }""")
+    check("贴进来的图先出现在预览条上（这一步本来就对）",
+          bool(pend) and pend["w"] > 0, str(pend))
+
+    CHAT["posted"].clear()
+    page.click("#sendb")
+    page.wait_for_timeout(400)
+    check("图随这一轮真的发出去了（不是只画在屏幕上）",
+          len(CHAT["posted"]) == 1 and len(CHAT["posted"][0].get("images") or []) == 1,
+          str([{"images": len(p.get("images") or [])} for p in CHAT["posted"]]))
+
+    page.evaluate("paintThread()")          # 生产里每个 delta 都会重绘一次
+    page.wait_for_timeout(200)
+    shot = page.evaluate("""() => {
+      const im = [...document.querySelectorAll('.msg.me .shots img')].pop();
+      if (!im) return null;
+      return {w: im.naturalWidth, h: im.naturalHeight, alt: im.alt,
+              blob: im.src.startsWith('blob:'), complete: im.complete};
+    }""")
+    check("重绘之后气泡里的图**还是图**（旧版在这里变成破图标 + 文件名）",
+          bool(shot) and shot["w"] > 0 and shot["h"] > 0, str(shot))
+    check("那张图不是靠 alt 文本撑着的（alt 只是兜底，不是内容）",
+          bool(shot) and shot["alt"] == "image.png", str(shot))
+
+    # 反面对照：把同一个 URL 吊销掉再重绘 —— 必须**变红**。
+    # 少了这一半，一个「永远不 revoke」的实现也会让上面全绿，而那是内存泄漏。
+    page.evaluate("""() => {
+      const im = [...document.querySelectorAll('.msg.me .shots img')].pop();
+      if (im) URL.revokeObjectURL(im.src);
+      paintThread();
+    }""")
+    page.wait_for_timeout(200)
+    dead = page.evaluate("""() => {
+      const im = [...document.querySelectorAll('.msg.me .shots img')].pop();
+      return im ? {w: im.naturalWidth, complete: im.complete} : null;
+    }""")
+    check("反面对照：URL 被吊销之后这张图确实画不出来（门打在病上）",
+          bool(dead) and dead["w"] == 0, str(dead))
+
+    # ---- G2 开发者开关：与同排东西的垂直中心对齐
+    page.evaluate("paintDev('pomodoro', true)")
+    page.wait_for_timeout(120)
+    geo = page.evaluate("""() => {
+      const c = (el) => { const r = el.getBoundingClientRect();
+        return r.top + r.height / 2; };
+      return {align: getComputedStyle(document.querySelector('.chat header')).alignItems,
+              sw: c(document.querySelector('.dev i')),
+              lab: c(document.querySelector('.dev')),
+              btn: c(document.querySelector('#sessbtn')),
+              title: c(document.querySelector('.chat header b'))};
+    }""")
+    check("开关的垂直中心与同排按钮重合（误差 ≤ 1px）",
+          abs(geo["sw"] - geo["btn"]) <= 1, str(geo))
+    check("开关的垂直中心与标题那一行重合（误差 ≤ 1px）",
+          abs(geo["sw"] - geo["title"]) <= 1, str(geo))
+    check("开关在自己的标签里也是居中的（不是被文字基线顶上去）",
+          abs(geo["sw"] - geo["lab"]) <= 1, str(geo))
+
+    # 反面对照：把 baseline 注回去 —— 必须**变红**
+    page.evaluate("""() => {
+      const h = document.querySelector('.chat header');
+      h.dataset.align = h.style.alignItems;
+      h.style.alignItems = 'baseline';
+    }""")
+    page.wait_for_timeout(120)
+    bad = page.evaluate("""() => {
+      const c = (el) => { const r = el.getBoundingClientRect();
+        return r.top + r.height / 2; };
+      return {sw: c(document.querySelector('.dev i')),
+              btn: c(document.querySelector('#sessbtn'))};
+    }""")
+    check("反面对照：baseline 对齐时开关确实偏了（门打在病上）",
+          abs(bad["sw"] - bad["btn"]) > 1, str(bad))
+    page.evaluate("""() => {
+      const h = document.querySelector('.chat header');
+      h.style.alignItems = h.dataset.align || '';
+    }""")
+
+    # ---- G3 新建会话：**一次**点击
+    # 判据是「点了几下」：一次点击之后必须已经换到一份空历史，且面板没被打开
+    # （打开面板再点「新建会话」是两次 —— 那正是要修掉的那一步）。
+    page.evaluate("reloadThread('pomodoro', '%s')" % SID)
+    page.wait_for_selector("#thread .msg", timeout=8000)
+    page.wait_for_timeout(150)
+    before = page.evaluate("document.querySelectorAll('#thread .msg').length")
+    check("先有对话（否则「换空了」证明不了什么）", before > 0, str(before))
+
+    reqs = []
+    page.on("request", lambda r: reqs.append(r.url))
+    page.click("#newbtn")                    # ← 就这一下
+    page.wait_for_timeout(500)
+    check("点一下「＋」就发出了新建会话的请求",
+          any("/session/new" in u for u in reqs), str(reqs[-3:]))
+    check("**没有**顺手把会话面板打开（那一步是多余的）",
+          not page.evaluate("document.querySelector('#smask').classList.contains('on')"))
+    after = page.evaluate("""() => ({
+      me: document.querySelectorAll('#thread .msg.me').length,
+      text: document.querySelector('#thread').textContent,
+      sid: (typeof S === 'object' && S.sid && S.sid['pomodoro']) || '',
+    })""")
+    # 判据是「旧对话的话一个字都不在了」，不是「一个节点都没有」：新会话那句
+    # 注脚自己就是一个 .msg.it .body，数节点会把正确的实现判红。
+    check("一次点击之后线程换成了空的（旧对话不再挂在屏幕上）",
+          after["me"] == 0 and "第二个回答" not in after["text"], str(after)[:120])
+    check("当前会话号跟着换了（不是「屏幕空了、其实还在旧会话里」）",
+          after["sid"] == NEW_SESSION["sid"], str(after["sid"]))
+    check("空线程里有一句人话说明旧对话还在（不是凭空消失）",
+          "还在" in after["text"], repr(after["text"])[:80])
+
+    # 反面对照：只点「会话」—— 必须**不**新建（否则「一次点击」这条门是假的）
+    NEW_SESSION["empty"] = False
+    page.evaluate("reloadThread('pomodoro', '%s')" % SID)
+    page.wait_for_timeout(200)
+    reqs.clear()
+    page.click("#sessbtn")
+    page.wait_for_timeout(300)
+    check("反面对照：只点「会话」不会新建（它只是打开面板）",
+          not any("/session/new" in u for u in reqs), str(reqs[-3:]))
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(150)
+
+    # ---- G4 窄窗口：多一颗按钮不许把 header 挤坏
+    # 判据是「还在一行里」+「每个控件都完整落在 header 之内」，不是「没报错」。
+    page.set_viewport_size({"width": 420, "height": 720})
+    page.wait_for_timeout(300)
+    nar = page.evaluate("""() => {
+      const hd = document.querySelector('.chat header');
+      const r = hd.getBoundingClientRect();
+      const kids = [...hd.children].map((e) => {
+        const b = e.getBoundingClientRect();
+        return {id: e.id || e.tagName, w: b.width,
+                insideX: b.left >= r.left - 1 && b.right <= r.right + 1,
+                insideY: b.top >= r.top - 1 && b.bottom <= r.bottom + 1};
+      });
+      return {h: r.height, w: r.width, kids};
+    }""")
+    check("窗口窄到 420px 时 header 仍是**一行**（没有被挤成两行）",
+          nar["h"] <= 56, f"h={nar['h']} w={nar['w']}")
+    bad = [k["id"] for k in nar["kids"] if not (k["insideX"] and k["insideY"])]
+    check("窄屏时每个控件都完整落在 header 里（没有被切掉 / 溢出）",
+          not bad, f"溢出的：{bad}")
+    nb = next((k for k in nar["kids"] if k["id"] == "newbtn"), None)
+    check("窄屏时那颗「＋」还在（宽度 > 8px，没被挤没）",
+          bool(nb) and nb["w"] > 8, str(nb))
+    page.set_viewport_size({"width": 1180, "height": 760})
+    page.wait_for_timeout(200)
+
+
 def main() -> int:
     neg = "--negative" in sys.argv
     httpd, base = start_server()
@@ -571,6 +773,7 @@ def main() -> int:
         gates_drag(page)
         gates_theme(page)
         gates_retract(page)
+        gates_ui_fixes(page)
         if neg:
             negative_controls(page)
         ctx.close()
