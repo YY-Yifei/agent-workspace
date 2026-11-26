@@ -527,14 +527,16 @@ def _child_env() -> dict:
     return env
 
 
-def page_open(viewport: str = "pane", workspace: str = "copy") -> dict:
+def page_open(viewport: str = "pane") -> dict:
     """开一个真窗口看自己的页面，之后一直用它。
 
     引擎是 pywebview / WebView2 —— 生产里插件页面就是它渲染的，不是 Chrome。
     窗口开在屏幕外（x=-3000）：既合成帧（能截图），又不挡你。
 
+    看的是**真页面**：真工作区、真插件、真会话。有正在跑的宿主就直接连它；
+    没有就自己起一个（仍是真工作区）。窗口是新的，不碰你正在看的那个。
+
     viewport: pane（默认，1180 宽，与生产一致）或 desktop（1600 宽）
-    workspace: copy（默认，复制一份跑，不碰你的数据）或 real（连你正在跑的宿主）
     """
     _page_reap()
     me = _me()
@@ -544,12 +546,9 @@ def page_open(viewport: str = "pane", workspace: str = "copy") -> dict:
     port = pagecheck.free_port()
     argv = [sys.executable, "-X", "utf8", "-m", "agentworkspace.pagecheck",
             "--worker", "--port", str(port), "--pid", me,
-            "--workspace", str(root), "--mode", workspace, "--viewport", viewport]
-    if workspace == "real":
-        hp = int(getattr(_rt(), "port", 0) or 0)
-        if not hp:
-            return {"text": "real 模式要连你正在跑的那个宿主，但这个宿主不是带界面启动的"
-                            "（没有端口）。改用 workspace=\"copy\"。"}
+            "--workspace", str(root), "--viewport", viewport]
+    hp = int(getattr(_rt(), "port", 0) or 0)
+    if hp:                              # 有现成宿主就连它；没有时 pagecheck 自己起一个
         argv += ["--host-port", str(hp)]
 
     log = root / ".dev-cache" / me / "worker.log"
@@ -563,8 +562,7 @@ def page_open(viewport: str = "pane", workspace: str = "copy") -> dict:
 
     sid = f"page{len(_PAGE) + 1}"
     _PAGE[sid] = {"proc": proc, "fh": fh, "log": log, "at": time.time(),
-                  "buf": b"", "sock": None, "real": workspace == "real",
-                  "viewport": viewport}
+                  "buf": b"", "sock": None, "viewport": viewport}
 
     # 连上去：worker 先 bind 再干活，所以这一步很快（真正的等待在 ready 上）
     t0 = time.time()
@@ -708,10 +706,9 @@ def page_check(sid: str = "", areas: str = "", shot: bool = False) -> dict:
     """
     try:
         sid = _page_pick(sid)
-        s = _PAGE[sid]
         r = _page_cmd(sid, {"op": "check",
                             "areas": [a.strip() for a in areas.split(",") if a.strip()] or None,
-                            "shot": bool(shot), "real": bool(s.get("real"))},
+                            "shot": bool(shot)},
                       timeout=PAGE_CMD * 2)
     except Exception as exc:
         return {"text": f"{type(exc).__name__}: {exc}"}

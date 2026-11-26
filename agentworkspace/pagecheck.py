@@ -29,11 +29,15 @@ CDP 只是**挂在同一个窗口上的观察通道**，不是第二个引擎：
      用 ``add_init_script`` 抢在导航前注脚本：那是**为了观察而改变观察对象**）。
      代价写进报告：页面加载两次，第一次的 console 拿不到。
 
-三个进程，每个都有必须存在的理由：
+验证对象只有一个：**真页面** —— 真工作区、真插件、真会话、你此刻正在跑的那个宿主。
+没有「副本工作区」这一档：副本能截图、能点按钮，但它不回答「我的页面在真实数据下
+长什么样」。要看，就看真的。
 
-    宿主进程（agent 住的那一个）
+进程只有两个（第二个只在没有现成宿主时才起）：
+
+    宿主进程（agent 住的那一个）—— 已经有 HTTP 端口，直接连它
       └─ 本文件 --worker  ← ``webview.start()`` 一个进程只能调一次，所以必须独立
-            ├─ agentworkspace.main --serve   ← 窗口要加载一个 URL，那 URL 得有人服务
+            ├─ 也许再 spawn 一个 agentworkspace.main --serve（宿主没在跑时）
             └─ 真窗口 → #p/<pid> → #appframe → /plugin/<pid>/
 
 用法（人）：
@@ -52,7 +56,6 @@ import argparse
 import base64
 import json
 import os
-import shutil
 import socket
 import subprocess
 import sys
@@ -61,7 +64,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = ROOT / ".dev-cache"
-DEAD_URL = "ws://127.0.0.1:9/"     # 故意连不上：验证不该碰真服务
 OFFSCREEN = -3000                  # 屏幕外坐标：可见（能合成帧）但不挡人
 MAX_VALUE = 4000                   # eval 返回值超过这个字符就落盘
 IDLE = 300                         # 没有命令这么久就自己收尸
@@ -143,6 +145,19 @@ def free_port() -> int:
         s.close()
 
 
+def _engine_name(ua: str, version: str = "") -> str:
+    """从 UA 里认出引擎。``browser.version`` 只有版本号，认不出是谁 ——
+    而「报告里不许出现 HeadlessChrome」这条门，靠的正是这个前缀。"""
+    import re
+    ua = ua or ""
+    for pat in (r"Edg/([\d.]+)", r"HeadlessChrome/([\d.]+)", r"Chrome/([\d.]+)"):
+        m = re.search(pat, ua)
+        if m:
+            name = pat.split("/")[0]
+            return f"{name}/{m.group(1)}"
+    return version or "unknown"
+
+
 def plugin_of(ws: Path, pid: str) -> dict:
     """这个程序有没有页面。没有不是错误 —— 是**没有**，报告里要如实说。"""
     pdir = Path(ws) / "plugins" / pid
@@ -169,42 +184,10 @@ def plugin_of(ws: Path, pid: str) -> dict:
     return out
 
 
-def prepare(src: Path, pid: str, mode: str, tag: str) -> tuple[Path, bool]:
-    """(要跑的工作区, 是不是临时副本)。
-
-    ``copy``（默认）：复制一份到 ``.dev-cache/<pid>/ws``，aaas 指向一个连不上的
-    端口。理由不是安全 —— 是**别改用户的数据**：验证会写 config.json、会建会话、
-    会让程序真的跑起来。门要求真实工作区前后 sha256 逐字节相同。
-
-    ``real``：直接用真工作区（连的是你正在跑的那个宿主，见 ``--host-port``）。
-    """
-    if mode == "real":
-        return Path(src), False
-    dst = CACHE / pid / "ws"
-    if dst.exists():
-        shutil.rmtree(dst, ignore_errors=True)
-    ignore = shutil.ignore_patterns(".git", ".dev-cache", ".shell", "sessions",
-                                    "__pycache__", "*.pyc", ".backup")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(src, dst, ignore=ignore, dirs_exist_ok=True)
-    cfg = dst / "config.json"
-    data = {}
-    if cfg.exists():
-        try:
-            data = json.loads(cfg.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    data.setdefault("aaas", {})["url"] = DEAD_URL
-    data["aaas"]["token"] = None
-    cfg.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    (CACHE / pid).mkdir(parents=True, exist_ok=True)
-    if tag:
-        (CACHE / pid / "tag.txt").write_text(tag, encoding="utf-8")
-    return dst, True
-
-
 def spawn_host(ws: Path, pid: str, log: Path) -> tuple[subprocess.Popen, int]:
     """起一个只开门、不开窗的宿主，读到它的端口就返回。
+
+    ``ws`` 是**真工作区**：只有在没有现成宿主可连时才走到这里。
 
     为什么不让本进程直接 serve：窗口要加载一个 URL，而 ``webview.start()`` 会
     占死主线程 —— 同一个进程里既当服务器又当 GUI 会互相等。用 CLI 还顺带复用了
@@ -290,6 +273,9 @@ class Worker:
         self._closing = False
         self._idle_at = time.time()
         self._last = ""
+        self.ua = ""
+        # 插件自己的运行时数据：真页面会写它。记下来，收尾时如实说。
+        self.data0 = self._data_snap()
 
     # -- 起 ---------------------------------------------------------
     def url(self) -> str:
@@ -356,6 +342,14 @@ class Worker:
         # 页面本身一个字不动 —— 代价是它加载了两次，第一次的 console 拿不到。
         self.page.reload(wait_until="load")
         self._settle()
+        # UA 在这里读，不是刚连上时：那时 self.page 还没赋值 / 执行上下文还没建好，
+        # evaluate 一抛就只剩版本号 —— 而「报告里不许出现 HeadlessChrome」这条门
+        # 靠的正是 UA 里的 Edg/ 前缀。
+        try:
+            self.ua = str(self.page.evaluate("navigator.userAgent") or "")
+        except Exception:
+            self.ua = ""
+        self.engine = _engine_name(self.ua, self._br.version)
 
     def _on_failed(self, r) -> None:
         """请求失败。**原因要记下来** —— 不然 `net::ERR_ABORTED`（我们自己 reload
@@ -472,6 +466,29 @@ class Worker:
                 "chatW": d.get("chatW"),
                 "requested": [self.width, self.height]}
 
+    def _data_snap(self) -> dict:
+        d = self.ws / "plugins" / self.pid / "data"
+        out: dict = {}
+        if not d.is_dir():
+            return out
+        for f in d.rglob("*"):
+            try:
+                if f.is_file():
+                    st = f.stat()
+                    out[str(f.relative_to(d))] = [st.st_size, int(st.st_mtime)]
+            except Exception:
+                continue
+        return out
+
+    def _data_delta(self) -> dict:
+        """真页面写了自己的数据 —— 如实列出来，不当成缺陷，也不假装没发生。"""
+        now = self._data_snap()
+        before = getattr(self, "data0", {}) or {}
+        added = sorted(set(now) - set(before))
+        changed = sorted(k for k in (set(before) & set(now)) if before[k] != now[k])
+        return {"added": added, "changed": changed,
+                "dir": str(self.ws / "plugins" / self.pid / "data")}
+
     def _why_not_ready(self) -> str:
         return ("窗口没起来：" + self._last) if self._last else "窗口还没就绪"
 
@@ -486,8 +503,7 @@ class Worker:
         return {"ok": True, "sizes": self._facts()}
 
     # -- 逐面看 -----------------------------------------------------
-    def check(self, areas=None, want_shot: bool = False,
-              allow_interactive: bool = True) -> dict:
+    def check(self, areas=None, want_shot: bool = False) -> dict:
         if self.page is None:
             return {"ok": False, "error": self._why_not_ready()}
         # sync API 的事件是「下一次调用时 pump」的，不是后台线程派发的。
@@ -506,7 +522,8 @@ class Worker:
                     "engine": {"browser": self.engine, "engine": "webview2"},
                     "sizes": self._facts(), "areas": rows, "skipped": skipped,
                     "console": self.console, "network": self.network,
-                    "pageerrors": self.errors, "shot": None}
+                    "pageerrors": self.errors, "shot": None,
+                    "data_changed": self._data_delta()}
 
         frame_open = bool(self.plugin.get("has_ui"))
 
@@ -582,10 +599,8 @@ class Worker:
 
         @area("interactive")
         def _interactive() -> dict:
-            if not allow_interactive:
-                skipped.append({"name": "interactive",
-                                "why": "real 模式下不点你的真页面（点下去是真发消息）"})
-                return {"name": "跳过", "ok": True}
+            # 默认清单里没有这一面，所以它不会自己点。要就显式点名 —— 点了就真点了：
+            # 这些按钮发的是真消息。
             n0 = len(self.errors)
             clicked = self.page.evaluate(CLICK_JS) or []
             self.page.wait_for_timeout(500)
@@ -600,7 +615,8 @@ class Worker:
                "sizes": self._facts(), "areas": rows, "skipped": skipped,
                "console": self.console, "network": self.network,
                "aborted": self.aborted,
-               "pageerrors": self.errors, "shot": None}
+               "pageerrors": self.errors, "shot": None,
+               "data_changed": self._data_delta()}
         if want_shot:
             s = self.shot()
             if s.get("ok"):
@@ -694,15 +710,14 @@ def serve_socket(w: Worker, conn: socket.socket) -> None:
             elif op == "shot":
                 send(w.shot(bool(req.get("full"))))
             elif op == "check":
-                send(w.check(req.get("areas"), bool(req.get("shot")),
-                             allow_interactive=not req.get("real")))
+                send(w.check(req.get("areas"), bool(req.get("shot"))))
             elif op == "resize":
                 send(w.resize(int(req.get("width") or NARROW)))
             elif op == "info":
                 send({"ok": True, "engine": w.engine, "plugin": w.plugin,
                       "sizes": w._facts(), "url": w.url()})
             elif op == "close":
-                send({"ok": True, "closed": True})
+                send({"ok": True, "closed": True, "data_changed": w._data_delta()})
                 w._closing = True
             else:
                 send({"ok": False, "error": f"不认识的 op：{op!r}"})
@@ -713,8 +728,7 @@ def serve_script(w: Worker, box: dict) -> None:
     box["engine"] = w.engine
     box["plugin"] = w.plugin
     if box.get("check"):
-        box["report"] = w.check(box.get("areas"), bool(box.get("shot_out")),
-                                allow_interactive=not box.get("real"))
+        box["report"] = w.check(box.get("areas"), bool(box.get("shot_out")))
         # 脚本入口只给路径：base64 进终端是 200KB 噪声，而图已经落盘了
         box["report"].pop("_png", None)
     if box.get("js"):
@@ -734,10 +748,8 @@ def main(argv: list[str] | None = None) -> int:
                                  description="在真窗口真引擎里看自己的页面")
     ap.add_argument("--pid", required=True, help="哪个程序的页面")
     ap.add_argument("--workspace", default=None, help="真工作区路径（默认仓库 workspace/）")
-    ap.add_argument("--mode", default="copy", choices=("copy", "real"),
-                    help="copy=复制一份跑（默认，不碰你的数据）；real=连你正在跑的宿主")
     ap.add_argument("--host-port", type=int, default=0,
-                    help="real 模式要：正在运行的那个宿主的端口")
+                    help="正在运行的那个宿主的端口（不给就自己起一个，仍用真工作区）")
     ap.add_argument("--viewport", default="pane", choices=tuple(VIEWPORTS))
     ap.add_argument("--width", type=int, default=0, help="窗口宽度（覆盖 viewport）")
     ap.add_argument("--eval", dest="js", default="", help="跑一段 JS，打印结果")
@@ -783,15 +795,15 @@ def main(argv: list[str] | None = None) -> int:
     host_port = args.host_port
     w = None
     try:
-        ws, temp = prepare(src, args.pid, args.mode, tag="pagecheck")
+        ws = src
         cdp = free_port()
         # 必须在 import webview **之前**设：WebView2 在创建环境时读它。
         os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = \
             f"--remote-debugging-port={cdp}"
-        if args.mode == "copy":
+        if not host_port:
+            # 没有现成宿主可连（宿主不是带界面启动的）：自己起一个，但仍是**真工作区**。
+            # 真数据 + 新窗口 —— 不是复制品，也不跟你抢你正在看的那个窗口。
             host, host_port = spawn_host(ws, args.pid, CACHE / args.pid / "host.log")
-        elif not host_port:
-            raise RuntimeError("real 模式要给 --host-port（宿主端口）")
 
         w = Worker(args.pid, ws, host_port, cdp, args.viewport, args.width or None)
         w.host = host
@@ -801,8 +813,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             box.update(check=args.check, js=args.js, shot_out=args.shot_out,
                        frame=args.frame,
-                       areas=[a for a in args.areas.split(",") if a.strip()] or None,
-                       real=(args.mode == "real"))
+                       areas=[a for a in args.areas.split(",") if a.strip()] or None)
             w.run(lambda wk: serve_script(wk, box))
     except Exception as exc:                   # noqa: BLE001
         why = f"{type(exc).__name__}: {exc}"
@@ -826,8 +837,6 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 pass
         kill_tree(host)
-        if temp:
-            pass                                # 副本留着给人看：截图/日志都在里面
 
     if listener is not None:
         return 0 if (w is not None and w._ready) else 1

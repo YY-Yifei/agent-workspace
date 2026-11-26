@@ -80,7 +80,7 @@ dev_read("config.json")     # ← 现在就能拿到 token，一个字没改
 ## 一、五个动词
 
 ```
-dev_page_open(workspace="copy"|"real", viewport="pane"|"desktop"|"narrow", fresh=True) -> sid
+dev_page_open(viewport="pane"|"desktop")              -> sid
 dev_page_eval(js, sid=None)                       -> {ok, value, error, wrapped, navigated, ms}
 dev_page_shot(sid=None, full=False, name="")      -> {path, w, h, bytes} + 图进上下文
 dev_page_check(sid=None, areas=None)              -> 文字报告（§七）
@@ -100,28 +100,30 @@ dev_page_close(sid=None)                          -> 关；省略 sid = 全关
 
 ---
 
-## 二、两个来源，一个引擎
+## 二、一条路：真页面（没有副本）
 
 引擎只有 **pywebview(WebView2)** 一个（v2 的结论没变：验 Chrome ≠ 验用户的机器）。
 
-| | `workspace="copy"`（默认） | `workspace="real"` |
-|---|---|---|
-| 谁在服务 | 子进程起一个最小工作区（`main --port 0 --workspace .dev-cache/<pid>/ws`） | **连正在跑的那个宿主**（`http://127.0.0.1:<rt.port>`），不起第二个服务 |
-| 数据 | 只有被测程序 + config 的副本；会话是空的 | 你真实的会话、设置、主题、历史 |
-| 能做什么 | 全部，包括 `interactive`（点一遍所有控件） | 只读为宜：点「发送」是真的发消息，烧真的 token |
-| 副作用 | 落在 `.dev-cache/`，门要求真实工作区前后 sha256 逐字节相同 | 就是真实工作区，没得隔离 |
+**没有副本工作区。** 验的就是真工作区：真插件、真会话、真设置。
 
-**为什么两种都要**：`copy` 用来「折腾」（点坏、脏数据、故意报错），`real` 用来「看真相」
-（标题栏的会话名、深色模式、真有图片时的布局、真插件列表撑出来的高度）。
-只有 `copy` 会给出「这页面是空的但也算通过」的假绿；只有 `real` 会烧掉真东西。
+宿主从哪来，只有一条规则：
 
-**一处需要改代码的硬依赖**：`real` 需要宿主端口，而现在**拿不到** ——
-`main.py:258` 的 `url` 是 `build()` 的局部变量，`httpd.server_address[1]` 没往 `rt` 上挂。
-加两行（`rt.port = httpd.server_address[1]`）。拿不到端口时 `open(workspace="real")`
-必须**一句话说清楚**，不许装作能用。
+| 情况 | 做法 |
+|---|---|
+| 有正在跑的宿主（`rt.port` 有值，`main.py:258`） | 直接连它：窗口加载 `http://127.0.0.1:<port>/#p/<pid>`，**不起**第二个服务 |
+| 没有（宿主不是带界面启动的） | 自己 spawn 一个 `main --serve --port 0 --workspace <真工作区>` |
 
-**窗口归属**：两种模式都**新起一个窗口**，都不碰用户正在看的那个。理由不是安全，
-是**别跟用户抢**：他在左边打字，你的 eval 把 iframe 导航走了，这不是「能力」，是干扰。
+**为什么把 `copy` 删掉**：副本能截图、能点按钮，但它不回答「我的页面在真实数据下长什么样」
+—— 空会话里的聊天页永远只有一条「今天想聊点什么」，那种页面**怎么验都是绿的**。
+而它原本要解决的问题（点坏、脏数据、故意报错）用 eval 就能做，不需要第二个工作区。
+
+**代价必须写进报告**：真页面有副作用。插件自己在加载时就会写 `plugins/<pid>/data/`
+（实测：`store.json` 变了）。所以 `check` 与 `close` 都带一个 `data_changed`，
+如实列出这次动过的运行时数据 —— **不判红**，因为那是「真页面」的定义，不是缺陷。
+不许变的是**插件源码与 `config.json`**，那道门在（`_tmp/p44_real.py` 25 项）。
+
+**窗口归属**：新起一个窗口，不碰用户正在看的那个。理由不是安全，是**别跟用户抢**：
+他在左边打字，你的 eval 把 iframe 导航走了，这不是「能力」，是干扰。
 
 ---
 
@@ -235,7 +237,7 @@ CDP 回 `Execution context was destroyed`。
 | `network` | 无 4xx/5xx、无 loadingFailed |
 | `load` | `document.readyState === "complete"`，且第一个可见元素有非零尺寸 |
 | `overflow` | `scrollWidth <= clientWidth`（横向不出界）。纵向允许滚动 |
-| `interactive` | 每个可点控件点一遍，看有没有 JS 错误 / 页面变白。**只在 `copy` 上跑**；`real` 上跳过并在报告里写「因为你没让我动真数据」 |
+| `interactive` | 每个可点控件点一遍，看有没有 JS 错误 / 页面变白。**默认不在清单里**（不会自己点）；显式 `areas="interactive"` 才跑 —— 这些按钮发的是真消息 |
 | `narrow` | 420px 不塌（控件不被切、不被挤成一列） |
 | `theme` | `data-theme` 深浅两档都拍一张，色差非零（防「切了没生效」） |
 | `shot` | 一张 PNG，非空，`w > 0` |
@@ -250,16 +252,17 @@ CDP 回 `Execution context was destroyed`。
 
 ```json
 {
-  "text": "8 个面：6 绿 / 2 红；视口 800×740（dpr 2.0）；来源 copy\n\n!! console 3 条错误，第一条：Uncaught TypeError: S.pid is undefined\n!! overflow 横向溢出 42px（.chat 右边界 1222 > 视口 1180）",
-  "engine": {"browser": "Edg/158.0.4370.33", "via": "webview2-cdp", "dpr": 2.0},
+  "text": "8 个面：6 绿 / 2 红；视口 800×740（dpr 2.0）；真页面\n\n!! console 3 条错误，第一条：Uncaught TypeError: S.pid is undefined\n!! overflow 横向溢出 42px（.chat 右边界 1222 > 视口 1180）",
+  "engine": {"browser": "Edg/158.0.0.0", "via": "webview2-cdp", "dpr": 2.0},
   "viewport": {"asked": "pane", "inner": [800, 740]},
-  "source": {"workspace": "copy", "url": "http://127.0.0.1:51234/plugin/mood/"},
+  "source": {"workspace": "<真工作区>", "host": "复用正在跑的宿主", "url": "http://127.0.0.1:51234/#p/mood"},
   "reloaded": true,
+  "data_changed": {"added": [], "changed": ["store.json"], "dir": "plugins/mood/data"},
   "areas": [
     {"id": "console", "ok": false, "facts": {"errors": 3, "first": "Uncaught TypeError: S.pid is undefined"}},
     {"id": "shot",    "ok": true,  "facts": {"path": ".dev-cache/mood/shots/pane.png", "w": 1600, "h": 1480}}
   ],
-  "skipped": [{"id": "interactive", "why": "workspace=real：点了会发真消息"}]
+  "skipped": [{"id": "interactive", "why": "默认不点（这些按钮发真消息）；要点头显式 areas=interactive"}]
 }
 ```
 
@@ -302,7 +305,7 @@ v2 §七 花了三条缓解措施去守那个端口。v3 不再守它 —— 但
 | 7 | 把 `.chat header` 的 `align-items` 改回 `baseline` → 报告**必须红**（第 41 轮那 3.1px） |
 | 8 | 页面里 `throw` → **不是全绿**；`<img src="/不存在.png">` → **也不是全绿**（console 挡不住 404，network 才挡） |
 | 9 | `dev_page_shot` 的图真进 `FunctionResult.parts`（`link.py:495` 现在只发 `Part.t`，`Part.image(raw, mime, name)` 早就有） |
-| 10 | `copy` 模式下真工作区前后 **sha256 逐字节相同** |
+| 10 | 真页面跑完：插件源码与 `config.json` **sha256 逐字节相同**；`plugins/<pid>/data` 的变化**如实进 `data_changed`**（不判红） |
 
 **变异（3 道，证明这些约束真的在起作用）**
 
@@ -310,7 +313,7 @@ v2 §七 花了三条缓解措施去守那个端口。v3 不再守它 —— 但
 |---|---|---|
 | 11 | 把 attach 挪到 `reload` 之后（即不 reload） | 门 8 必须红（证明加载期事件确实靠 reload 拿） |
 | 12 | `hidden=True` 代替屏幕外坐标 | 门 9 必须红（证明截图约束真实存在） |
-| 13 | 报告里的 `engine.browser` 换成 `HeadlessChrome/…` | 门 8 必须红（防止有人偷偷换回 Chrome 验） |
+| 13 | 报告里的 `engine.browser` 换成 `HeadlessChrome/…` | 门 8 必须红（`engine` 从页面 UA 取，取不到才退化成版本号 —— 这一步早读就会静默退化） |
 
 ---
 
@@ -329,7 +332,7 @@ v2 §七 花了三条缓解措施去守那个端口。v3 不再守它 —— 但
 
 | 文件 | 改动 |
 |---|---|
-| `agentworkspace/pagecheck.py` | **新建** ~480 行（子进程+窗口、CDP 会话线程、eval 六条语义、8 个面、报告） |
+| `agentworkspace/pagecheck.py` | **新建** ~480 行（子进程+窗口、CDP 会话线程、eval 六条语义、8 个面、报告）；第44轮删掉 `prepare()`/`--mode`/`DEAD_URL`（-60 行），加 `_engine_name`/`_data_delta` |
 | `agentworkspace/devtools.py` | +5 个动词 ~110 行（会话登记表、idle 回收、`_spill` 复用） |
 | `agentworkspace/kernel.py` | `Result.images`（`kernel.py:271`）+5 行；`rt.port` +2 行 |
 | `agentworkspace/link.py` | `Part.image` 拼装（`:495` 一行变三行）+6 行 |
@@ -345,8 +348,8 @@ v2 §七 花了三条缓解措施去守那个端口。v3 不再守它 —— 但
 
 ## 十二、没做的
 
-- **`interactive` 在 `real` 上是跳过而不是支持**：要做到「点真页面而不发真消息」，得给
-  后端一个 dry-run 档 —— 那是另一件事，不该塞进页面验证里
+- **`interactive` 默认不跑**：它不在默认清单里，显式点名才会点。要点真页面又不发真消息，
+  得给后端一个 dry-run 档 —— 那是另一件事，不该塞进页面验证里
 - **视觉回归（像素 diff）**：两次跑必然有抗锯齿、字体 hinting 的抖动，要先解决基线抖动，这轮不值得
 - **验宿主界面**（`index.html` 本身）：`dev_*` 的作用域就是 `_pdir()`；那是另一副手
 - **webview2 的 `--force-device-scale-factor`**：能固定 dpr 让截图可复现，但它也会改变

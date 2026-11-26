@@ -2320,8 +2320,8 @@ def _run() -> int:
     from . import pagecheck as _pc
 
     sig_o = set(_insp.signature(_dt.page_open).parameters)
-    check("D10a dev_page_open 没有 url 参数（验的只能是自己那个页面，不是通用爬虫）",
-          "url" not in sig_o and {"workspace", "viewport"} <= sig_o, sorted(sig_o))
+    check("D10a dev_page_open 没有 url、也没有 workspace（没有副本模式：只看真页面）",
+          sig_o == {"viewport"}, sorted(sig_o))
     sig_e = set(_insp.signature(_dt.page_eval).parameters)
     check("D10b dev_page_eval 默认在自己的页面里求值（frame: page / host）",
           sig_e == {"js", "sid", "frame"}, sorted(sig_e))
