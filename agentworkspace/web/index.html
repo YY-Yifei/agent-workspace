@@ -328,6 +328,10 @@
      这一说（取消只还原外观预览）。 */
   .pkg{display:flex;flex-direction:column;gap:12px;border-top:1px solid var(--line);
     padding-top:12px}
+  /* `[hidden]` 只是**浏览器默认样式**（display:none），而下面 `.field` 是作者样式
+     —— 作者永远赢。少了这一行，「装成哪个程序」在没选文件时也露着（截图里就是这样），
+     人站在一个空 pid 框前面，不知道要先选文件。 */
+  .pkg .field[hidden]{display:none}
   .pkg .prow{display:flex;gap:8px;align-items:center}
   .pkg select{flex:1 1 auto;min-width:0;height:32px;padding:0 8px;border-radius:10px;
     border:1px solid var(--line);background:var(--bg);color:var(--ink);font:inherit;

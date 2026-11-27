@@ -202,10 +202,16 @@ def main() -> int:
               "plugin/data/store.json" in names2, str(names2))
 
         # ---- 真选一个文件导入：看一眼 → 导入 → 左边栏里多了它
+        # 查的是**看得见**（is_visible），不是 `element.hidden`：属性翻不翻是 JS 的事，
+        # 「人眼前有没有这一格」是 CSS 的事，而这两件事上一版正好相反（见补丁注释）。
+        check("还没选文件时，「装成哪个程序」不该出现在眼前",
+              page.is_visible("#impaswrap") is False)
         page.set_input_files("#impfile", str(demo_pkg))
         page.wait_for_function(
             "document.querySelector('#impprev').textContent.trim().length > 0", timeout=15000)
         page.wait_for_function("!document.querySelector('#impaswrap').hidden", timeout=15000)
+        check("选完文件之后它才出现（在这一步之前人是没什么可填的）",
+              page.is_visible("#impaswrap") is True)
         first = page.inner_text("#impprev")
         check("选完文件先报包里是什么（标题 / 文件数 / 带没带数据）",
               "样例程序" in first and "个文件" in first and "含数据" in first, first)
