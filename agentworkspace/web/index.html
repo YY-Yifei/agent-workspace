@@ -582,7 +582,12 @@ function paintConn() {
 
    所以「像宿主」这件事是**插件主动做的**，宿主只出三样东西：
      ① 同一个 URL：<link rel="stylesheet" href="/aw.css"> —— 宿主自己引的也是它
-     ② 同一座桥：  <script src="/aw.js"></script> —— 深浅自己跟着宿主翻
+     ② 同一座桥：  <script src="/aw.js">（脚本本身） —— 深浅自己跟着宿主翻
+        ⚠ 这段注释里**不许**出现真正的 script 结束标记（要写就写 <\/script>）：
+        HTML 解析器先于 JS 看这份文件，它只认那串字符（后面跟空格也认），会把内联
+        脚本从中间截断。第50轮就是这么把整页 JS 干掉的 —— 症状是「#stage 停在
+        正在连上…」，而且 DOM 里冒出 src="/plugin/${p.id}/" 这种未插值的 iframe
+        （模板字符串被 HTML 当标签解析了）。
      ③ 说出来：开发者模式里 dev_style_guide() 给一份能直接粘的骨架；
         dev_page_check() 的报告里有一行 style 事实（引没引、有没有裸 hex），
         但它**不判错** —— 没借不是坏页面，只是没借。

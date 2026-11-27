@@ -1102,6 +1102,58 @@ def _run() -> int:
     check("宿主不往插件页里注入样式（撤掉注入：不碰别人的文档一个字节）",
           "skinFrame" not in hsrc and "data-aw-skin" not in hsrc
           and "contentDocument" not in hsrc, "")
+    # ── 内联脚本不许被 HTML 从中间截断（第50轮的血）────────────────────────
+    # 5bf7a9f 里我在**注释**中写了一个字面量的 script 结束标记。HTML 解析器不认识
+    # JS 注释，它只认那串字符（后面跟 > 、空格、斜杠都算），于是把内联脚本从那里
+    # 关掉了：后面 1500 行 JS 全变成**页面正文**，boot() 一次都没跑 ——
+    # 症状是「#stage 永远停在正在连上…」，而 DOM 里冒出 src="/plugin/${p.id}/"
+    # 这种未插值的 iframe（模板字符串被当成标签解析了）。
+    #
+    # 为什么不能数 </script> 的个数：那次是 5 个开、5 个闭 —— 注释里那个「假的」
+    # 正好顶替了真正的那个，计数门照样绿。所以这两条门都落在**症状**上。
+    from html.parser import HTMLParser
+
+    class _PageText(HTMLParser):
+        """按 HTML 解析器的切法，分开收「正文文本」与「内联脚本体」。"""
+
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.texts: list[str] = []
+            self.bodies: list[str] = []
+            self._buf: list[str] | None = None
+
+        def handle_starttag(self, tag, attrs):      # noqa: D102 - 只用这几个钩子
+            if tag == "script":
+                self._buf = []
+
+        def handle_endtag(self, tag):               # noqa: D102
+            if tag == "script" and self._buf is not None:
+                self.bodies.append("".join(self._buf))
+                self._buf = None
+
+        def handle_data(self, data):                # noqa: D102
+            if self._buf is not None:
+                self._buf.append(data)
+            else:
+                self.texts.append(data)
+
+    _pg = _PageText()
+    _pg.feed(hsrc)
+    _marks = ("function ", "=> ", "const ", "document.", "${")
+    _leak = [t.strip() for t in _pg.texts if any(k in t for k in _marks)]
+    check("宿主页正文里没有 JS 源码（内联脚本没被提前截断）",
+          not _leak, (_leak[0][:80] if _leak else "正文里没有 JS 片段"))
+    # 第二条门盯的是「脚本本身还完整吗」：被截断时 paintStage / boot 会跑到**正文**里，
+    # 主脚本体就只剩开头那一截。上一版这条写的是「末尾是不是 boot 的 })();」——
+    # 变异验证时它照样是 ok（截断后最长的那段是 head 脚本），装饰品，换掉了。
+    # 认人不能按长度：变异下泄漏的注释里有 `<script src="/aw.js">`，它会在正文里
+    # 重新打开一个 script 元素，把后面漏下来的 JS 全吞进脚本体 —— 「最长的那段」
+    # 于是应有尽有。主内联脚本的头一句就是 "use strict";，按它认。
+    _main = next((b for b in _pg.bodies if b.lstrip().startswith('"use strict";')), "")
+    check("主内联脚本里画得出来（\"use strict\" 开头那段里头有 paintStage / boot）",
+          "function paintStage(" in _main and "async function boot()" in _main,
+          f"主脚本体 {len(_main)} 字符")
+
     check("分层还在（引进来那份不会反客为主：未分层的规则永远赢过分层）",
           "@layer aw.tokens, aw.base;" in aw and aw.count("@layer aw.") >= 3, "")
     # 指导落在开发者模式里。那份 guide 的令牌必须**从 aw.css 现读**，不许手写一份
