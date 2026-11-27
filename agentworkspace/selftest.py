@@ -989,6 +989,17 @@ def _run() -> int:
     check("web/*.js 与 web/*.css 都进了 package-data（漏了就是装完 404 / 样式全丢）",
           pp.is_file() and all(k in pp.read_text(encoding="utf-8")
                                for k in ("web/*.js", "web/*.css")), str(pp))
+    # 第二份清单：package-data 决定 **wheel** 里有什么，MANIFEST.in 决定 **sdist** 里
+    # 有什么。同一件事写两遍，就必然走岔（发布前实测：css 只在其中一份里，靠的是
+    # setuptools「顺手把 package_data 塞进 sdist」这个隐含行为）。所以这里不手写清单，
+    # 拿 web/ 目录里**真实存在的扩展名**去比对 —— 少一个就是少一个。
+    webdir = Path(__file__).resolve().parent / "web"
+    exts = sorted({x.suffix for x in webdir.iterdir() if x.is_file()})
+    mfp = Path(__file__).resolve().parent.parent / "MANIFEST.in"
+    mtx = mfp.read_text(encoding="utf-8") if mfp.is_file() else ""
+    miss = [e for e in exts if f"web/*{e}" not in mtx]
+    check("MANIFEST.in 覆盖 web/ 里每一种扩展名（源码包少一个文件 = 从源码装的人样式全丢）",
+          not miss, f"漏了 {miss}；web/ 里有 {exts}")
 
     # ── 滚动条。这一块在第十轮之前是**零命中**：跑的一直是系统默认那条
     # （17px 宽、浅灰凹槽、两头各一个箭头），背景却是 #0e1013 —— 它比页面上

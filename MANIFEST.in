@@ -4,6 +4,10 @@ include README.md
 include docs/*.md
 include agentworkspace/web/*.html
 include agentworkspace/web/*.js
+# 源样式（aw.css）同样是 web/ 里的一员：它只在 package-data 里写着的时候，源码包
+# 靠 setuptools「顺手把 package_data 带进来」这个**隐含**行为才有它 —— 换成一份
+# 不这么干的构建后端，从 sdist 装的人就没有样式了。这里明写一遍。
+include agentworkspace/web/*.css
 include agentworkspace/assets/*.ico
 recursive-include agentworkspace *.py
 # 源码包要能自己跑测试：`node tests/turn.test.js` 就是这套忙碌状态机的规格。
