@@ -11,9 +11,11 @@ import asyncio
 import enum
 import inspect
 import json
+import os
 import queue
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -119,6 +121,25 @@ def _fixture_note() -> None:
               flush=True)
 
 
+def _relax_stdout() -> None:
+    """让控制台编不出的字符**退化成问号**，而不是把整场自检掀翻。
+
+    为什么这条要单独存在：Windows 默认控制台是 GBK，而某条断言的名字里带着
+    ``✗``（D10l 那条在说「全 ✗ 必须退出 1」）。GBK 编不出这个记号 → ``print``
+    抛 ``UnicodeEncodeError`` → 整场自检跑到一半以 traceback 收场、退出码 1。
+    人看到的是「自检失败」，而真相可能是全绿 —— **门自己把绿说成了红**。
+
+    只放宽 ``errors``、不动 ``encoding``：GBK 控制台上中文照旧可读，编不出的记号
+    变 ``?``；退出码仍由 ``bad`` 决定，一个字也不美化。UTF-8 控制台上什么都不变。
+    """
+    out = sys.stdout
+    if hasattr(out, "reconfigure"):
+        try:
+            out.reconfigure(errors="replace")
+        except (ValueError, OSError):       # 有些哑管道/重定向不支持，静默放过
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     """自检入口：**默认在临时工作台里跑**，``--here`` 才动真工作台。
 
@@ -133,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
                 失败，并在开头说明「那是数据缺失，不是代码坏了」。
     ``--keep``  保留临时工作台。默认规则：全绿就删，红了留着方便复查。
     """
+    # 开口之前先放宽编码：第一句 print 里就可能带着编不出的记号
+    _relax_stdout()
     args = list(sys.argv[1:] if argv is None else argv)
     unknown = [a for a in args if a not in ("--here", "--keep")]
     if unknown:
@@ -3901,6 +3924,29 @@ def _run() -> int:
     httpd.shutdown()
     if getattr(App, "native", None):
         App.native.shutdown()                       # 收尸：不留孤儿窗口
+    # ---- 自检自己：GBK 控制台上编不出的记号不许把整场掀翻
+    # 必须走子进程：本进程的 stdout 编码早就定了，改不回去。
+    # 环境里剥掉所有 PYTHON*（PYTHONUTF8=1 会让 gbk 白设），只留 PYTHONIOENCODING=gbk
+    # 与包根（sys.path[0] 是 cwd，不钉 PYTHONPATH 的话子进程 import 不到包）。
+    _gbk_env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+    _gbk_env["PYTHONIOENCODING"] = "gbk"
+    _gbk_env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+    _p, _pwhy = None, ""
+    try:
+        _p = subprocess.run(
+            [sys.executable, "-c",
+             "from agentworkspace.selftest import _relax_stdout, check\n"
+             "_relax_stdout()\n"
+             "check('\u7f16\u4e0d\u51fa\u7684\u8bb0\u53f7 \\u2717 \u4e5f\u8981\u80fd\u5370\u51fa\u6765', True)\n"
+             "print('done')\n"],
+            env=_gbk_env, capture_output=True, text=True,
+            encoding="gbk", errors="replace", timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as _exc:
+        _pwhy = f"{type(_exc).__name__}: {_exc}"
+    check("GBK 控制台上编不出的记号不让自检炸成一副「失败」的样子",
+          _p is not None and _p.returncode == 0 and "done" in (_p.stdout or ""),
+          (_p.stderr or "")[-300:] if _p is not None else _pwhy)
+
     print(f"\n{'全绿' if bad == 0 else '有失败'}：{ok} 通过 / {bad} 失败")
     return 0 if bad == 0 else 1
 
