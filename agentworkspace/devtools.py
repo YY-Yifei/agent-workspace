@@ -193,6 +193,11 @@ def host_services() -> dict:
         "",
         "**写页面之前调一次 dev_style_guide()** —— 骨架、令牌、四条纪律都在那一份里。",
         "这里只留形状：同一件事写在两处，两处必然漂移，然后有人照着旧的那份写。",
+        "",
+        "插件包：一个程序可以导出成一枚 .awp（\"plugin/**\" + 一份 awp.json），",
+        "导出/导入**在设置面板里，由人点** —— 你没有这条手：包是人在磁盘上挑的一个文件，",
+        "「这个文件从哪来」只有人答得上。你写的程序天生就是包里的形状（plugin.json /",
+        "backend.py / ui/**），所以别人要导出你做的程序，什么都不用改。",
     ]
     return {"text": "\n".join(lines),
             "services": {n: list(f) for n, f in SERVICES.items()},

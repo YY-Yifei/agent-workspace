@@ -34,6 +34,7 @@
 | `native.py` | 原生程序宿主：不是第二条执行路径，是「人的门」的第三种壳 |
 | `main.py` | 入口：装配，没有第四样东西 |
 | `pluginvcs.py` | **旁路**：每个程序就地一个 git 仓（可用 `/api/p/<pid>/versions`，也可被 agent 的四动词调用） |
+| `pluginpkg.py` | **插件包**：一个程序 ⇄ 一枚 `.awp`（导出默认**不带**数据）｜见 `docs/plugin-package.md` |
 | `web/index.html` | 工作台视图 + 对话 + 能力面板（单文件，无构建步骤） |
 | `web/aw.css` | 样式契约：令牌 / 底座 / 滚动条 —— 宿主与插件引的是**同一个 URL**；宿主**不注入**，插件自己引（开发者模式下 `dev_style_guide()` 有骨架）｜见 `docs/host-styles.md` |
 
@@ -120,6 +121,21 @@ workspace/
 `data/` 永不进历史、`.backup/` 不进历史、`[vcs]` 缺失时整条旁路关掉而写入不受影响。
 细节见 [`docs/plugin-versioning.md`](docs/plugin-versioning.md)。
 
+## 插件包（导出 / 导入）
+
+设置面板（⚙）里两块：**导出插件**（选一个程序 → 存成一枚 `.awp`）、**导入插件**
+（选一枚 `.awp` → 装成 `plugins/<pid>`）。程序是用户攒出来的，换台机器 / 备份一下 /
+给同事看一眼，都不该靠「拷一个目录」—— 没人记得住 `data/` 与 `__pycache__/` 哪个算程序。
+
+- **默认不导出数据**：`data/` 要勾「连同数据一起导出」才进包，而且那枚勾选框每次
+  打开面板都归零（记住上次的选择 = 默认导出）。判据在服务端，不在界面。
+- **导入不覆盖**：撞名就拒，并建议一个空着的名字（`pomodoro_2`），改不改由人。
+- **同一道门**：装上去之前跑 `check_plugin` + 子进程 import 探针，起不来就整份回滚 ——
+  与 agent 写程序同一条校验，同一条回滚。
+- 对话（`workspace/sessions/`）**不进包**：那是宿主的会话库，不是插件的东西。
+
+细节与拒绝清单见 [`docs/plugin-package.md`](docs/plugin-package.md)。
+
 ## 开发者模式
 
 一个开关（设置面板里拨），打开后当前程序多拿到一把**只够改自己**的手：
@@ -156,6 +172,7 @@ node tests/md.test.js                 # 消息渲染 Markdown
 - [`docs/agent-per-program.md`](docs/agent-per-program.md) —— 每个程序一个智能体
 - [`docs/dev-mode.md`](docs/dev-mode.md) —— 开发者模式的边界
 - [`docs/plugin-versioning.md`](docs/plugin-versioning.md) —— 程序的版本化与回退
+- [`docs/plugin-package.md`](docs/plugin-package.md) —— 插件包 `.awp`：导出 / 导入与拒绝清单
 - [`docs/settings-and-icon.md`](docs/settings-and-icon.md) —— 设置与窗口图标
 - [`docs/shell-and-native.md`](docs/shell-and-native.md) —— 窗口壳与原生程序
 

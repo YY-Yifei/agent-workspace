@@ -75,11 +75,16 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     # -- 基础 ----------------------------------------------------------
-    def _send(self, code: int, body: bytes, ctype: str) -> None:
+    def _send(self, code: int, body: bytes, ctype: str,
+              headers: dict | None = None) -> None:
         self.send_response(code)
         self.send_header("content-type", ctype)
         self.send_header("content-length", str(len(body)))
         self.send_header("cache-control", "no-store")
+        # 额外的头是**调用方给的**，不是这里发明的：目前只有一个用户 ——
+        # 导出的 content-disposition（文件下载要它，否则浏览器会把它当一页打开）。
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -190,6 +195,35 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "智能体池未装配"}, 503)
             return self._json({"url": hub.url, "theme": settings.load_theme(hub.root),
                                "agents": hub.status()})
+
+        if path == "/api/plugins/export":
+            # 插件的「导出」：同一个入口，`dry=1` 只说「会装进什么」，否则回字节。
+            # **data 默认 0** —— 「默认不导出数据」这条要求的判据就在这半行里，
+            # 不在界面上那枚勾选框：勾选框只表达这一次的选择，而且它每次开面板
+            # 都会被重置。判据放服务端，界面忘了重置也不会悄悄带上数据。
+            from . import pluginpkg
+
+            q = parse_qs(urlsplit(self.path).query)
+            pid = (q.get("pid") or [""])[0]
+            want_data = (q.get("data") or ["0"])[0] in ("1", "true", "yes")
+            plugin = rt.plugins.get(pid)
+            if plugin is None:
+                why = ("内置程序没有插件目录，导不出" if rt.program(pid) is not None
+                       else f"没有程序 {pid}")
+                return self._json({"status": "bad", "error": why}, 404)
+            try:
+                if (q.get("dry") or [""])[0] == "1":
+                    return self._json({"status": "ok", "dry": True,
+                                       **pluginpkg.preview(plugin.path, pid=pid,
+                                                           include_data=want_data)})
+                blob, name = pluginpkg.export(rt, pid, include_data=want_data)
+            except pluginpkg.BadPackage as exc:      # 消息给人看，原样回
+                return self._json({"status": "bad", "error": str(exc)}, 400)
+            # 文件名是 pid + 时间戳（纯 ASCII），所以能直接进 content-disposition；
+            # 中文标题不进文件名 —— 那要走 RFC 5987，而这里没有值得为它加一层的
+            # 信息（标题在包的 awp.json 里，装上去就是它）。
+            return self._send(200, blob, "application/zip", {
+                "content-disposition": f'attachment; filename="{name}"'})
 
         m = STORE_RE.match(path)
         if m:
@@ -331,6 +365,10 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(urlsplit(self.path).path)
         rt, hub = App.runtime, App.hub
         length = int(self.headers.get("content-length") or 0)
+        # 插件包这条路收的是**包的字节**，不是 JSON —— 分流必须在 json.loads 之前，
+        # 读 body 的那一步也归它自己（上限要在读之前判，读完再判就太晚了）。
+        if path == "/api/plugins/import":
+            return self._import(length)
         raw = self.rfile.read(length) if length else b""
         try:
             body = json.loads(raw.decode("utf-8")) if raw else {}
@@ -506,6 +544,57 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"status": msg, "version": rt.version})
 
         return self._json({"error": "not found", "path": path}, 404)
+
+    # -- 插件包 ---------------------------------------------------------
+    IMPORT_MAX = 64 << 20            # 与 pluginpkg.MAX_TOTAL 同一个量级：
+                                     # 压缩包本身比解包后小，这里只挡「别读进内存再说」
+
+    def _import(self, length: int) -> None:
+        """插件包的「导入」：收原始字节；``dry=1`` 只解析、不落盘。
+
+        两条边界，都是「不替人做主」：
+          * **不覆盖**：撞名就拒，一个已有程序的数据不该因为一次手滑而消失；
+          * **不改名**：撞名时给一个空着的建议名，改不改由人在「导入为」里定。
+        """
+        from . import pluginpkg
+
+        rt = App.runtime
+        if length > self.IMPORT_MAX:
+            # 还没读 body 就回绝：HTTP/1.1 是 keep-alive，未读的 body 会被当成
+            # 下一个请求行解析（与 do_POST 开头那道门同一条理由）。
+            self.close_connection = True
+            return self._json({"status": "bad",
+                               "error": f"包太大（{length} 字节 > {self.IMPORT_MAX}）"}, 413)
+        raw = self.rfile.read(length) if length else b""
+        if not raw:
+            return self._json({"status": "bad", "error": "没有收到文件"}, 400)
+        q = parse_qs(urlsplit(self.path).query)
+        name = (q.get("name") or [""])[0]          # 只是给人看的文件名，不进任何路径
+        as_pid = ((q.get("as") or [""])[0] or "").strip() or None
+        dry = (q.get("dry") or [""])[0] == "1"
+        try:
+            pkg = pluginpkg.read(raw, name=name)
+        except pluginpkg.BadPackage as exc:
+            return self._json({"status": "bad", "error": str(exc)}, 400)
+        want = as_pid or pkg["pid"]
+        if dry:
+            # 「先看一眼」与真正导入走**同一个解析**（pluginpkg.read），所以预览里
+            # 看到的东西与装上去的东西不可能不一致 —— 这一点比省一次读更重要。
+            return self._json({
+                "status": "ok", "dry": True, "pid": pkg["pid"], "title": pkg["title"],
+                "files": len(pkg["files"]), "data": pkg["data"],
+                "bytes": pkg["bytes"], "name": name,
+                "conflict": (Path(rt.root) / "plugins" / want).exists(),
+                "suggest": pluginpkg.free_pid(rt.root, want)})
+        try:
+            out = pluginpkg.install(rt, raw, as_pid=as_pid, name=name)
+        except pluginpkg.BadPackage as exc:        # 校验没过 / 起不来 / 撞名：原样回人话
+            return self._json({"status": "bad", "error": str(exc)}, 400)
+        tail = "（含数据）" if out["data"] else "（没带数据：装上去是个干净的程序）"
+        msg = f"已导入 {out['title']}，{out['files']} 个文件{tail}"
+        if out["renamed"]:
+            msg += f"；装成了 {out['pid']}（包里那个叫 {pkg['pid']}）"
+        return self._json({**out, "status": "ok", "message": msg})
 
     # -- SSE -----------------------------------------------------------
     def _sse(self) -> None:

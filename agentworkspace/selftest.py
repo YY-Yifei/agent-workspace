@@ -3707,6 +3707,194 @@ def _run() -> int:
     check("门6c 残余的工具卡当场收成「已中断」（否则组头一直报「进行中」）",
           "if (t.status === '运行中') t.status = '已中断';" in html40, "")
 
+    print("[25] 插件包：导出 / 导入（**默认不导出数据**）")
+    # 这一节验的是「一个程序是什么」——它不靠界面，所以除了最后两条界面门，
+    # 其余都能在门里整个跑一遍。判据全在 pluginpkg（与 agent 写程序同一道校验）。
+    import io
+    import zipfile
+
+    from . import pluginpkg
+
+    def _post_raw(path: str, data: bytes) -> dict:
+        """导入收的是**字节**，不是 JSON —— 所以要一条自己的 POST。"""
+        req = Request(base + path, data=data,
+                      headers={"content-type": "application/octet-stream"}, method="POST")
+        try:
+            with urlopen(req, timeout=30) as r:
+                return json.loads(r.read() or b"{}")
+        except Exception as exc:                    # HTTPError 也是响应
+            code_ = getattr(exc, "code", 0)
+            body_ = getattr(exc, "read", lambda: b"")()
+            try:
+                return json.loads(body_ or b"{}")
+            except ValueError:
+                return {"status": "bad", "error": body_.decode("utf-8", "replace"),
+                        "_code": code_}
+
+    pdir = WS / "plugins" / "pomodoro"
+    # 先给它一份**数据**：不给的话「默认不带数据」这条门就算不出差别来
+    # （没有数据 → 带不带都是空的，门自己先空转）。
+    (pdir / "data").mkdir(exist_ok=True)
+    (pdir / "data" / "store.json").write_text('{"n": 1}', encoding="utf-8")
+
+    blob = pluginpkg.build(pdir)
+    pk = pluginpkg.read(blob)
+    check("默认导出的包里**没有** data/（数据不是默认值，是选择）",
+          not any(n.startswith("plugin/data/") for n in pk["names"]), str(pk["names"]))
+    check("默认导出的包里有程序本体（plugin.json / backend.py / ui/）",
+          {"plugin/plugin.json", "plugin/backend.py"} <= set(pk["names"]), str(pk["names"]))
+    check("__pycache__ / .pyc 不进包（那是运行期垃圾，不是程序）",
+          not any("__pycache__" in n or n.endswith(".pyc") for n in pk["names"]))
+    check("包的身份写在 awp.json 里，且**如实**说没带数据",
+          json.loads(pluginpkg.read(blob) and
+                     zipfile.ZipFile(io.BytesIO(blob)).read("awp.json"))["data"] is False)
+
+    blob_d = pluginpkg.build(pdir, include_data=True)
+    pkd = pluginpkg.read(blob_d)
+    check("勾了数据就带上 data/store.json（同一个入口，只换一个参数）",
+          "plugin/data/store.json" in pkd["names"], str(pkd["names"]))
+
+    # ---- 往返：导出 → 装进另一个工作台 → 一模一样，且真的能跑
+    dst = Path(tempfile.mkdtemp(prefix="aw-pkg-dst-"))
+    (dst / "plugins").mkdir(parents=True)
+    rt2 = kernel.Runtime(dst)
+    rt2.scan()
+    out = pluginpkg.install(rt2, blob)
+    check("装回去的程序出现在内核里（装载与写盘是同一条路）",
+          out["pid"] in rt2.plugins, str(sorted(rt2.plugins)))
+    check("往返之后 backend.py 与 ui/index.html **逐字节相同**",
+          (dst / "plugins" / out["pid"] / "backend.py").read_bytes()
+          == (pdir / "backend.py").read_bytes()
+          and (dst / "plugins" / out["pid"] / "ui" / "index.html").read_bytes()
+          == (pdir / "ui" / "index.html").read_bytes())
+    # 这两条必须**早于** dispatch 与 rmtree：
+    #   · 先查「干净」—— pomodoro 的 start() 会 ctx.set 一次，它自己会把 data/ 建出来，
+    #     放在 dispatch 后面验就成了「跑一次之后有没有数据」，那是另一件事；
+    #   · 再查「撞名」—— 目录被删掉之后撞名自然不成立，门会绿，而绿的是一句空话。
+    check("默认包装上去是**干净**的：没有 data/（用户那份数据没跟着代码走）",
+          not (dst / "plugins" / out["pid"] / "data").exists())
+    try:
+        pluginpkg.install(rt2, blob)
+    except pluginpkg.BadPackage as exc:
+        # 认**产品真正说的那半句**（不认我脑子里那个关键词：门按想象里的措辞写，
+        # 就成了「验一句话对不对」，而不是「这个行为有没有发生」）。
+        ok_msg = "已经有一个叫" in str(exc) and "不覆盖" in str(exc)
+        why_msg = str(exc)
+    else:
+        ok_msg, why_msg = False, "居然装上了"
+    check("撞名**不覆盖**（拒绝，而不是悄悄替人改名）", ok_msg, why_msg)
+
+    d = rt2.dispatch(out["pid"], "start", {"minutes": 2}, "human")
+    check("装回来的程序**现在就能用**（同一个 dispatch 跑得通）", d.status == "ok", d.text)
+    shutil.rmtree(dst, ignore_errors=True)
+
+    # ---- 拦：四条「不该装上的东西」
+
+    buf = Path(tempfile.mkdtemp(prefix="aw-pkg-evil-")) / "evil.awp"
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("awp.json", json.dumps({"awp": 1, "pid": "evil", "data": False}))
+        zf.writestr("plugin/plugin.json", "{}")
+        zf.writestr("plugin/backend.py", "x = 1\n")
+        zf.writestr("plugin/../../escaped.txt", b"boom")
+    try:
+        pluginpkg.read(buf.read_bytes())
+        slip = None
+    except pluginpkg.BadPackage as exc:
+        slip = str(exc)
+    check("zip slip（plugin/../../escaped.txt）在**解包前**就被拒", bool(slip), str(slip))
+
+    buf2 = Path(tempfile.mkdtemp(prefix="aw-pkg-liar-")) / "liar.awp"
+    with zipfile.ZipFile(buf2, "w") as zf:
+        zf.writestr("awp.json", json.dumps({"awp": 1, "pid": "liar", "data": False}))
+        zf.writestr("plugin/plugin.json", "{}")
+        zf.writestr("plugin/backend.py", "x = 1\n")
+        zf.writestr("plugin/data/store.json", "{}")
+    try:
+        pluginpkg.read(buf2.read_bytes())
+        liar = None
+    except pluginpkg.BadPackage as exc:
+        liar = str(exc)
+    check("包说「没带数据」却塞了 data/ → 这份包自相矛盾，拒收", bool(liar), str(liar))
+
+    ro = Path(tempfile.mkdtemp(prefix="aw-pkg-broken-"))
+    rt3 = kernel.Runtime(ro)
+    (ro / "plugins").mkdir(parents=True, exist_ok=True)
+    rt3.scan()
+    buf3 = ro.parent / f"{ro.name}-broken.awp"
+    with zipfile.ZipFile(buf3, "w") as zf:
+        zf.writestr("awp.json", json.dumps({"awp": 1, "pid": "broken", "data": False}))
+        zf.writestr("plugin/plugin.json", json.dumps({"title": "坏的"}))
+        zf.writestr("plugin/backend.py", "raise RuntimeError('一 import 就炸')\n")
+        zf.writestr("plugin/ui/index.html", "<html><body>x</body></html>")
+    try:
+        pluginpkg.install(rt3, buf3.read_bytes())
+        broken = ""
+    except pluginpkg.BadPackage as exc:
+        broken = str(exc)
+    check("起不来的包：拒收，且**整份回滚**（不留下半个程序）",
+          bool(broken) and not (ro / "plugins" / "broken").exists(), broken[:120])
+    try:
+        pluginpkg.install(rt3, blob, as_pid="assistant")
+        resv = ""
+    except pluginpkg.BadPackage as exc:
+        resv = str(exc)
+    check("保留名（assistant）装不进来 —— 与装载处同一条判据", "保留名" in resv, resv[:120])
+    shutil.rmtree(ro, ignore_errors=True)
+
+    # ---- 门上的两条（人真的会点的那个入口）
+    codex, bodyx, hx = get(base, "/api/plugins/export?pid=pomodoro")
+    z = zipfile.ZipFile(io.BytesIO(bodyx))
+    check("GET /api/plugins/export 回 zip + 下载头（否则浏览器把它当一页打开）",
+          codex == 200 and hx.get("content-disposition", "").endswith('.awp"'),
+          f"{codex} {hx.get('content-disposition')}")
+    check("**不带 data=1 就没有 data/** —— 「默认不导出」判在服务端，不靠界面",
+          "plugin/data/store.json" not in z.namelist(), str(z.namelist()))
+    _, body1, _ = get(base, "/api/plugins/export?pid=pomodoro&data=1")
+    check("data=1 才有 data/（这一条是上一条的对照，缺了它就证不出差别）",
+          "plugin/data/store.json" in zipfile.ZipFile(io.BytesIO(body1)).namelist())
+    dryx = json.loads(get(base, "/api/plugins/export?pid=pomodoro&dry=1")[1])
+    check("dry=1 只说「会装进什么」（不打包、不落盘）",
+          dryx["status"] == "ok" and dryx["codeFiles"] == 3 and dryx["dataFiles"] == 0,
+          str(dryx))
+    nx = json.loads(get(base, "/api/plugins/export?pid=assistant")[1])
+    check("内置程序导不出（它没有插件目录）", nx.get("status") == "bad", str(nx))
+
+    d1 = _post_raw("/api/plugins/import?name=pomodoro.awp&dry=1", blob_d)
+    check("导入 dry：报出包里的 pid / 标题 / 文件数 / 带没带数据",
+          d1["status"] == "ok" and d1["pid"] == "pomodoro" and d1["data"] is True
+          and d1["files"] == len(pkd["files"]), str(d1))
+    check("导入 dry **不落盘**（看一眼就写一个目录，那不叫看一眼）",
+          not (WS / "plugins" / d1["suggest"]).exists(), d1.get("suggest"))
+    d2 = _post_raw(f"/api/plugins/import?name=pomodoro.awp&as={d1['suggest']}", blob_d)
+    check("撞名时按「导入为」装成另一个名字，且成功",
+          d2["status"] == "ok" and d2["pid"] == d1["suggest"] and d2["renamed"] is True,
+          str(d2)[:200])
+    check("装完立刻生效：内核里有它（install 自己 scan，不靠调用方记得）",
+          d2["pid"] in rt.plugins, str(sorted(rt.plugins)))
+    check("带数据的包装上去，数据也真的在",
+          (WS / "plugins" / d2["pid"] / "data" / "store.json").is_file())
+    d3 = _post_raw("/api/plugins/import?name=pomodoro.awp&as=pomodoro", blob_d)
+    check("导入**不覆盖**已有程序（那条路由上也一样）", d3["status"] == "bad", str(d3)[:160])
+    check("被拒之后原程序一个字节都没动",
+          (WS / "plugins" / "pomodoro" / "backend.py").read_bytes()
+          == (pdir / "backend.py").read_bytes())
+
+    # ---- 界面那一条：勾选**默认不勾**，且每次开面板归零
+    htmlx = get(base, "/")[1].decode("utf-8", "replace")
+    check("设置面板里有插件导出的入口（选程序 + 导出）",
+          'id="exppid"' in htmlx and 'id="expbtn"' in htmlx, "")
+    check("设置面板里有插件导入的入口（选文件 + 导入为）",
+          'id="impfile"' in htmlx and 'id="impas"' in htmlx, "")
+    box = re.search(r'<input type="checkbox" id="expdata"[^>]*>', htmlx)
+    check("「连同数据」那枚勾选框在 HTML 里**没有 checked**（默认不导出）",
+          bool(box) and "checked" not in box.group(0), box.group(0) if box else "缺这一格")
+    check("每次打开面板都把它归零（记住上次 = 默认导出）",
+          "$('#expdata').checked = false;" in htmlx)
+    stx = json.loads(get(base, "/api/state")[1])
+    _bi = {p["id"]: p.get("builtin") for p in stx["programs"]}
+    check("state 里内置程序标 builtin=True、插件标 False（界面靠这一格，不靠 id 硬编码）",
+          _bi.get("assistant") is True and _bi.get("pomodoro") is False, str(_bi))
+
     for _r in roots40:
         shutil.rmtree(_r, ignore_errors=True)
 

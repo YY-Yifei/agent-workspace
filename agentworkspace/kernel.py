@@ -511,6 +511,7 @@ class Plugin:
                 "icon": self.manifest.get("icon") or "",
                 "hasUi": self.ui is not None, "uiKind": self.ui_kind,
                 "uiName": (self.manifest.get("ui") or "ui/index.html") if self.ui else "",
+                "builtin": False,          # 与 BuiltinProgram 那格的同一份契约
                 "error": self.error,
                 "functions": [{"name": c.wire, "fn": c.fn,
                                "description": c.description,

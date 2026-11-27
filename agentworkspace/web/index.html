@@ -323,6 +323,25 @@
     background:var(--bg);color:var(--dim);font:inherit;font-size:13px;cursor:pointer}
   .seg button:hover{color:var(--ink);border-color:var(--dim)}
   .seg button.on{background:var(--bubble);border-color:var(--accent);color:var(--ink)}
+  /* 插件包：这一块不是「设置」，是「搬进搬出」。所以它和上面两项之间有一道线，
+     而它自己的按钮**不走**「保存并重连」—— 导出/导入做了就做了，没有「取消」
+     这一说（取消只还原外观预览）。 */
+  .pkg{display:flex;flex-direction:column;gap:12px;border-top:1px solid var(--line);
+    padding-top:12px}
+  .pkg .prow{display:flex;gap:8px;align-items:center}
+  .pkg select{flex:1 1 auto;min-width:0;height:32px;padding:0 8px;border-radius:10px;
+    border:1px solid var(--line);background:var(--bg);color:var(--ink);font:inherit;
+    font-size:13px}
+  .pkg button{flex:0 0 auto;height:32px;padding:0 12px;border-radius:10px;
+    border:1px solid var(--line);background:var(--bg);color:var(--ink);font:inherit;
+    font-size:13px;cursor:pointer}
+  .pkg button:hover{border-color:var(--accent);color:var(--accent)}
+  .pkg button[disabled]{opacity:.55;cursor:default;border-color:var(--line);color:var(--dim)}
+  .pkg input[type=file]{flex:1 1 auto;min-width:0;font:inherit;font-size:12px;
+    color:var(--dim)}
+  .pkg .chk{display:flex;flex-direction:row;align-items:center;gap:7px;font-size:12px;
+    color:var(--dim);cursor:pointer}
+  .pkg .chk input{width:14px;height:14px;margin:0;accent-color:var(--accent)}
   /* 版本面板：与设置面板同一套骨架（#mask/.dlg），只多一个可滚动的列表。
      列表自己滚，标题与按钮不动 —— 版本多了也不会把「关闭」推出视野。 */
   /* 会话面板复用同一套骨架（#mask/.dlg + .vrow）：它是同一类东西 ——
@@ -396,6 +415,31 @@
       <input id="aaasurl" spellcheck="false" autocomplete="off"
              placeholder="ws://localhost:8888/">
     </label>
+    <div class="pkg">
+      <div class="field">
+        <span>导出插件</span>
+        <div class="prow">
+          <select id="exppid" aria-label="要导出的插件"></select>
+          <button type="button" id="expbtn">导出</button>
+        </div>
+        <label class="chk" for="expdata"><input type="checkbox" id="expdata">
+          连同数据一起导出</label>
+        <div class="hint" id="expprev"></div>
+      </div>
+      <div class="field">
+        <span>导入插件</span>
+        <div class="prow">
+          <input type="file" id="impfile" accept=".awp,application/zip"
+                 aria-label="选择插件包">
+          <button type="button" id="impbtn" disabled>导入</button>
+        </div>
+        <div class="field" id="impaswrap" hidden>
+          <span>装成哪个程序（撞名时改这里）</span>
+          <input id="impas" spellcheck="false" autocomplete="off" placeholder="pid">
+        </div>
+        <div class="hint" id="impprev"></div>
+      </div>
+    </div>
     <div class="stat"><i class="sdot" id="setdot" aria-hidden="true"></i>
       <span class="hint" id="setstat"></span></div>
     <div class="hint" id="setmsg"></div>
@@ -1989,6 +2033,130 @@ function setHint(text, cls) {
   el.className = 'hint' + (cls ? ' ' + cls : '');
 }
 
+/* ------------------------------------------------------- 插件包（搬进搬出） */
+/* 「数据是否导出」**默认不勾**，而且每次开面板都重新归零。记住上次的选择就等于
+   默认导出 —— 记住的是「上次导过一次」，而带没带数据没人会去看第二遍。
+   判据在服务端：`/api/plugins/export` 不带 data 就是不带。这里只是表达这一次的选择。 */
+let impPick = null;        // 选好、且已经「看过一眼」的那枚包（File）
+
+function setPkgHint(sel, text, cls) {
+  const el = $(sel);
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = 'hint' + (cls ? ' ' + cls : '');
+}
+
+/* 内置程序（小助理）没有目录、没有 data、也导不出 —— 靠 state 里那一格 builtin
+   判，不靠「id 是不是 assistant」：那等于把内核的一条事实在界面上再抄一遍。 */
+function pkgPlugins() { return (S.programs || []).filter((p) => !p.builtin); }
+
+function paintPkgPicker() {
+  const sel = $('#exppid');
+  const list = pkgPlugins();
+  sel.innerHTML = list.length
+    ? list.map((p) => `<option value="${esc(p.id)}">${esc(p.title)}（${esc(p.id)}）</option>`).join('')
+    : '<option value="">（还没有插件）</option>';
+  sel.disabled = !list.length;
+  $('#expbtn').disabled = !list.length;
+  $('#expdata').checked = false;          // 默认不导出数据（每次都归零）
+  setPkgHint('#expprev', '');
+  impPick = null;
+  $('#impfile').value = '';
+  $('#impaswrap').hidden = true;
+  $('#impas').value = '';
+  $('#impbtn').disabled = true;
+  setPkgHint('#impprev', '');
+  if (list.length) previewExport();
+}
+
+/* 「会装进什么」——导出前先报数，而不是让人导出完再打开 zip 数文件。
+   走 dry=1：同一个入口，同一个解析，只是不回字节。 */
+async function previewExport() {
+  const pid = $('#exppid').value;
+  if (!pid) return;
+  const data = $('#expdata').checked ? 1 : 0;
+  const r = await fetch(`/api/plugins/export?pid=${encodeURIComponent(pid)}&data=${data}&dry=1`)
+    .then((x) => x.json()).catch(() => null);
+  if (!r || r.status !== 'ok') {
+    setPkgHint('#expprev', (r && r.error) || '预览失败', 'bad');
+    return;
+  }
+  const n = (r.codeFiles || 0) + (r.dataFiles || 0);
+  const size = r.bytes >= 1024 ? `${Math.round(r.bytes / 1024)} KB` : `${r.bytes} 字节`;
+  setPkgHint('#expprev', r.dataFiles
+    ? `会装进 ${n} 个文件 / ${size}（其中数据 ${r.dataFiles} 个）· ${r.name}`
+    : `会装进 ${n} 个文件 / ${size}（不含数据）· ${r.name}`, '');
+}
+
+/* 导出走**下载**，不 fetch：文件得有个落点。同源 + content-disposition: attachment，
+   浏览器与 WebView2 都会把它当成一次下载，而不是把 zip 当一页打开。 */
+function doExport() {
+  const pid = $('#exppid').value;
+  if (!pid) return;
+  const data = $('#expdata').checked ? 1 : 0;
+  const a = document.createElement('a');
+  a.href = `/api/plugins/export?pid=${encodeURIComponent(pid)}&data=${data}`;
+  a.download = '';        // 文件名以服务端的 content-disposition 为准
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setPkgHint('#expprev', `已交给浏览器下载${data ? '（含数据）' : '（不含数据）'}`, 'ok');
+}
+
+async function postPackage(file, dry, as) {
+  const body = await file.arrayBuffer();
+  const q = `name=${encodeURIComponent(file.name)}${dry ? '&dry=1' : ''}`
+    + (as ? `&as=${encodeURIComponent(as)}` : '');
+  return fetch(`/api/plugins/import?${q}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/octet-stream' },
+    body,
+  }).then((x) => x.json()).catch((err) => ({ status: 'bad', error: String(err) }));
+}
+
+/* 导入是**两步**：先看一眼（包里是谁、几个文件、有没有数据、撞不撞名），再装。
+   撞名时服务端给一个空着的建议名，预填进「导入为」—— 建议归建议，改不改由人。 */
+async function pickImport() {
+  const f = $('#impfile').files && $('#impfile').files[0];
+  if (!f) return;
+  $('#impbtn').disabled = true;
+  $('#impaswrap').hidden = true;
+  setPkgHint('#impprev', '看一眼…', '');
+  const r = await postPackage(f, true, '');
+  if (!r || r.status !== 'ok') {
+    impPick = null;
+    setPkgHint('#impprev', (r && r.error) || '这个包读不出来', 'bad');
+    return;
+  }
+  impPick = f;
+  $('#impas').value = r.suggest || r.pid;
+  $('#impaswrap').hidden = false;
+  $('#impbtn').disabled = false;
+  const size = r.bytes >= 1024 ? `${Math.round(r.bytes / 1024)} KB` : `${r.bytes} 字节`;
+  const tail = r.conflict ? ' · 已经有同名程序，换个名字' : '';
+  setPkgHint('#impprev', `${r.title}（${r.pid}）· ${r.files} 个文件 / ${size}`
+    + `${r.data ? '（含数据）' : '（不含数据）'}${tail}`, r.conflict ? 'bad' : 'ok');
+}
+
+async function doImport() {
+  if (!impPick) return;
+  const pid = $('#impas').value.trim();
+  $('#impbtn').disabled = true;
+  setPkgHint('#impprev', '导入中…', '');
+  const r = await postPackage(impPick, false, pid);
+  if (!r || r.status !== 'ok') {
+    $('#impbtn').disabled = false;
+    setPkgHint('#impprev', (r && r.error) || '导入失败', 'bad');
+    return;
+  }
+  setPkgHint('#impprev', r.message || '已导入', 'ok');
+  impPick = null;
+  $('#impfile').value = '';
+  $('#impaswrap').hidden = true;
+  await loadState();      // 新程序出现在左边栏：**读真状态**，不在这里猜一份
+  paintRail();
+}
+
 function openSettings() {
   const m = $('#mask');
   if (!m) return;
@@ -1996,6 +2164,7 @@ function openSettings() {
   m.classList.add('on');
   m.setAttribute('aria-hidden', 'false');
   $('#aaasurl').value = (S.settings && S.settings.url) || '';
+  paintPkgPicker();
   paintThemeSeg();
   setHint('');
   paintConn();
@@ -2049,6 +2218,16 @@ $('#themeseg').addEventListener('click', (e) => {
 });
 $('#setcancel').onclick = closeSettings;
 $('#setform').onsubmit = saveSettings;
+$('#exppid').addEventListener('change', previewExport);
+$('#expdata').addEventListener('change', previewExport);
+$('#expbtn').onclick = doExport;
+$('#impfile').addEventListener('change', pickImport);
+$('#impbtn').onclick = doImport;
+/* 在「导入为」里敲回车，不该触发表单提交（那是「保存并重连」）——
+   这一步的下一步是导入，不是保存设置。 */
+$('#impas').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); doImport(); }
+});
 $('#mask').addEventListener('click', (e) => { if (e.target.id === 'mask') closeSettings(); });
 $('#vclose').onclick = closeVersions;
 $('#vmask').addEventListener('click', (e) => { if (e.target.id === 'vmask') closeVersions(); });
