@@ -7,7 +7,7 @@
 用法::
 
     python -m agentworkspace.main                       # 起桌面窗口（pywebview）
-    # 工作区默认就是**你敲命令时所在的目录**；--workspace 可换，不存在会自动新建
+    # 工作台默认就是**你敲命令时所在的目录**；--workspace 可换，不存在会自动新建
     python -m agentworkspace.main --browser             # 换成浏览器（pywebview 起不来时的形态）
     python -m agentworkspace.main --cli                 # 命令行：跟小助理说一句
     python -m agentworkspace.main --cli -m "做个番茄钟"    # 同上
@@ -39,7 +39,7 @@ try:                                   # 控制台多半是 GBK：不让一行�
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
-# 默认工作区 = **启动时的当前目录**。
+# 默认工作台 = **启动时的当前目录**。
 # 原来这里是 ROOT.parent / "workspace" —— 那是「从源码仓库里跑」的形状。
 # 一旦装进 site-packages，它就等于 site-packages/workspace：一个谁都没有的地方，
 # 对 PyPI 用户永远是错的默认值。而当前目录是「我现在要做的事」。
@@ -49,9 +49,9 @@ ICON = ROOT / "assets" / "icon.ico"          # 窗口图标：我们自己画的
 
 
 def _load_cfg(ws: Path) -> dict:
-    """读工作区设置；**形状不对就当没有**。
+    """读工作台设置；**形状不对就当没有**。
 
-    默认工作区可以是任意启动目录，所以这个文件可能根本不是我们的：解析成数组、
+    默认工作台可以是任意启动目录，所以这个文件可能根本不是我们的：解析成数组、
     ``"server"`` 是 null / 字符串 / 列表，都见过。这里不猜，一律降级 —— 让调用方
     永远能 ``cfg.get("server", {}).get(...)`` 而不炸。
     （settings.load() 也读这份文件，它的 isinstance 护栏必须与这里一致。）
@@ -81,7 +81,7 @@ def _load_cfg(ws: Path) -> dict:
 
 
 def _executable_plugins(ws: Path) -> list[str]:
-    """启动时**真的会被执行**的程序名 —— 给「默认工作区 = 当前目录」那条提示用。
+    """启动时**真的会被执行**的程序名 —— 给「默认工作台 = 当前目录」那条提示用。
 
     判据必须与内核一致，宁可少说也不许多数：``Runtime.scan()`` 跳过 ``_`` / ``.``
     开头的目录；``Runtime._load()`` 还要求 ``plugin.json`` 能解析、``backend.py``
@@ -320,7 +320,7 @@ def _wait_forever() -> None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="agentworkspace.main", description="Agent Workspace")
     ap.add_argument("--workspace", default=None, metavar="DIR",
-                    help="工作区目录（默认：启动时的当前目录；不存在则新建）")
+                    help="工作台目录（默认：启动时的当前目录；不存在则新建）")
     # None = 读 config.json；0 = 随机空闲端口（验收用它，绝不和别的宿主抢）
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--cli", action="store_true", help="不开界面，跑一条真链路")
@@ -341,20 +341,20 @@ def main(argv: list[str] | None = None) -> int:
         # 除了 OSError（目录被删 / 网络盘断开），expanduser 在 POSIX 上还会抛
         # RuntimeError（`~nosuchuser`）与 KeyError（$HOME 未设且 uid 查不到）。
         # 三个都收：抛上去就是一个裸 traceback，而这行代码的存在意义正是不抛。
-        print(f"[工作区] 定位不到启动目录：{exc}", flush=True)
+        print(f"[工作台] 定位不到启动目录：{exc}", flush=True)
         print("     → 用 --workspace 指定一个确定存在的路径", flush=True)
         return 2
-    if not ws.is_dir():                  # 工作区就是一个目录：没有就建，
+    if not ws.is_dir():                  # 工作台就是一个目录：没有就建，
         try:
             ws.mkdir(parents=True, exist_ok=True)
         except OSError as exc:           # 没权限 / 路径中段是文件 / 它本身就是个文件
-            print(f"[工作区] 建不出来：{ws}（{exc}）", flush=True)
+            print(f"[工作台] 建不出来：{ws}（{exc}）", flush=True)
             print("     → 这个路径本身是个文件，或者中间某一级是文件；换个 --workspace",
                   flush=True)
             return 2
         # 成功之后才说「新建」：先报成功再失败，等于对人撒一次谎
-        print(f"[工作区] 新建：{ws}", flush=True)   # 别让人先 mkdir 再启动
-    if not a.workspace:                  # 与上面「用真值挑工作区」同一个判据
+        print(f"[工作台] 新建：{ws}", flush=True)   # 别让人先 mkdir 再启动
+    if not a.workspace:                  # 与上面「用真值挑工作台」同一个判据
         # 默认 = 启动时的当前目录，等于把「我在哪个目录」当成信任边界。
         # 这件事必须说出来：build() 里的 scan() 会 exec 这里每一个
         # plugins/*/backend.py，dev.json 也从同一个根读。别让它悄悄成立。
@@ -365,23 +365,23 @@ def main(argv: list[str] | None = None) -> int:
         # 会在人点一次「保存设置」时被整份抹掉）。
         # 这不是本轮新增的行为，但默认 cwd 把它从「你挑的目录」变成「你恰好所在的目录」。
         stray = [n for n in ("config.json", "dev.json") if (ws / n).is_file()]
-        # 「是不是我们的工作区」要看**内容与痕迹**，不能看目录名：
-        # plugins/ 太常见（别人的项目也常有），而只有一份 config.json 的工作区
+        # 「是不是我们的工作台」要看**内容与痕迹**，不能看目录名：
+        # plugins/ 太常见（别人的项目也常有），而只有一份 config.json 的工作台
         # 恰恰是本程序自己写出来的 —— 按目录名判会把两种情况都判反。
         # `server` **不在**标记集合里：Node / FastAPI / Unity 的 config.json 常有它，
         # 而本程序从不写这一段（settings.save_url 只写 aaas）。把它当标记，
-        # 等于让一份外人配置冒充「我们的工作区」，提示被静默吞掉。
+        # 等于让一份外人配置冒充「我们的工作台」，提示被静默吞掉。
         ours = bool({"aaas", "agent"} & set(_load_cfg(ws))) \
             or (ws / ".shell").is_dir() \
             or (ws / "logs" / "events.jsonl").is_file()
         if stray and not ours:
-            print(f"[工作区] {ws} 里已有 {'、'.join(stray)}：本程序会把它当自己的设置读取，"
+            print(f"[工作台] {ws} 里已有 {'、'.join(stray)}：本程序会把它当自己的设置读取，"
                   f"保存设置时就地改写它", flush=True)
-            print("     → 这看起来更像别人的项目而不是工作区；"
+            print("     → 这看起来更像别人的项目而不是工作台；"
                   "不是你的就用 --workspace 换一处", flush=True)
         if found:
             shown = "、".join(found[:8]) + ("…" if len(found) > 8 else "")
-            print(f"[工作区] {ws}（= 启动时的当前目录）里有 {len(found)} 个程序：{shown}",
+            print(f"[工作台] {ws}（= 启动时的当前目录）里有 {len(found)} 个程序：{shown}",
                   flush=True)
             print("     → 它们的 backend.py 会被加载执行；只在你信任这个目录时启动，"
                   "否则用 --workspace 换一处", flush=True)

@@ -29,8 +29,8 @@ CDP 只是**挂在同一个窗口上的观察通道**，不是第二个引擎：
      用 ``add_init_script`` 抢在导航前注脚本：那是**为了观察而改变观察对象**）。
      代价写进报告：页面加载两次，第一次的 console 拿不到。
 
-验证对象只有一个：**真页面** —— 真工作区、真插件、真会话、你此刻正在跑的那个宿主。
-没有「副本工作区」这一档：副本能截图、能点按钮，但它不回答「我的页面在真实数据下
+验证对象只有一个：**真页面** —— 真工作台、真插件、真会话、你此刻正在跑的那个宿主。
+没有「副本工作台」这一档：副本能截图、能点按钮，但它不回答「我的页面在真实数据下
 长什么样」。要看，就看真的。
 
 进程只有两个（第二个只在没有现成宿主时才起）：
@@ -63,7 +63,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-# 缓存**不在这里**：它必须落在工作区里，见 Worker.cache。
+# 缓存**不在这里**：它必须落在工作台里，见 Worker.cache。
 OFFSCREEN = -3000                  # 屏幕外坐标：可见（能合成帧）但不挡人
 MAX_VALUE = 4000                   # eval 返回值超过这个字符就落盘
 IDLE = 300                         # 没有命令这么久就自己收尸
@@ -187,7 +187,7 @@ def plugin_of(ws: Path, pid: str) -> dict:
     out = {"pid": pid, "dir": str(pdir), "exists": pdir.is_dir(), "has_ui": False,
            "why": ""}
     if not out["exists"]:
-        out["why"] = f"工作区里没有这个程序：{pdir}"
+        out["why"] = f"工作台里没有这个程序：{pdir}"
         return out
     try:
         meta = json.loads(man.read_text(encoding="utf-8")) if man.exists() else {}
@@ -209,7 +209,7 @@ def plugin_of(ws: Path, pid: str) -> dict:
 def spawn_host(ws: Path, pid: str, log: Path) -> tuple[subprocess.Popen, int]:
     """起一个只开门、不开窗的宿主，读到它的端口就返回。
 
-    ``ws`` 是**真工作区**：只有在没有现成宿主可连时才走到这里。
+    ``ws`` 是**真工作台**：只有在没有现成宿主可连时才走到这里。
 
     为什么不让本进程直接 serve：窗口要加载一个 URL，而 ``webview.start()`` 会
     占死主线程 —— 同一个进程里既当服务器又当 GUI 会互相等。用 CLI 还顺带复用了
@@ -302,10 +302,10 @@ class Worker:
 
     @property
     def cache(self) -> Path:
-        """``<工作区>/.dev-cache/<pid>/`` —— 缓存只能落在这里。
+        """``<工作台>/.dev-cache/<pid>/`` —— 缓存只能落在这里。
 
         返回给 agent 的路径（eval 落盘、截图）要拿 ``dev_read`` 去打开，
-        而 ``toolbox._safe()`` 拒绝工作区外的一切；落在包目录旁边时，
+        而 ``toolbox._safe()`` 拒绝工作台外的一切；落在包目录旁边时，
         那些路径一个都打不开。装成 wheel 之后那个目录还常常是只读的
         —— 于是 ``eval`` 抛 PermissionError，而它不在这条路的 try 里。
         """
@@ -854,9 +854,9 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="agentworkspace.pagecheck",
                                  description="在真窗口真引擎里看自己的页面")
     ap.add_argument("--pid", required=True, help="哪个程序的页面")
-    ap.add_argument("--workspace", default=None, help="真工作区路径（默认仓库 workspace/）")
+    ap.add_argument("--workspace", default=None, help="真工作台路径（默认仓库 workspace/）")
     ap.add_argument("--host-port", type=int, default=0,
-                    help="正在运行的那个宿主的端口（不给就自己起一个，仍用真工作区）")
+                    help="正在运行的那个宿主的端口（不给就自己起一个，仍用真工作台）")
     ap.add_argument("--viewport", default="pane", choices=tuple(VIEWPORTS))
     ap.add_argument("--width", type=int, default=0, help="窗口宽度（覆盖 viewport）")
     ap.add_argument("--eval", dest="js", default="", help="跑一段 JS，打印结果")
@@ -908,7 +908,7 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = \
             f"--remote-debugging-port={cdp}"
         if not host_port:
-            # 没有现成宿主可连（宿主不是带界面启动的）：自己起一个，但仍是**真工作区**。
+            # 没有现成宿主可连（宿主不是带界面启动的）：自己起一个，但仍是**真工作台**。
             # 真数据 + 新窗口 —— 不是复制品，也不跟你抢你正在看的那个窗口。
             host, host_port = spawn_host(ws, args.pid,
                                          ws / ".dev-cache" / args.pid / "host.log")

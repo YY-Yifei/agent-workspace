@@ -56,7 +56,7 @@ def _safe(path: str, *, must_exist: bool = False) -> Path:
     root = _ws()
     p = (root / str(path or ".")).resolve()
     if p != root and root not in p.parents:
-        raise ValueError(f"路径越界：{path}（只能操作工作区内的文件）")
+        raise ValueError(f"路径越界：{path}（只能操作工作台内的文件）")
     if must_exist and not p.exists():
         raise ValueError(f"不存在：{path}")
     return p
@@ -65,7 +65,7 @@ def _safe(path: str, *, must_exist: bool = False) -> Path:
 # ------------------------------------------------------------------ 看
 
 def tree(max_depth: int = 3) -> dict:
-    """看工作区结构：目录、插件、提示词。
+    """看工作台结构：目录、插件、提示词。
 
     max_depth: 递归深度
     """
@@ -79,7 +79,7 @@ def tree(max_depth: int = 3) -> dict:
             if child.name.startswith((".", "__")) or child.name in ("logs", ".tmp"):
                 continue
             if child.is_symlink():
-                # 只显示、不跟进去：跟进去就绕开了「工作区边界」这句话
+                # 只显示、不跟进去：跟进去就绕开了「工作台边界」这句话
                 lines.append("  " * (depth - 1) + child.name + "@")
                 continue
             shown = child.name + ("/" if child.is_dir() else "")
@@ -88,17 +88,17 @@ def tree(max_depth: int = 3) -> dict:
                 walk(child, depth + 1)
 
     walk(root, 1)
-    body = "\n".join(lines) or "（空工作区）"
-    return {"text": f"工作区 {root.name}/：\n{body}", "root": str(root)}
+    body = "\n".join(lines) or "（空工作台）"
+    return {"text": f"工作台 {root.name}/：\n{body}", "root": str(root)}
 
 
 MAX_READ_CHARS = 20000          # 一次读进上下文的硬顶（字符）
 
 
 def read(path: str, offset: int = 1, limit: int = 0) -> dict:
-    """读工作区内的文件，可分页。
+    """读工作台内的文件，可分页。
 
-    path: 相对工作区的路径
+    path: 相对工作台的路径
     offset: 起始行（1 = 开头）
     limit: 最多行数（0 = 尽量多，上限 2 万字符）
 
@@ -171,7 +171,7 @@ def _skip_part(parts: tuple[str, ...]) -> bool:
 
 def search(pattern: str, path: str = ".", limit: int = 30, regex: bool = False,
            ignore_case: bool = False, glob: str = "", context: int = 0) -> dict:
-    """检索工作区，返回「文件:行号: 内容」。
+    """检索工作台，返回「文件:行号: 内容」。
 
     pattern: 要找的文本
     path: 检索起点，可给目录或单个文件
@@ -293,7 +293,7 @@ def _write_target(path: str) -> Path:
     小助理的 ``write`` 与开发者模式的 ``dev_write`` 都走这里 —— 于是「不许碰
     什么」只有一处，不会两条路径各说各话。
 
-        工作区内         可以
+        工作台内         可以
         data/           不行（用户攒下的东西，删了没法退）
         plugins/**      不行（改程序要走 plugin_write：四道校验 + 整份回滚）
         dev.json        不行（**开关必须归人**：程序能写它，就等于自己能把自己
@@ -322,9 +322,9 @@ def _write_target(path: str) -> Path:
 
 
 def write(path: str, content: str) -> dict:
-    """写工作区内的文本文件（自动建目录）。改插件用 plugin_write。
+    """写工作台内的文本文件（自动建目录）。改插件用 plugin_write。
 
-    path: 相对工作区的路径
+    path: 相对工作台的路径
     content: 完整内容
     """
     p = _write_target(path)
@@ -345,7 +345,7 @@ def _kill_tree(proc: subprocess.Popen) -> None:
     """连同**子孙进程**一起杀 —— 只 kill shell 本身是没用的。
 
     为什么：``shell=True`` 起的是 cmd.exe，真正干活的是它的子进程。杀掉 cmd 之后
-    python / node / python -m pytest 还在跑：继续占着工作区文件锁、继续写半成品，
+    python / node / python -m pytest 还在跑：继续占着工作台文件锁、继续写半成品，
     而 agent 已经收到「已终止」这条消息。实测（_tmp/diag_search_shell.py [11]）：
     kill() 之后 6 秒，孙子进程照样把标记文件写了出来。
     """
@@ -371,10 +371,10 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 
 
 def _spill_shell(text: str) -> str:
-    """超长输出落盘，返回**工作区内**的相对路径 —— 拿它去 read 接着看。
+    """超长输出落盘，返回**工作台内**的相对路径 —— 拿它去 read 接着看。
 
     落在 ``logs/shell/``：``tree`` 与 ``search`` 都跳过 logs/，于是这份缓存
-    既不会被搜到、也不会污染工作区结构；丢了也不影响正确性（读不到就报错）。
+    既不会被搜到、也不会污染工作台结构；丢了也不影响正确性（读不到就报错）。
     """
     root = _ws()
     d = root / "logs" / "shell"
@@ -395,7 +395,7 @@ def shell(command: str, cwd: str = "", timeout: int = SHELL_TIMEOUT) -> dict:
     """跑一条命令并带回输出（看测试、列目录、跑脚本）。
 
     command: 要执行的命令（走系统 shell）
-    cwd: 在哪个子目录里跑（相对工作区，越界会被拒）
+    cwd: 在哪个子目录里跑（相对工作台，越界会被拒）
     timeout: 最多等几秒（1~600），到点连同子进程一起杀
 
     返回里一定有 exit / seconds / cwd / encoding。三条约定：

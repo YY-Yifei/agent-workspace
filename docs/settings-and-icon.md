@@ -8,7 +8,7 @@
 
 **入口在左下角**（`#rail` 底部，程序那一列的下方，中间一道分隔线）。
 它不是程序：没有 pid、不进 `state()` 的 `programs`、不参与「一人一条会话」。
-理由一句话：它管的是**整个工作区连哪个道**，不属于任何一个程序。
+理由一句话：它管的是**整个工作台连哪个道**，不属于任何一个程序。
 
 面板里两个字段：**外观**（跟随系统 / 深色 / 浅色）与 **aaas-service 地址**。
 地址下面两行小字：
@@ -24,7 +24,7 @@
 
 | 层 | 是什么 | 为什么在这儿 |
 |---|---|---|
-| `config.json` | **真源** | 「这台机器上这个工作区长什么样」和「连哪个道」是同一类东西：换窗口、换内核进程都该一致 |
+| `config.json` | **真源** | 「这台机器上这个工作台长什么样」和「连哪个道」是同一类东西：换窗口、换内核进程都该一致 |
 | `/api/state.settings.theme` | 下发给界面 | 首帧之后按它重贴（`applyTheme`） |
 | `localStorage['aw-theme']` | **只是首帧缓存** | 等 state 回来再换色，浅色的人开机时会先闪一下深色。缓存里存的是**解析后**的 dark/light，不是档位 |
 
@@ -108,7 +108,7 @@ GetIconInfo + GetDIBits        → 把句柄拆成 RGBA 像素
 实测（会话 2，真窗口）：
 
 ```
-窗口 0x560600「我的工作区」；句柄 {'big': 46995013, 'small': 2298065}
+窗口 0x560600「我的工作台」；句柄 {'big': 46995013, 'small': 2298065}
 窗口大图标 64×64
 与我们的标相似度 89%          与 python.exe 的图标相似度 1%
 结论：ours
@@ -137,10 +137,10 @@ GetIconInfo + GetDIBits        → 把句柄拆成 RGBA 像素
 
 ```
 python -m agentworkspace.selftest          # [4b] 设置 18 项
-python -m agentworkspace.uiprobe           # 真窗口 28 项（自带工作区）
+python -m agentworkspace.uiprobe           # 真窗口 28 项（自带工作台）
 python -m agentworkspace.winicon           # 图标读回（要在有窗口的会话里）
 python -m agentworkspace.qa desktop        # 壳 4 项
 ```
 
-**uiprobe 自带工作区**（`.tmp/qa/ws-probe`）：它要真的保存一次设置，而那是写
-`config.json` 的动作 —— 在别人的真实工作区里跑，就等于拿测试改用户的数据。
+**uiprobe 自带工作台**（`.tmp/qa/ws-probe`）：它要真的保存一次设置，而那是写
+`config.json` 的动作 —— 在别人的真实工作台里跑，就等于拿测试改用户的数据。

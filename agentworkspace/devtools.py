@@ -8,7 +8,7 @@
 
     看：``dev_tree`` ``dev_read`` ``dev_search``
     史：``dev_versions`` ``dev_show`` ``dev_diff``
-    写：``dev_write``         —— 工作区内的普通文件（不碰程序目录、不碰开关）
+    写：``dev_write``         —— 工作台内的普通文件（不碰程序目录、不碰开关）
     改：``dev_plugin_write``  —— 改**自己**：**没有 pid 参数**，改别人在签名上就不可能
     退：``dev_revert``        —— 回到某一版：语义是「把那一版再提交一次」，不是 reset
     验：``dev_page_open`` ``dev_page_eval`` ``dev_page_shot`` ``dev_page_check``
@@ -26,7 +26,7 @@
 就静默失效一次（它有 skip 分支，所以是**静默**）。
 
 「eval 会读到 ``S.settings.token``」不是理由：``dev_read("config.json")``
-今天就能拿到同一份 token，而 ``config.json`` 就在工作区根。真正的边界是
+今天就能拿到同一份 token，而 ``config.json`` 就在工作台根。真正的边界是
 **开发者模式本身**（``_me()`` 拿不到 caller 就直接说这条路只给开发者模式用），
 不是某个动词的粒度。用错的理由守对的事，守不住的从来不是那件事。
 
@@ -111,10 +111,10 @@ def _vcs():
 
 
 def _spill(text: str, slug: str) -> str:
-    """超长结果落盘，返回**工作区内**的路径 —— 拿它去 ``dev_read(path, offset=…)`` 接着读。
+    """超长结果落盘，返回**工作台内**的路径 —— 拿它去 ``dev_read(path, offset=…)`` 接着读。
 
     为什么落在 ``.dev-cache/<pid>/``：三个约束同时只允许这一个位置。
-    ``_safe()`` 要求在工作区内（否则返回的路径 ``dev_read`` 根本打不开）；
+    ``_safe()`` 要求在工作台内（否则返回的路径 ``dev_read`` 根本打不开）；
     ``_snapshot()`` 会 ``rglob`` 整个插件目录且**不排除**隐藏目录，落进插件目录
     就会被拷进 ``.backup/``；``search()`` 跳过点开头的路径段，所以点开头不会被
     自己的检索扫到。缓存丢了不影响正确性：读不到就报错，agent 改走分页。
@@ -146,7 +146,7 @@ def _page(lines: list[str], offset: int, limit: int) -> tuple[str, int, bool]:
 # ------------------------------------------------------------------ 看
 
 def tree(max_depth: int = 3) -> dict:
-    """看工作区结构（只读）；你的文件在 plugins/<你的 id>/ 下。
+    """看工作台结构（只读）；你的文件在 plugins/<你的 id>/ 下。
 
     max_depth: 递归深度
     """
@@ -183,7 +183,9 @@ def host_services() -> dict:
         "  ctx.set('messages', [...]); ctx.emit('dingtalk.sent', {'n': 1})",
         "  ctx.call('别的程序', '它的函数', {'x': 1})   # 走同一个 dispatch",
         "",
-        "网页里：",
+        "网页里（样式**借**宿主的，别抄一份 —— 插件页在 iframe 里是另一份文档，",
+        "自定义属性不跨文档继承，抄了必然漂移。见 docs/host-styles.md）：",
+        "  <link rel=\"stylesheet\" href=\"/aw.css\">   # 令牌 / 底座 / 滚动条",
         "  <script src=\"/aw.js\"></script>",
         "  aw.theme()            // \"dark\" | \"light\" —— 宿主解析过的，直接能画",
         "  aw.on_theme(t => paint(t))",
@@ -195,9 +197,9 @@ def host_services() -> dict:
 
 
 def read(path: str, offset: int = 1, limit: int = SHOW_LIMIT) -> dict:
-    """读工作区内的文件，可分页。改自己前先读当前版。
+    """读工作台内的文件，可分页。改自己前先读当前版。
 
-    path: 相对工作区的路径
+    path: 相对工作台的路径
     offset: 起始行（1 = 开头）
     limit: 最多行数（硬顶 500）
     """
@@ -208,7 +210,7 @@ def read(path: str, offset: int = 1, limit: int = SHOW_LIMIT) -> dict:
 
 def search(pattern: str, path: str = ".", limit: int = 30, regex: bool = False,
            ignore_case: bool = False, glob: str = "", context: int = 0) -> dict:
-    """检索工作区，返回「文件:行号: 内容」。
+    """检索工作台，返回「文件:行号: 内容」。
 
     pattern: 要找的文本
     path: 检索起点，可给目录或单个文件
@@ -377,9 +379,9 @@ def diff(version: str, path: str = "") -> dict:
 # ------------------------------------------------------------------ 写
 
 def write(path: str, content: str) -> dict:
-    """写工作区内的文本文件。改自己用 dev_plugin_write。
+    """写工作台内的文本文件。改自己用 dev_plugin_write。
 
-    path: 相对工作区的路径（data/、plugins/**、dev.json、config.json 拒写）
+    path: 相对工作台的路径（data/、plugins/**、dev.json、config.json 拒写）
     content: 完整内容
     """
     from . import toolbox
@@ -561,8 +563,8 @@ def page_open(viewport: str = "pane") -> dict:
     引擎是 pywebview / WebView2 —— 生产里插件页面就是它渲染的，不是 Chrome。
     窗口开在屏幕外（x=-3000）：既合成帧（能截图），又不挡你。
 
-    看的是**真页面**：真工作区、真插件、真会话。有正在跑的宿主就直接连它；
-    没有就自己起一个（仍是真工作区）。窗口是新的，不碰你正在看的那个。
+    看的是**真页面**：真工作台、真插件、真会话。有正在跑的宿主就直接连它；
+    没有就自己起一个（仍是真工作台）。窗口是新的，不碰你正在看的那个。
 
     viewport: pane（默认，1180 宽，与生产一致）或 desktop（1600 宽）
     """
@@ -582,7 +584,7 @@ def page_open(viewport: str = "pane") -> dict:
     log = root / ".dev-cache" / me / "worker.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     fh = open(log, "w", encoding="utf-8", buffering=1)
-    # cwd 是工作区（不是包所在的仓库根），所以 `-m agentworkspace.pagecheck`
+    # cwd 是工作台（不是包所在的仓库根），所以 `-m agentworkspace.pagecheck`
     # 得靠 PYTHONPATH 才 import 得到。生产装了包时这条是多余的，开发时是必需的 ——
     # 而开发者模式主要在开发时用。
     proc = subprocess.Popen(argv, cwd=str(root), stdout=fh, stderr=subprocess.STDOUT,

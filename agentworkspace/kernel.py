@@ -16,7 +16,7 @@
     一 = 内核（本文件：一个目录约定、一条 dispatch、一条事件流、一份能力面）
     二 = 双入口（人走 HTTP，agent 走 invokeFunction，落到同一个 dispatch）
     三 = 插件三要素（backend.py 能力 / ui 页面 / data 状态）
-    万物 = 工作区（用户攒出来的程序）
+    万物 = 工作台（用户攒出来的程序）
 
 契约五条（docs/plugin-mechanism.md）：
     1. 公开函数 = 能力；``_`` 前缀 = 私有；wire name = ``<pid>_<fn>``
@@ -84,7 +84,7 @@ def _json_safe(value):
 
 WIRE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")   # aaas §3.2 function 名约束
 MAX_EVENT_LOG = 500
-# 审计文件的**上界**。一个只 append 不轮转的日志会一直长 —— 真实工作区里
+# 审计文件的**上界**。一个只 append 不轮转的日志会一直长 —— 真实工作台里
 # events.jsonl 已经到 48MB，打开它的人要读 48MB 才看得到今天发生了什么。
 LOG_MAX_BYTES = 5 * 1024 * 1024      # 单个文件 5MB
 LOG_KEEP = 2                         # 保留 .1 / .2 两份（合计上限 ≈ 15MB）
@@ -322,7 +322,7 @@ SERVICES: dict[str, tuple[str, ...]] = {
     "theme":      ("backend", "web", "native"),   # 现在该画深还是浅（**解析后**）
     "theme_pref": ("backend", "web", "native"),   # 人点的那一档（别拿它去画）
     "on_theme":   ("backend", "web", "native"),   # 外观变了叫一声
-    "state":      ("backend", "web", "native"),   # 整份工作区状态
+    "state":      ("backend", "web", "native"),   # 整份工作台状态
     "dir":        ("backend", "web", "native"),   # 我自己的目录
     "on_event":   ("backend", "web", "native"),   # 订阅事件流
     "log":        ("backend",),                   # 留一句话（网页/原生用自己的终端）
@@ -450,7 +450,7 @@ class Context:
 
     # -- 看一眼全局 / 留一句话 -------------------------------------------
     def state(self) -> dict:
-        """整份工作区状态（与 ``/api/state`` 同一份）。"""
+        """整份工作台状态（与 ``/api/state`` 同一份）。"""
         return self._rt.state()
 
     def log(self, msg) -> None:
@@ -1034,7 +1034,7 @@ class Runtime:
         else:
             # dev.json 只记「**开着的**」：关掉就把条目删了。
             # 为什么不是写成 false：删掉一个程序之后，那个条目没有任何东西会再清理它
-            # —— 它会以 "habit": false 的形状永远留在文件里（0.3.0 的工作区里就有一枚
+            # —— 它会以 "habit": false 的形状永远留在文件里（0.3.0 的工作台里就有一枚
             # "habit": true，而 habit 这个程序早删了）。一个说不清来历的条目，比没有
             # 条目更坏：下一次同名插件出现时，人是照着它做判断的。
             data.pop(pid, None)
@@ -1045,7 +1045,7 @@ class Runtime:
         caps = sorted(self.capabilities_of(pid))
         self.publish("dev.changed", pid=pid, source="human",
                      data={"dev": bool(on), "functions": caps})
-        return ("开发者模式已打开：能读写工作区里的文件，也能改自己的代码"
+        return ("开发者模式已打开：能读写工作台里的文件，也能改自己的代码"
                 "（只有这些 —— 碰不到别的程序，也没有终端）" if on
                 else "开发者模式已关闭：手收回，回到只能动自己程序的状态")
 

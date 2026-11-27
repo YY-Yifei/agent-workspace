@@ -60,7 +60,7 @@ v2 把两条都钉死。
 
 | 哲学 | 在调用方落在哪 | 为什么成立 |
 |---|---|---|
-| **磁盘即状态** —— 每步重读，改一下下一步生效 | 工作区目录就是全部状态，没有内存中的"真相" | 内核重启/崩溃/换前端，状态不丢；同一目录可以被终端和桌面共用 |
+| **磁盘即状态** —— 每步重读，改一下下一步生效 | 工作台目录就是全部状态，没有内存中的"真相" | 内核重启/崩溃/换前端，状态不丢；同一目录可以被终端和桌面共用 |
 | **提示词即身份** —— 身份可被自己改写 | `prompts/system.md` → `AgentDefinition.instructions` | 协议规定 `instructions` **MUST 不进入会话历史**、每次临时注入 —— 「改完即生效且不污染历史」是白拿的 |
 | **函数即能力** —— 注解 → Schema → 工具 | `functions/*.py` → `FunctionDeclaration` | 一份类型注解同时长出「模型能调」和「界面能点」，同一执行路径 |
 | **轮即栅栏** —— 演化在两个轮之间生效 | 写盘后 `reload()` → 下一轮 `declareAgent` | 协议本来就规定 `declareAgent` 只影响**后续轮次**，护栏是白拿的 |
@@ -69,7 +69,7 @@ v2 把两条都钉死。
 
 ---
 
-## 3. 工作区目录
+## 3. 工作台目录
 
 ```
 my-workspace/
@@ -94,9 +94,9 @@ my-workspace/
 
 开箱的「小助理」不是一段本地程序，而是**一份默认 `AgentDefinition`**：
 
-- `instructions` = 内置的 `prompts/system.md`（讲清它是谁、这个工作区怎么用、怎么给自己造能力）；
+- `instructions` = 内置的 `prompts/system.md`（讲清它是谁、这个工作台怎么用、怎么给自己造能力）；
 - `functions` = 一组基础能力：读/写文件、列目录、检索、跑命令、`write_function`、`create_plugin`；
-- **脑是 aaas-service 的脑**。所以第一次连上 8888，它就能干活；连不上，工作区就是一块空板子 —— 如实提示去配 `config.json`，**不做任何"假聊天"降级**。这是「能力完全基于 aaas」的代价，我们认。
+- **脑是 aaas-service 的脑**。所以第一次连上 8888，它就能干活；连不上，工作台就是一块空板子 —— 如实提示去配 `config.json`，**不做任何"假聊天"降级**。这是「能力完全基于 aaas」的代价，我们认。
 
 ---
 
@@ -183,7 +183,7 @@ functions.py（类型注解）──► 能力 Schema ──► ① 模型可调
 | M2 | 基础能力面（文件/执行/write_function）+ history 持久化与折叠 + 中断/取消 | 2d |
 | M3 | 插件模型：plugin.json 校验、页面路由、双入口执行器、data part → 视图渲染 | 3d |
 | M4 | 演化接力：写盘 → reload → 下一轮 declare；`create_plugin` 元能力端到端 | 2d |
-| M5 | 图片（part.file / 4MB 上限）、断连重连、多工作区切换 | 3d |
+| M5 | 图片（part.file / 4MB 上限）、断连重连、多工作台切换 | 3d |
 
 栈：Python 标准库 + pywebview + 单文件 HTML/JS，零构建零框架。本机 pywebview 未安装（`pip install pywebview`，Windows 需 WebView2，Win11 自带）。
 
@@ -193,9 +193,9 @@ functions.py（类型注解）──► 能力 Schema ──► ① 模型可调
 
 | # | 风险 | 应对 |
 |---|---|---|
-| R1 | aaas-service 不可用 ⇒ 工作区零能力（没有本地兜底） | 启动探测 + 明确提示改 `config.json`；**不造假聊天** |
+| R1 | aaas-service 不可用 ⇒ 工作台零能力（没有本地兜底） | 启动探测 + 明确提示改 `config.json`；**不造假聊天** |
 | R2 | 循环类旋钮（步数/轮数/温度）在服务端，本地改不动 | UI 里如实标「服务端管」，不摆假旋钮 |
 | R3 | `declareAgent` 只在下一轮生效，模型写完看不到效果 | 演化后自动接力轮（§6） |
-| R4 | 插件能跑 shell / 写盘 | `permissions` 声明 + 首次启用确认 + 总开关，默认禁网络与工作区外写入 |
+| R4 | 插件能跑 shell / 写盘 | `permissions` 声明 + 首次启用确认 + 总开关，默认禁网络与工作台外写入 |
 | R5 | `maxFrameBytes=6MB`：能力面太大 declare 帧会超 | 能力控制在 ~80 个以内；插件按需加载 |
 | R6 | 历史全量重发（stateless）导致 token 成本随会话增长 | host 侧折叠/摘要；这是调用方的活，不是 aaas 的 |

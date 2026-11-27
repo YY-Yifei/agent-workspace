@@ -155,6 +155,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, js.encode("utf-8"),
                               "application/javascript; charset=utf-8")
 
+        if path == "/aw.css":
+            # 样式契约（docs/host-styles.md）。与 /aw.js 同一条思路：**同一个 URL、
+            # 同一份字节** —— 宿主 index.html 引它，插件页（自己引的、宿主注入的）
+            # 也引它。插件页在 iframe 里是另一份文档，自定义属性不跨文档继承，
+            # 所以「插件像宿主」这件事只能靠同一个文件，靠抄一份必然漂移。
+            return self._file(App.web / "aw.css")
+
         if path == "/api/theme":
             # 给原生窗口与插件页面用的一问一答（网页那两个值就在 /aw.js 里）。
             return self._json({"pref": rt.theme_pref(), "resolved": rt.theme_now()})
@@ -169,7 +176,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({**st,
                                "native": App.native.info() if App.native else {},
                                # 设置面板要的那两项：连哪个道 + 什么外观。
-                               # 主题是「这台机器上这个工作区长什么样」，
+                               # 主题是「这台机器上这个工作台长什么样」，
                                # 与地址同级 —— 所以它跟着 state 一起下来。
                                "settings": {"url": hub.url if hub else "",
                                             "theme": settings.load_theme(

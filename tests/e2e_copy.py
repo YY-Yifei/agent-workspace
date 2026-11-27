@@ -92,7 +92,7 @@ def press_ctrl_c() -> None:
 
 # ----------------------------------------------------------------- 服务
 def start_server() -> tuple[str, object]:
-    """起一个**自己的**工作区 + 真门（不碰用户的数据）。"""
+    """起一个**自己的**工作台 + 真门（不碰用户的数据）。"""
     from agentworkspace import assistant, kernel
     from agentworkspace.selftest import _FakeHub
     from agentworkspace.server import serve

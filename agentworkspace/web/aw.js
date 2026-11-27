@@ -35,6 +35,17 @@
   var THEME = '__AW_THEME__';
   var PREF = '__AW_PREF__';
 
+  // -- 外观：写进**自己这份文档** ------------------------------------------
+  // 插件页在 iframe 里，那是另一份文档：宿主 <html data-theme> 传不过来。
+  // 所以这条属性得有人在自己的 documentElement 上写 —— 写在这里，而不是让每个
+  // 插件各自 paint()：抄的人一多，总有一份忘了跟着改（那正是 aw.css 要解决的问题）。
+  // node 里跑（selftest 数三面集合）没有 document，它必须安静退场。
+  function paint() {
+    if (typeof document === 'undefined' || !document.documentElement) return;
+    document.documentElement.dataset.theme = (THEME === 'light' ? 'light' : 'dark');
+  }
+  paint();
+
   function post(path, body) {
     return fetch(path, {
       method: 'POST',
@@ -86,6 +97,7 @@
       if (ev.type === 'ui.theme' && ev.data) {
         THEME = ev.data.resolved || THEME;
         PREF = ev.data.pref || PREF;
+        paint();
       }
       if (kinds && kinds.indexOf(ev.type) < 0) return;
       try { cb(ev); } catch (e) { /* 回调炸了别把订阅带走 */ }

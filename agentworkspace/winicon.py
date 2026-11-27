@@ -14,7 +14,7 @@
 
 用法::
 
-    python -m agentworkspace.winicon                       # 找「我的工作区」那个窗口
+    python -m agentworkspace.winicon                       # 找「我的工作台」那个窗口
     python -m agentworkspace.winicon --title 界面行为验收
     python -m agentworkspace.winicon --out .tmp/qa/icons   # 把三张图都存下来看
 """
@@ -248,7 +248,7 @@ def ico_frame(path: Path, size: int = 32) -> tuple[int, int, bytes]:
 # ---------------------------------------------------------------- 命令行
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="agentworkspace.winicon", description="窗口图标读回")
-    ap.add_argument("--title", default="我的工作区", help="窗口标题里的片段")
+    ap.add_argument("--title", default="我的工作台", help="窗口标题里的片段")
     ap.add_argument("--icon", default=str(Path(__file__).parent / "assets" / "icon.ico"))
     ap.add_argument("--exe", default=sys.executable, help="基准：哪个 exe 的图标算「默认」")
     ap.add_argument("--out", default=None, help="把三张图存到这里（目录）")

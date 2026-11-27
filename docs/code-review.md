@@ -26,7 +26,7 @@
   pyproject 元数据、.gitignore），其余按主题归入下面的「未修」。
 
 修完的检验：`python -m agentworkspace.selftest` → **98 通过 / 16 失败**，与改动前
-**完全一致**（16 项失败全部是工作区里缺 `pomodoro` / `memo` 等样例程序的既有基线，
+**完全一致**（16 项失败全部是工作台里缺 `pomodoro` / `memo` 等样例程序的既有基线，
 不是这一轮改坏的）；`python -m agentworkspace.qa all` 另有专门说明。
 
 ## 已修（逐条改了哪儿、为什么这么改）
@@ -201,7 +201,7 @@ ocr review -c HEAD --audience agent --format json -o .tmp/ocr-review-2.json
 未改 2 条：纯风格建议（注释措辞/表格对齐），不改。
 
 回归：`python -m agentworkspace.selftest` → **98 通过 / 16 失败**，与第一轮、与改动前
-完全一致（16 项全是工作区缺 `pomodoro` / `memo` 的既有基线）。
+完全一致（16 项全是工作台缺 `pomodoro` / `memo` 的既有基线）。
 
 ## 评审本身的两个坑（工具侧，不是我们的代码）
 
@@ -228,8 +228,8 @@ ocr review -c HEAD --audience agent --format json -o .tmp/ocr-review-2.json
 **15 条全部核实为真，全部修了。** 逐条判真这件事本身就有收获 —— 其中两条是
 「代码看起来对、机制上不对」：
 
-- **high · 缓存落错地方**：`ROOT` 是包父目录，不是工作区，于是 `eval` 落盘与截图的
-  路径在 `.dev-cache/` 里、**`dev_read` 打不开**（`toolbox._safe()` 拒绝工作区外），
+- **high · 缓存落错地方**：`ROOT` 是包父目录，不是工作台，于是 `eval` 落盘与截图的
+  路径在 `.dev-cache/` 里、**`dev_read` 打不开**（`toolbox._safe()` 拒绝工作台外），
   装成 wheel 之后那个目录还常常只读。改成 `Worker.cache`，落在 `<ws>/.dev-cache/<pid>/`。
 - **high · 诊断信息被自己删掉**：5 条失败路径都是「先 `_page_kill` 再 `_page_log_tail`」，
   而 `_page_kill` 第一件事就是 `_PAGE.pop`，`_page_log_tail` 又靠 `_PAGE` 找路径 ——
@@ -267,7 +267,7 @@ ocr review -c HEAD --audience agent --format json -o .tmp/ocr-review-2.json
 
 `p43_gates` 一开始有 2 条红的，都是**脚本自己过时**，但两条都改好了才收工：
 一条变异没传 `frame`，清空动作落在插件 iframe 里（那里没有 `#appframe`），**根本没清空**；
-一条 `tree_sha` 还在要求「真工作区一个字节都没变」，而「真页面会写自己的 data」是
+一条 `tree_sha` 还在要求「真工作台一个字节都没变」，而「真页面会写自己的 data」是
 第44轮起就定下的语义。红着又被解释掉的负面对照，等于没有负面对照。
 
 ### 工具侧仍然只能记着

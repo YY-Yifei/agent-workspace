@@ -98,17 +98,17 @@ def _raw_get(base: str, path: str) -> tuple[int, dict]:
 
 
 def _fixture_note() -> None:
-    """工作区里缺了程序时，先把话说在明处。
+    """工作台里缺了程序时，先把话说在明处。
 
     这些断言验的是「内核 × 真实程序」的对接（pomodoro 的 4 个能力、memo 的原生窗口）。
-    工作区里没有那些程序，它们必然失败 —— 那是**数据缺失**，不是代码坏了。
+    工作台里没有那些程序，它们必然失败 —— 那是**数据缺失**，不是代码坏了。
     把这两件事混在一个「失败」里，下一次真出问题就没人分得清。
     """
     need = ("pomodoro", "memo")
     gone = [p for p in need if not (WS / "plugins" / p).is_dir()]
     if gone:
-        print(f"[注意] 工作区里没有 {', '.join(gone)} 这些程序；"
-              f"与它们有关的断言会失败 —— 那是工作区数据缺失，不是本轮改坏的。",
+        print(f"[注意] 工作台里没有 {', '.join(gone)} 这些程序；"
+              f"与它们有关的断言会失败 —— 那是工作台数据缺失，不是本轮改坏的。",
               flush=True)
         pdir = WS / "plugins"
         # plugins/ 本身不在时也要如实说出来 —— 那正是这条提示想覆盖的情况，
@@ -120,18 +120,18 @@ def _fixture_note() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """自检入口：**默认在临时工作区里跑**，``--here`` 才动真工作区。
+    """自检入口：**默认在临时工作台里跑**，``--here`` 才动真工作台。
 
     为什么默认隔离：这份自检里有一组断言验的是「内核 × 真实程序」的对接
-    （pomodoro 的 4 个能力、memo 的原生窗口）。那两个程序是**工作区数据**，不是
+    （pomodoro 的 4 个能力、memo 的原生窗口）。那两个程序是**工作台数据**，不是
     代码 —— 谁把它们删了（``workspace/plugins/.trash-*-data`` 就是删除残留），那
     16 条就红着。红着不解释的质量门等于没有门：下一次真出问题，没人分得清
     「数据缺了」和「代码坏了」。所以默认把 ``workspace/`` 只读复制一份、补上
     fixture 再跑 —— 同一份代码在任何一台机器上给出同一份答案。
 
-    ``--here``  就在当前工作区里跑（真实的、有数据的那个）；缺数据的断言会如实
+    ``--here``  就在当前工作台里跑（真实的、有数据的那个）；缺数据的断言会如实
                 失败，并在开头说明「那是数据缺失，不是代码坏了」。
-    ``--keep``  保留临时工作区。默认规则：全绿就删，红了留着方便复查。
+    ``--keep``  保留临时工作台。默认规则：全绿就删，红了留着方便复查。
     """
     args = list(sys.argv[1:] if argv is None else argv)
     unknown = [a for a in args if a not in ("--here", "--keep")]
@@ -143,20 +143,20 @@ def main(argv: list[str] | None = None) -> int:
     global WS
     tmp: Path | None = None
     if here:
-        print(f"[当前工作区] {WS}（--here：不隔离，缺数据的断言会如实失败）", flush=True)
+        print(f"[当前工作台] {WS}（--here：不隔离，缺数据的断言会如实失败）", flush=True)
         _fixture_note()
     else:
         tmp = Path(tempfile.mkdtemp(prefix="aw-selftest-"))
         WS = fixtures.build(tmp)
-        print(f"[临时工作区] {WS}", flush=True)
-        print("        （workspace/ 的只读副本 + pomodoro/memo；--here 改测真工作区）",
+        print(f"[临时工作台] {WS}", flush=True)
+        print("        （workspace/ 的只读副本 + pomodoro/memo；--here 改测真工作台）",
               flush=True)
     try:
         rc = _run()
     finally:
         if tmp is not None:
             if keep or bad:
-                print(f"\n（临时工作区保留在 {tmp}，方便复查；确认后可删）", flush=True)
+                print(f"\n（临时工作台保留在 {tmp}，方便复查；确认后可删）", flush=True)
             else:
                 shutil.rmtree(tmp, ignore_errors=True)
     return rc
@@ -375,7 +375,7 @@ def _run() -> int:
         _mk("plugins/evil/plugin.json", '{"id":"evil","title":"越界","ui":"../config.json"}')
         _mk("plugins/evil/backend.py", "")
         # 两个真实存在的「界外文件」：越界 ui 要指向 plugins/config.json（旧内核
-        # 那时会认它、hasUi=true），穿越要指向工作区根的 config.json。目标不存在
+        # 那时会认它、hasUi=true），穿越要指向工作台根的 config.json。目标不存在
         # 的话，旧代码也会「碰巧」是对的 —— 那就测不出任何东西。
         _mk("config.json", '{"hub":"ws://127.0.0.1:1/"}')
         _mk("plugins/config.json", '{"hub":"ws://127.0.0.1:1/"}')
@@ -589,7 +589,7 @@ def _run() -> int:
     except (OSError, ValueError):
         dev_now = {}
     # dev.json 只记「**开着的**」：关掉就删条目，不留 "xxx": false。
-    # 0.3.0 的工作区里就有一枚 "habit": true，而 habit 这个程序早删了 —— 一个说不清
+    # 0.3.0 的工作台里就有一枚 "habit": true，而 habit 这个程序早删了 —— 一个说不清
     # 来历的条目比没有条目更坏：下一次同名插件出现时，人是照着它做判断的。
     check("关掉开关不留死条目（dev.json 只记「开着的」）",
           not any(k in dev_now for k in rt.plugins), str(dev_now))
@@ -634,7 +634,7 @@ def _run() -> int:
           str(sorted(rt.devtools["plugin_write"].parameters.get("properties", {}))))
     other = next((k for k in rt.plugins if k != pid), None)
     if other is None:
-        print("  --  跳过「别人的隔离没有被连带打开」：工作区里没有第二个程序", flush=True)
+        print("  --  跳过「别人的隔离没有被连带打开」：工作台里没有第二个程序", flush=True)
     else:
         check("别人的隔离没有被连带打开",
               not any(w.startswith(("assistant_", "dev_")) for w in rt.capabilities_of(other)),
@@ -745,7 +745,7 @@ def _run() -> int:
         # 空提交的语义，不是版本化的语义。
         # versions() 默认只取 20 条（那是给人看的一页）。用在「多一版」这个
         # 判据上就是**假红**：[13] 挑的 pid 是 next(iter(rt.plugins))，未必是刚
-        # 建的 —— 实测 dingtalk 在临时工作区里被写到 21 版，len(versions()) 于是
+        # 建的 —— 实测 dingtalk 在临时工作台里被写到 21 版，len(versions()) 于是
         # 恒等于 20，"多一版"永远看不见。判据要的是「链长了」，就得看全链。
         _ALLV = 10 ** 6
         n_before = len(_pv.versions(_pdir, limit=_ALLV))
@@ -960,8 +960,9 @@ def _run() -> int:
           not re.search(r"\bon[a-z]{3,}\s*=", code_only, re.I), "")
 
     pp = Path(__file__).resolve().parent.parent / "pyproject.toml"
-    check("web/*.js 进了 package-data（漏了就是装完 404，本地试不出来）",
-          pp.is_file() and "web/*.js" in pp.read_text(encoding="utf-8"), str(pp))
+    check("web/*.js 与 web/*.css 都进了 package-data（漏了就是装完 404 / 样式全丢）",
+          pp.is_file() and all(k in pp.read_text(encoding="utf-8")
+                               for k in ("web/*.js", "web/*.css")), str(pp))
 
     # ── 滚动条。这一块在第十轮之前是**零命中**：跑的一直是系统默认那条
     # （17px 宽、浅灰凹槽、两头各一个箭头），背景却是 #0e1013 —— 它比页面上
@@ -974,36 +975,71 @@ def _run() -> int:
     css = re.search(r"<style>(.*?)</style>", hsrc, re.S)
     check("index.html 有 <style> 段", css is not None, str(idx))
     naked = re.sub(r"/\*.*?\*/", "", css.group(1) if css else "", flags=re.S)
+    # 真源搬到 web/aw.css 了（第48轮）：宿主页与插件页引的是**同一个 URL**。
+    # 所以「滚动条样式还在不在」要在 aw.css 上验，而且要多验一条「宿主页不再自己
+    # 留一份」—— 两份同时存在时，改一份、另一份静默生效，那正是这次要消灭的东西：
+    # 第十轮只治了宿主自己，插件页在 iframe 里继续画 17px 的系统默认条。
+    awpath = Path(__file__).resolve().parent / "web" / "aw.css"
+    awsrc = awpath.read_text(encoding="utf-8") if awpath.is_file() else ""
+    aw = re.sub(r"/\*.*?\*/", "", awsrc, flags=re.S)
+    check("aw.css 在，且宿主页引了它（在 <style> 之前：首帧就要有令牌）",
+          bool(awsrc) and '<link rel="stylesheet" href="/aw.css">' in hsrc
+          and hsrc.index('href="/aw.css"') < hsrc.index("<style>"), str(awpath))
+    check("宿主页不再自己定义滚动条伪元素（真源只许一份）",
+          naked.count("::-webkit-scrollbar") == 1, f"{naked.count('::-webkit-scrollbar')} 处")
+    check("颜色令牌只在 aw.css 里定义（宿主页那几行是别名，不是第二份颜色）",
+          "--aw-bg:#0e1013" in aw and "#0e1013" not in naked, "")
     # 锚在**声明**上，不是锚在选择器上：`#rail::-webkit-scrollbar{width:8px}` 里
     # 也有 `::-webkit-scrollbar{` —— 全局那条被删掉，这条检查照样绿，等于空转。
     check("滚动条不是系统默认那条（锚在声明上，别被窄栏那条满足）",
-          "::-webkit-scrollbar{width:var(--sb)" in naked, "")
+          "::-webkit-scrollbar{width:var(--aw-sb)" in aw, "")
     check("箭头按钮与 corner 都处置了（默认样式里最扎眼的两处）",
-          "::-webkit-scrollbar-button{display:none" in naked
-          and "::-webkit-scrollbar-corner{background:transparent}" in naked, "")
-    outside = re.sub(r"@supports \(-moz-appearance:none\)\s*\{.*?\n  \}", "", naked, flags=re.S)
+          "::-webkit-scrollbar-button{display:none" in aw
+          and "::-webkit-scrollbar-corner{background:transparent}" in aw, "")
+    outside = re.sub(r"@supports \(-moz-appearance:none\)\s*\{.*?\n  \}", "", aw, flags=re.S)
     check("scrollbar-width/color 只出现在 -moz 门内",
           "scrollbar-width" not in outside and "scrollbar-color" not in outside, "")
     # 视觉粗细来自 base 那条：3px 透明边 + background-clip:padding-box 把热区削窄。
     # 删掉任一个，滑块就画成热区全宽（4px → 10px，窄栏 2px → 8px），而下面的
     # hover 检查仍然绿 —— 它只证明"悬停没用简写"，证明不了"本来就是细的"。
-    thumb = re.search(r"::-webkit-scrollbar-thumb\s*\{([^}]*)\}", naked)
+    thumb = re.search(r"::-webkit-scrollbar-thumb\s*\{([^}]*)\}", aw)
     check("thumb 用 3px 透明边 + padding-box 削出视觉粗细（缺了就胖成热区）",
           bool(thumb) and "background-clip:padding-box" in thumb.group(1)
           and "border:3px solid transparent" in thumb.group(1), "")
-    hov = re.search(r"::-webkit-scrollbar-thumb:hover\s*\{([^}]*)\}", naked)
+    hov = re.search(r"::-webkit-scrollbar-thumb:hover\s*\{([^}]*)\}", aw)
     check("thumb:hover 用 background-color（简写会重置 background-clip）",
           bool(hov) and "background-color" in hov.group(1)
           and not re.search(r"(?<!-)background\s*:", hov.group(1)), "")
     # 这一条守的是**这次改动本身**：深浅只能有一个判据（<html data-theme>），
     # 由设置面板决定。@media 一旦回来，就有两个判据同时说话 —— 「设成深色的人
     # 被系统切浅」会以最难查的方式重演（CSS 静默盖掉 JS 的决定）。
-    check("深浅只有一个判据：浅色块挂在 [data-theme=light] 上，不再由 @media 决定",
-          re.search(r":root\[data-theme=\"light\"\]\s*\{", naked) is not None
-          and "prefers-color-scheme:light" not in naked.replace(" ", ""), "")
+    flat = re.sub(r"\s+", "", aw)
+    # 判据仍然只有一个，但门换了个位置：@media 允许回来，**只许**带 :not([data-theme])
+    # 的门 —— 属性一出现它立刻失效，两条判据永远不可能同时说话。这一条守的是
+    # 「有人图省事把门去掉」，那正是第十轮踩过的坑。
+    check("深浅只有一个判据：@media 那条必须带 :not([data-theme]) 的门",
+          re.search(r':root\[data-theme="light"\]\{', flat) is not None
+          and "@media(prefers-color-scheme:light){:root:not([data-theme]){" in flat, "")
+
+    def _light_decls(src: str) -> list:
+        """抠出两处浅色块的 --aw-* 声明（排序后比对）。"""
+        out = []
+        for m in re.finditer(
+                r':root(?:\[data-theme="light"\]|:not\(\[data-theme\]\))'
+                r'\{([^}]*)\}', src):
+            out.append(sorted(re.findall(r"(--aw-[a-z-]+:[^;]+);", m.group(1))))
+        return out
+
+    _lits = _light_decls(aw)
+    check("两处浅色逐字相同（[data-theme=light] 与 @media 兜底 —— 同一份浅色写两遍，"
+          "正是要漂移的地方）",
+          len(_lits) == 2 and _lits[0] == _lits[1] and len(_lits[0]) >= 11,
+          f"{[len(x) for x in _lits]}")
+    # 数**声明**而不是数子串：`@media (prefers-color-scheme:light)` 里也含
+    # "color-scheme:light"，直接 count 会数出 3 个，看着像多了、其实是媒体查询。
+    # 声明一定被分号夹住（令牌块里前一条永远是 `…;`）。
     check("深浅两套 color-scheme（缺浅色那套，浅色系统上仍画深色原生控件）",
-          re.search(r"color-scheme\s*:\s*dark", naked) is not None
-          and re.search(r"color-scheme\s*:\s*light", naked) is not None, "")
+          ";color-scheme:dark;" in flat and flat.count(";color-scheme:light;") == 2, "")
     th = re.search(r"#thread\s*\{([^}]*)\}", naked)
     check("#thread 的 gutter 单边常驻（both-edges 会让正文比标题多缩 10px）",
           bool(th) and "scrollbar-gutter:stable" in th.group(1)
@@ -1016,25 +1052,25 @@ def _run() -> int:
     # 浅色那一套从「跟随系统」改成「由设置决定」之后就长这样了。锚的仍是
     # color-scheme 这个**语义特征**，不是选择器写法。
     dark_root = re.search(
-        r":root(?:\[[^\]]*\])?\s*\{([^}]*color-scheme\s*:\s*dark[^}]*)\}", naked)
+        r":root(?:\[[^\]]*\])?\{([^}]*color-scheme:dark[^}]*)\}", flat)
     light_root = re.search(
-        r":root(?:\[[^\]]*\])?\s*\{([^}]*color-scheme\s*:\s*light[^}]*)\}", naked)
+        r":root(?:\[[^\]]*\])?\{([^}]*color-scheme:light[^}]*)\}", flat)
 
     def _alpha(block: str, var: str):
-        """取某个 --sb* 变量的 alpha；取不到返回 None（None 一律判失败，别当 0 放过）。"""
+        """取某个 --aw-sb* 变量的 alpha；取不到返回 None（None 一律判失败，别当 0 放过）。"""
         m = re.search(var + r"rgba\(\d+,\s*\d+,\s*\d+,\s*([\d.]+)\)", block)
         return float(m.group(1)) if m else None
 
-    a_dark = _alpha(dark_root.group(1) if dark_root else "", "--sb-thumb:")
+    a_dark = _alpha(dark_root.group(1) if dark_root else "", "--aw-sb-thumb:")
     check("暗色静止档 alpha ≥ .6（低于此不到 WCAG 1.4.11 的 3:1）",
           a_dark is not None and a_dark >= 0.6, f"alpha={a_dark}")
     # 只验暗色是不够的：浅色覆盖被删（合并冲突、误删）就退回暗色 .62，
     # 而 .62 落到 #f6f7f9 上只有 ~1.8:1 —— 浅色模式下滚动条基本看不见。
-    a_light = _alpha(light_root.group(1) if light_root else "", "--sb-thumb:")
+    a_light = _alpha(light_root.group(1) if light_root else "", "--aw-sb-thumb:")
     check("浅色静止档 alpha ≥ .78（暗色 .62 落到浅底上只有 ~1.8:1）",
           a_light is not None and a_light >= 0.78, f"alpha={a_light}")
-    h_dark = _alpha(dark_root.group(1) if dark_root else "", "--sb-thumb-hi:")
-    h_light = _alpha(light_root.group(1) if light_root else "", "--sb-thumb-hi:")
+    h_dark = _alpha(dark_root.group(1) if dark_root else "", "--aw-sb-thumb-hi:")
+    h_light = _alpha(light_root.group(1) if light_root else "", "--aw-sb-thumb-hi:")
     check("两套悬停档都在，且各自比静止档更亮（两档不能塌成一档）",
           None not in (h_dark, h_light) and h_dark > a_dark and h_light > a_light,
           f"暗 {a_dark}→{h_dark} 浅 {a_light}→{h_light}")
@@ -1053,6 +1089,21 @@ def _run() -> int:
     # 那正是上一版"补一条 hover 覆盖回去"的来源。这一条守的是"别再加回去"。
     check("窄栏不重设 thumb（只改 width，颜色与边框全部继承全局）",
           re.search(r"#rail::-webkit-scrollbar-thumb", naked) is None, "")
+
+    # ── 「只有一份样式、三种用法」（第48轮）────────────────────────────────
+    # 宿主页引它、插件自己引它、宿主给它注入它 —— 三个入口只能是**同一个 URL**。
+    # 少一条，就退回「各抄一份，第一处改动起开始漂移」。
+    check("宿主给插件页注入的是同一个 /aw.css（不是第二份副本），且带防重复注入的记号",
+          "href = '/aw.css'" in hsrc and "data-aw-skin" in hsrc
+          and hsrc.count("skinFrame") >= 3, f"skinFrame × {hsrc.count('skinFrame')}")
+    check("注入的那份整份在 @layer 里（分层才输给插件自己的规则，否则补齐 = 替它决定配色）",
+          "@layer aw.tokens, aw.base;" in aw and aw.count("@layer aw.") >= 3, "")
+    check("注入时顺手把 data-theme 贴过去（没有 aw.js 的插件页没人写这个属性）",
+          "d.documentElement.dataset.theme" in hsrc, "")
+    # 实测抓到的：插件自己引了 aw.css，宿主又注入一份 —— 同一个文件在同一个文档里
+    # 加载两次，界面上完全看不出来，只在 CSSOM 里露一截。
+    check("已经有 /aw.css 就不再注入（只认自己的记号会把「插件自己引的」漏掉）",
+          "link[rel~=\"stylesheet\"]" in hsrc and "=== '/aw.css'" in hsrc, "")
 
     # ── 对话闸门（第十二轮）。这一节守的是**四类会静默失效的错法**：
     #   (a) 忙碌判断散在多处 → 总有一处忘了改，两轮并发就从那儿进来；
@@ -1217,8 +1268,8 @@ def _run() -> int:
 
     # ── 会话（P0）──────────────────────────────────────────────────
     print("[18] 会话：归我们所有的一份数据，不是服务端的状态")
-    # 挑一个**真的存在**的程序：写死 pomodoro 会让这一节跟着工作区数据一起红，
-    # 而它想验的是会话本身。工作区里哪个在就用哪个，一个都没有就用小助理。
+    # 挑一个**真的存在**的程序：写死 pomodoro 会让这一节跟着工作台数据一起红，
+    # 而它想验的是会话本身。工作台里哪个在就用哪个，一个都没有就用小助理。
     _pid = next((p["id"] for p in rt.state()["programs"] if p["id"] != "assistant"),
                 "assistant")
     _stmp = Path(tempfile.mkdtemp())
@@ -1872,7 +1923,7 @@ def _run() -> int:
         check("cwd 参数：能在子目录里跑（不用 `cd x && ...` 拼命令）",
               _e == "" and "m.txt" in _g(_r, "text", ""), _e or str(_r)[:160])
         _r, _e = _try(toolbox.shell, "echo hi", "../..")
-        check("cwd 越界被拒（跟路径一样锁在工作区内）", _e != "" and "越界" in _e, _e)
+        check("cwd 越界被拒（跟路径一样锁在工作台内）", _e != "" and "越界" in _e, _e)
 
         _r, _e = _try(toolbox.shell, "   ")
         check("空命令报错（别起一个什么都不干的 shell）", _e != "", f"返回了：{_r}")
@@ -2224,7 +2275,7 @@ def _run() -> int:
     try:
         ws6 = fixtures.build(tmp6)
         (ws6 / "probe.txt").write_text("PLAIN-FILE", encoding="utf-8")
-        # assistant.install 会把 toolbox._RT / devtools._RT 指到这个**临时**工作区上，
+        # assistant.install 会把 toolbox._RT / devtools._RT 指到这个**临时**工作台上，
         # 而本段结束就 rmtree。不还原的话，后面任何一次用到那两把「手」，
         # 都在对着一个已经不存在的目录干活：要么凭空建出一个空目录（断言在空地上
         # 全绿），要么报一个跟被测代码毫无关系的错。所以先存后还。
@@ -2303,7 +2354,7 @@ def _run() -> int:
               f"{allowed.status} → {denied.status}")
     finally:
         toolbox._RT, _devtools._RT = _prev_tb, _prev_dv        # 交还原处，不留悬空引用
-        check("D9 临时工作区用完就把内核全局交还原处（后面几节不许对着死目录干活）",
+        check("D9 临时工作台用完就把内核全局交还原处（后面几节不许对着死目录干活）",
               toolbox._RT is _prev_tb and _devtools._RT is _prev_dv,
               f"toolbox._RT={getattr(toolbox._RT, 'root', None)!r}")
         shutil.rmtree(tmp6, ignore_errors=True)
@@ -2328,7 +2379,7 @@ def _run() -> int:
     check("D10c 求值器会 await（不 await 的话 (async()=>42)() 会序列化成 {}）",
           "await" in _pc.SERIALIZER and "async" in _pc.SERIALIZER, "")
 
-    # 用 WS（这次 selftest 自己的隔离工作区）而不是 Path("workspace")：
+    # 用 WS（这次 selftest 自己的隔离工作台）而不是 Path("workspace")：
     # 后者按 cwd 解析，干净检出上根本没有这个目录 —— 那会让 D10d 因为
     # 「样例程序不在」而红，跟被测的代码一点关系都没有。
     p_ok = _pc.plugin_of(WS, "pomodoro")
@@ -2358,7 +2409,7 @@ def _run() -> int:
           "dev_page_open" in str(_miss.get("text")), _miss)
 
     _env = _dt._child_env()
-    check("D10j 子进程 env 里钉着包根（工作区里 cwd 不含包，全靠它）",
+    check("D10j 子进程 env 里钉着包根（工作台里 cwd 不含包，全靠它）",
           str(Path(_pc.__file__).resolve().parent.parent) in str(_env.get("PYTHONPATH")),
           _env.get("PYTHONPATH"))
 
@@ -2450,7 +2501,7 @@ def _run() -> int:
           f"{_s1} / {_s2}")
 
     _wk = _pc.Worker("probe", WS, 0, 0)
-    check("D10p 缓存落在工作区里（落在包目录旁边时 dev_read 打不开、装成 wheel 还会只读）",
+    check("D10p 缓存落在工作台里（落在包目录旁边时 dev_read 打不开、装成 wheel 还会只读）",
           _wk.cache.is_relative_to(WS) and _wk.cache.name == "probe",
           str(_wk.cache))
     check("D10q 透明背景不当黑色（rgba(0,0,0,0) 会把正常页面判成对比度 1.0）",
@@ -2497,7 +2548,7 @@ def _run() -> int:
             pass
 
     # E 段：事件日志必须有**上界**。
-    # 旧实现只 append、从不轮转：真实工作区的 workspace/logs/events.jsonl 已经
+    # 旧实现只 append、从不轮转：真实工作台的 workspace/logs/events.jsonl 已经
     # 长到 48.37MB 一个文件，每 publish 一次就再长一行。断言的不是「有没有写」，
     # 是「有没有上界」—— 一个只增不减的审计文件等于没有审计。
     tmp7 = Path(tempfile.mkdtemp(prefix="aw-log-"))
@@ -3316,6 +3367,15 @@ def _run() -> int:
           code_js == 200 and f"'{theme_http['resolved']}'" in js
           and "__AW_THEME__" not in js, f"{code_js} {len(js)}")
 
+    code_css, body_css, heads_css = get(base, "/aw.css")
+    _css_file = Path(__file__).resolve().parent / "web" / "aw.css"
+    check("G7d /aw.css 200 + text/css，且与包里那份**逐字相同**（插件拿到的就是宿主那份）",
+          code_css == 200 and "text/css" in (heads_css or {}).get("content-type", "")
+          and _css_file.is_file() and body_css == _css_file.read_bytes(),
+          f"{code_css} {len(body_css)}")
+    check("G7e /aw.js 里带着「把主题写到自己文档上」那段（插件不必自己 paint）",
+          "document.documentElement.dataset.theme" in js and "function paint()" in js, "")
+
     # store / emit：网页那两个方法与后端 ctx 是**同一份**数据、同一条事件流
     post(base, "/api/p/pomodoro/store", {"key": "k39", "value": {"a": 1}})
     _c, body_s, _ = get(base, "/api/p/pomodoro/store?key=k39")
@@ -3332,7 +3392,8 @@ def _run() -> int:
         hs = _dev.host_services()
         check("G9 dev_host_services 从活代码反射（清单 == 契约表，不是抄的一份）",
               set(hs["services"]) == set(kernel.SERVICES)
-              and all(k in hs["text"] for k in ("ctx.get", "aw.theme", "ctx.call")),
+              and all(k in hs["text"] for k in ("ctx.get", "aw.theme", "ctx.call",
+                                                "/aw.css")),
               "")
     except Exception as exc:                          # noqa: BLE001
         check("G9 dev_host_services 从活代码反射", False, f"{type(exc).__name__}: {exc}")
@@ -3434,7 +3495,7 @@ def _run() -> int:
         def dispatch(self, *a, **kw):
             raise AssertionError("这一节不执行工具")
 
-    # 每条 Link 一个**自己的工作区**：Store 里 pid 相同就会认成同一个会话，
+    # 每条 Link 一个**自己的工作台**：Store 里 pid 相同就会认成同一个会话，
     # 共用一份的话，后面每一条门都会读到前面那条门的对话（门与门互相污染）。
     roots40: list[Path] = []
 

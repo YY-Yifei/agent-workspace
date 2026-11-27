@@ -45,7 +45,7 @@
 
 **1. 「eval 会读到 `S.settings.token`」—— 同一份 token 一句 `dev_read` 就有。**
 
-`toolbox._safe()`（`toolbox.py:54`）只挡「越出工作区」，而 `config.json` **就在工作区根**，
+`toolbox._safe()`（`toolbox.py:54`）只挡「越出工作台」，而 `config.json` **就在工作台根**，
 `aaas.token` 在它里面。也就是说：
 
 ```python
@@ -104,18 +104,18 @@ dev_page_close(sid=None)                          -> 关；省略 sid = 全关
 
 引擎只有 **pywebview(WebView2)** 一个（v2 的结论没变：验 Chrome ≠ 验用户的机器）。
 
-**没有副本工作区。** 验的就是真工作区：真插件、真会话、真设置。
+**没有副本工作台。** 验的就是真工作台：真插件、真会话、真设置。
 
 宿主从哪来，只有一条规则：
 
 | 情况 | 做法 |
 |---|---|
 | 有正在跑的宿主（`rt.port` 有值，`main.py:258`） | 直接连它：窗口加载 `http://127.0.0.1:<port>/#p/<pid>`，**不起**第二个服务 |
-| 没有（宿主不是带界面启动的） | 自己 spawn 一个 `main --serve --port 0 --workspace <真工作区>` |
+| 没有（宿主不是带界面启动的） | 自己 spawn 一个 `main --serve --port 0 --workspace <真工作台>` |
 
 **为什么把 `copy` 删掉**：副本能截图、能点按钮，但它不回答「我的页面在真实数据下长什么样」
 —— 空会话里的聊天页永远只有一条「今天想聊点什么」，那种页面**怎么验都是绿的**。
-而它原本要解决的问题（点坏、脏数据、故意报错）用 eval 就能做，不需要第二个工作区。
+而它原本要解决的问题（点坏、脏数据、故意报错）用 eval 就能做，不需要第二个工作台。
 
 **代价必须写进报告**：真页面有副作用。插件自己在加载时就会写 `plugins/<pid>/data/`
 （实测：`store.json` 变了）。所以 `check` 与 `close` 都带一个 `data_changed`，
@@ -182,7 +182,7 @@ CDP 回 `Execution context was destroyed`。
 
 一次 `document.documentElement.outerHTML` 就是几百 KB。上限 4000 字符，
 超出落 `.dev-cache/<pid>/eval-<ts>.txt` 并返回路径（复用 `devtools._spill` 的落点约定：
-工作区内、点开头、不进快照、`dev_read` 打得开）。
+工作台内、点开头、不进快照、`dev_read` 打得开）。
 
 ### 6. 工具执行体在**唯一**那个工作线程上（隐式依赖，写在这里）
 
@@ -255,7 +255,7 @@ CDP 回 `Execution context was destroyed`。
   "text": "8 个面：6 绿 / 2 红；视口 800×740（dpr 2.0）；真页面\n\n!! console 3 条错误，第一条：Uncaught TypeError: S.pid is undefined\n!! overflow 横向溢出 42px（.chat 右边界 1222 > 视口 1180）",
   "engine": {"browser": "Edg/158.0.0.0", "via": "webview2-cdp", "dpr": 2.0},
   "viewport": {"asked": "pane", "inner": [800, 740]},
-  "source": {"workspace": "<真工作区>", "host": "复用正在跑的宿主", "url": "http://127.0.0.1:51234/#p/mood"},
+  "source": {"workspace": "<真工作台>", "host": "复用正在跑的宿主", "url": "http://127.0.0.1:51234/#p/mood"},
   "reloaded": true,
   "data_changed": {"added": [], "changed": ["store.json"], "dir": "plugins/mood/data"},
   "areas": [

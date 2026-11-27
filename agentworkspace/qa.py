@@ -39,7 +39,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-# 验收用的工作区 = 这台机器上真正在跑的那份，与 selftest.WS **同一个路径**。
+# 验收用的工作台 = 这台机器上真正在跑的那份，与 selftest.WS **同一个路径**。
 # 不 import selftest 是为了不让 qa 背进 selftest 的模块状态；代价是这个表达式
 # 必须和 selftest.py 的那一行一起改。
 WS = ROOT / "workspace"
@@ -257,7 +257,7 @@ def _have(port: int, pid: str) -> tuple[bool, str]:
 
 
 def have(port: int, pid: str) -> bool:
-    """工作区里现在有没有这个程序。
+    """工作台里现在有没有这个程序。
 
     为什么需要它：验收脚本里写死了样例程序的名字（memo / mood）。那些程序是**用户数据**
     —— 被删掉之后，硬跑只会得到一条看着像「功能坏了」的红线。缺数据该说「跳过」，
@@ -321,8 +321,8 @@ class Host:
         self.log = OUT / "host.log"
         self.fh = open(self.log, "w", encoding="utf-8", buffering=1)
         extra = list(extra or [])
-        # 显式给工作区：包默认已把「启动时的当前目录」当工作区，而这里 cwd=ROOT，
-        # 不传就会对着仓库根跑 ——「工作区里有 memo/mood 吗」那些检查会静默落进
+        # 显式给工作台：包默认已把「启动时的当前目录」当工作台，而这里 cwd=ROOT，
+        # 不传就会对着仓库根跑 ——「工作台里有 memo/mood 吗」那些检查会静默落进
         # skip 分支，验收变成假绿（这是 ocr 第一轮抓到的 medium）。
         if not any(str(x).split("=")[0] == "--workspace" for x in extra):
             extra += ["--workspace", str(WS)]
@@ -351,7 +351,7 @@ class Host:
             time.sleep(0.3)
         raise RuntimeError("宿主 60s 内没有就绪：" + self.log.read_text(encoding="utf-8")[-800:])
 
-    def wait_window(self, substr: str = "我的工作区", timeout: float = 40) -> list[dict]:
+    def wait_window(self, substr: str = "我的工作台", timeout: float = 40) -> list[dict]:
         t0 = time.time()
         while time.time() - t0 < timeout:
             w = find_windows(substr, self.proc.pid)
@@ -361,7 +361,7 @@ class Host:
         return []
 
     def close(self) -> int:
-        wins = find_windows("我的工作区", self.proc.pid)
+        wins = find_windows("我的工作台", self.proc.pid)
         for w in wins:
             u.PostMessageW(w["hwnd"], WM_CLOSE, 0, 0)
         try:
@@ -421,7 +421,7 @@ def qa_native() -> dict:
         return res
     if not found:
         host.close()
-        res["checks"] = [{"name": "跳过：工作区里没有 memo（原生窗口样例）——"
+        res["checks"] = [{"name": "跳过：工作台里没有 memo（原生窗口样例）——"
                                   "「独立的真 OS 窗口」这件事本轮没有验到", "ok": False,
                           "skip": True}]
         return res
@@ -475,7 +475,7 @@ def qa_ui(chat: bool = False) -> dict:
             continue
         if not found:
             host.close()
-            res["checks"].append({"name": f"跳过：工作区里没有 {pid}（没有页面样例可截）",
+            res["checks"].append({"name": f"跳过：工作台里没有 {pid}（没有页面样例可截）",
                                   "ok": False, "skip": True})
             continue
         seed = None

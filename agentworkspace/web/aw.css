@@ -1,0 +1,109 @@
+/* aw.css —— 宿主样式契约。**宿主自己引这一份，插件也引这一份。**
+
+   为什么需要它：插件页住在 <iframe> 里，那是**另一份文档**。自定义属性沿元素树
+   继承，不跨文档；::-webkit-scrollbar 是文档级的伪元素；color-scheme 也各算各的。
+   所以「继承宿主的样式」这条路根本不存在 —— 只有两个选项：每份插件各抄一遍
+   （第一处改动起就开始漂移），或者同一个 URL。
+   这个文件就是那个 URL：GET /aw.css（宿主 index.html 与插件页拿到的字节逐字相同）。
+
+   两种用法，一份文件：
+     ① 插件自己引（推荐）：<link rel="stylesheet" href="/aw.css">
+        令牌、底座、滚动条一次到位；再引 /aw.js 就自动跟着深浅切换。
+     ② 宿主给每个插件页注入（宿主已经在做，插件零协商）：同一份字节，但**整份都在
+        @layer 里**，于是插件自己写的（未分层的）规则自动赢过它。注入因此改不了
+        别人已经画好的配色，却补上了它没有的滚动条与 color-scheme。
+
+   @layer 是这份文件的骨架，不是风格：没有它，「注入」就等于替别人决定背景色。
+   反过来说，插件想退出某一层，自己写一条未分层的同名规则即可 —— 那是退出口，
+   不是漏洞。
+
+   只认这些名字：--aw-bg / --aw-panel / --aw-line / --aw-ink / --aw-dim /
+   --aw-bubble / --aw-accent / --aw-ok / --aw-bad / --aw-sb / --aw-sb-thumb /
+   --aw-sb-thumb-hi。宿主内部还叫 --bg / --panel / …，那是它自己的**别名**
+   （见 index.html 的 :root）。插件不要用那一套 —— 那不是契约，随时会变。 */
+@layer aw.tokens, aw.base;
+
+/* ── ① 令牌：颜色与滚动条刻度 ───────────────────────────────────────────── */
+@layer aw.tokens {
+  :root{
+    --aw-bg:#0e1013; --aw-panel:#14171b; --aw-line:#22272e; --aw-ink:#e6eaef;
+    --aw-dim:#8b949e; --aw-bubble:#1c2128; --aw-accent:#5aa2ff;
+    --aw-ok:#4bbd7a; --aw-bad:#e0645b;
+    /* 滚动条三档：--aw-sb 是**热区**（能抓住的宽度），视觉粗细由 thumb 的透明
+       边框削掉；两档可见度 —— 静止时只是边界，鼠标压上去才是控件。
+       两档刻度按 WCAG 1.4.11 的非文本对比 3:1 定，而且是**算过**的：
+         暗 静止 .62 → 3.08:1    悬停 .8  → 4.36:1
+         浅 静止 .80 → 3.13:1    悬停 .95 → 4.10:1
+       上一版写 .55，实测只有 2.67:1 —— 注释里写着 3:1，其实是空话，而没人会去手算。
+       滚动条是"这个容器还能滚"的唯一提示，太淡就等于没有。细（视觉 4px）+
+       半透明仍然安静，但不该隐形。 */
+    --aw-sb:10px; --aw-sb-thumb:rgba(139,148,158,.62); --aw-sb-thumb-hi:rgba(139,148,158,.8);
+    /* 这一行是"治本"：默认滚动条不受页面 CSS 影响，但受 color-scheme 影响。
+       没有它，即使写了下面的伪元素，未覆盖的地方（原生控件、输入框、下拉箭头）
+       仍会被画成浅色。 */
+    color-scheme:dark;
+  }
+  /* 浅色：**只此一处**。旧版靠 @media 跟随系统 —— 那等于「关不掉」，而设置里
+     既然有了三档，深浅就只认一个判据：<html data-theme="dark|light">。
+     谁写上去？宿主是开机脚本 + applyTheme()，插件是 /aw.js 或者宿主注入。
+     CSS 自己**不再看 @media** —— 两条判据并存时，「设成深色的人被系统切浅」
+     这种事故迟早会在某个边角上重演。
+     （唯一的例外是下面那段兜底，它的门是 :not([data-theme])：属性一出现就失效，
+      两条判据永远不可能同时说话。） */
+  :root[data-theme="light"]{
+    --aw-bg:#f6f7f9; --aw-panel:#fff; --aw-line:#e5e7eb; --aw-ink:#171a1f;
+    --aw-dim:#6b7280; --aw-bubble:#eef0f3; --aw-accent:#2563eb;
+    --aw-ok:#1f9d55; --aw-bad:#d13b30;
+    --aw-sb-thumb:rgba(107,114,128,.8); --aw-sb-thumb-hi:rgba(107,114,128,.95);
+    color-scheme:light;
+  }
+  /* 兜底：插件只引了 aw.css、没引 /aw.js（于是没人给它写 data-theme）。
+     没有它，「只借样式、不要桥」这一档在浅色系统上会永远画深色。
+     这两块的取值必须与上面那块**逐字相同** —— selftest 有一条断言在比对它们，
+     因为「同一份浅色写两遍」本身就是要漂移的地方。 */
+  @media (prefers-color-scheme:light){
+    :root:not([data-theme]){
+      --aw-bg:#f6f7f9; --aw-panel:#fff; --aw-line:#e5e7eb; --aw-ink:#171a1f;
+      --aw-dim:#6b7280; --aw-bubble:#eef0f3; --aw-accent:#2563eb;
+      --aw-ok:#1f9d55; --aw-bad:#d13b30;
+      --aw-sb-thumb:rgba(107,114,128,.8); --aw-sb-thumb-hi:rgba(107,114,128,.95);
+      color-scheme:light;
+    }
+  }
+}
+
+/* ── ② 底座：盒子模型、正文、滚动条 ─────────────────────────────────────── */
+@layer aw.base {
+  *,*::before,*::after{box-sizing:border-box}
+  html{background:var(--aw-bg);color:var(--aw-ink)}
+  body{margin:0;background:var(--aw-bg);color:var(--aw-ink);
+    font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  /* 滚动条。系统默认那一条是画给"文档"的：17px 宽、浅灰凹槽、两头各一个
+     箭头按钮 —— 放在 #0e1013 上，它比任何内容都亮，这就是违和的来源。
+     四处处置：
+       1) 箭头按钮归零、corner 透明（默认样式里最扎眼的两处）；
+       2) 滑块用 3px 透明边框把 10px 热区削成 4px 视觉：细，但仍抓得住；
+       3) 静止 .62 / 悬停拖动 .8 —— 不滚动时它只是容器边缘的一道影子；
+       4) Firefox 兜底用 `@supports (-moz-appearance:none)` 当门。
+          反过来拿 `@supports not selector(::-webkit-scrollbar)` 当门有风险：
+          碰上"声称支持该伪元素却又不画它"的引擎会两头落空，而 Gecko 正好
+          在这条线上模糊。`-moz-` 属性只有 Gecko 认，零误伤。
+     ⚠ 这里**不能**出现裸的 scrollbar-width/scrollbar-color：Chromium 121+ 一旦
+       看到它们就整段忽略 ::-webkit-scrollbar，圆角与"悬停才亮"会当场全丢。
+     ⚠ 悬停档用 background-color 而不是 background：简写会把 background-clip
+       重置回 border-box，滑块会在悬停那一瞬间由 4px 胖成 10px。 */
+  ::-webkit-scrollbar{width:var(--aw-sb);height:var(--aw-sb);background:transparent}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background-color:var(--aw-sb-thumb);border-radius:99px;
+    border:3px solid transparent;background-clip:padding-box}
+  ::-webkit-scrollbar-thumb:hover{background-color:var(--aw-sb-thumb-hi)}
+  ::-webkit-scrollbar-thumb:active{background-color:var(--aw-sb-thumb-hi)}
+  ::-webkit-scrollbar-button{display:none;width:0;height:0}
+  ::-webkit-scrollbar-corner{background:transparent}
+  @supports (-moz-appearance:none){
+    /* Gecko 的 thumb 没有 :hover/:active —— 上面那套"静止一档、压上去一档"
+       在这里会塌成永久静止档，于是所有容器的滚动条都停在最淡的那一档。
+       没有第二档可升，就只能让第一档就是亮的：直接给 --aw-sb-thumb-hi。 */
+    *{scrollbar-width:thin;scrollbar-color:var(--aw-sb-thumb-hi) transparent}
+  }
+}

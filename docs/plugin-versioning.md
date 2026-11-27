@@ -298,7 +298,7 @@ Windows 上 `write_text` 现在写的就是 CRLF，既有插件的 blob 全是 C
 
 ### 落盘目录的三条硬约束（都来自已核实的代码）
 
-- **必须在工作区内**：`_safe()`（`toolbox.py:55-56`）越界即拒 —— 工作区外的路径 `dev_read` 打不开，「返回路径」就成了比不返回更糟的假承诺。
+- **必须在工作台内**：`_safe()`（`toolbox.py:55-56`）越界即拒 —— 工作台外的路径 `dev_read` 打不开，「返回路径」就成了比不返回更糟的假承诺。
 - **必须不在插件目录内**：`_snapshot()`（`toolbox.py:395-401`）是 `pdir.rglob("*")`，**只**排除 `rel.parts[0] == "data"`，**不排除隐藏目录** → 缓存落进插件目录会被整个拷进 `.backup/<pid>/`（那目录只有一版，每次提交前 `rmtree` 重拷）。
 - **必须点开头**：`search()`（`toolbox.py:117`）跳过 `.` 开头的路径段 → `.dev-cache/` 不会被自己的检索扫到。
 
@@ -408,8 +408,8 @@ Windows 上 `write_text` 现在写的就是 CRLF，既有插件的 blob 全是 C
 
 验收（2026-11-23 全绿）：
 
-- `python -m agentworkspace.selftest` → **209 通过 / 0 失败**（在补齐 fixture 的临时工作区上跑；
-  真工作区因 `pomodoro`/`memo` 已被删而少 16 条，那些是**数据缺失**，`_fixture_note()` 已如实标注）
+- `python -m agentworkspace.selftest` → **209 通过 / 0 失败**（在补齐 fixture 的临时工作台上跑；
+  真工作台因 `pomodoro`/`memo` 已被删而少 16 条，那些是**数据缺失**，`_fixture_note()` 已如实标注）
 - `node tests/turn.test.js` → **135 通过 / 0 失败**
 - `node tests/md.test.js` → **81 通过 / 0 失败**
 

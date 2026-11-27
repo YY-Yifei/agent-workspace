@@ -1,10 +1,17 @@
 # Agent Workspace
 
-桌面上的 **Agent 工作区**：用户攒程序（番茄钟、心情日记、记账…），每个程序都有自己的助手；
+桌面上的 **Agent 工作台**：用户攒程序（番茄钟、心情日记、记账…），每个程序都有自己的助手；
 智能全在远端 `aaas-service`，本进程只做四件事 —— **落盘、执行被点名的那一个、广播、传话**。
 
 > **内核不含一克智能。** 它不选工具、不决定下一步、不重试、不兜底。
 > 判据：本仓库里出现的每个分支，都只回答「参数/状态是否合法」，不回答「接下来做什么」。
+
+> **中文名一律叫「工作台」。** 英文标识仍然叫 `workspace` —— 包名 `open-agent-workspace`、
+> `--workspace` 参数、目录名、`/api/state` 里的字段都不动：那是路径与命令行接口，
+> 改名是破坏性变更，换不来任何好处。判据一句话：**给人看的字叫「工作台」，
+> 给机器读的串叫 `workspace`。**
+> （另有一个不相干的「工作区」：`shell.fit()` 里的**屏幕工作区** = 桌面减任务栏，
+> 那是操作系统的词，所以它没跟着改。）
 
 ## 谱系
 
@@ -13,7 +20,7 @@
 一      = 内核（本仓库 agentworkspace/：一个目录约定、一条 dispatch、一条事件流、一份能力面）
 二      = 双入口（人走本地 HTTP，agent 走 invokeFunction，落到同一个 dispatch）
 三      = 程序三要素（backend.py 能力 / ui 页面 / data 状态）
-万物    = 工作区（用户攒出来的程序）
+万物    = 工作台（用户攒出来的程序）
 ```
 
 九个模块，各管一件事：
@@ -27,7 +34,8 @@
 | `native.py` | 原生程序宿主：不是第二条执行路径，是「人的门」的第三种壳 |
 | `main.py` | 入口：装配，没有第四样东西 |
 | `pluginvcs.py` | **旁路**：每个程序就地一个 git 仓（可用 `/api/p/<pid>/versions`，也可被 agent 的四动词调用） |
-| `web/index.html` | 工作区视图 + 对话 + 能力面板（单文件，无构建步骤） |
+| `web/index.html` | 工作台视图 + 对话 + 能力面板（单文件，无构建步骤） |
+| `web/aw.css` | 样式契约：令牌 / 底座 / 滚动条 —— 宿主与插件引的是**同一个 URL**（`docs/host-styles.md`） |
 
 配套：`settings.py`（唯一一项设置：aaas-service 地址）、`devtools.py`（开发者模式那双手）、
 `assistant.py`（内核唯一内置的程序：小助理）、`toolbox.py`（小助理的手）、
@@ -63,20 +71,20 @@ open-agent-workspace --cli -m "做个番茄钟"        # 同上
 open-agent-workspace --cli --as pomodoro -m "开始 25 分钟"   # 跟某个程序自己的助手说
 ```
 
-**工作区默认就是你敲命令时所在的目录**（没有会自动新建），所以它落在「你正在做的事」那里：
+**工作台默认就是你敲命令时所在的目录**（没有会自动新建），所以它落在「你正在做的事」那里：
 
 ```bash
 cd D:\我的项目
-open-agent-workspace                          # 工作区 = D:\我的项目
+open-agent-workspace                          # 工作台 = D:\我的项目
 open-agent-workspace --workspace D:\别处      # 也可以显式指定（不存在同样自动建）
 ```
 
 `--cli` 是验收形态：`connect → declare → sendInput → invokeFunction → 本地执行 →
 functionResult → 模型续写 → turn.completed`。这条不通，界面做得再漂亮也是空壳。
 
-## 工作区长什么样
+## 工作台长什么样
 
-工作区（**默认 = 启动时的当前目录**，`--workspace` 可换）是**运行时**，不在本仓库里：
+工作台（**默认 = 启动时的当前目录**，`--workspace` 可换）是**运行时**，不在本仓库里：
 
 ```
 workspace/
@@ -88,7 +96,7 @@ workspace/
   dev.json               开发者模式开关（**只属于人**：程序写它一律被拒）
 ```
 
-内核**没有任何内置的领域能力**：番茄钟、日记、记账都是工作区里长出来的程序，
+内核**没有任何内置的领域能力**：番茄钟、日记、记账都是工作台里长出来的程序，
 所以它们**不在这个仓库里** —— 这里只有内核。
 
 ## 契约（写程序的人关心这几条）
@@ -130,7 +138,7 @@ workspace/
 
 ```bash
 python -m agentworkspace.selftest     # 逻辑层（内存里跑完整链路）
-python tests/selftest_with_fixtures.py  # 同上，但先造 fixtures（真工作区里没有示例程序时用这个）
+python tests/selftest_with_fixtures.py  # 同上，但先造 fixtures（真工作台里没有示例程序时用这个）
 python -m agentworkspace.qa all       # 真窗口
 python -m agentworkspace.uiprobe      # 真浏览器（拖动 / 折叠 / 设置 / 图标）
 node tests/turn.test.js               # 对话状态机（忙时禁发 / 停得下）

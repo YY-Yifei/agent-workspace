@@ -154,7 +154,7 @@ class Native:
 
     # -- 看全局：人、agent、别的插件都发生了什么 --------------------------
     def state(self) -> dict:
-        """整份工作区状态：有哪些程序、各自的能力、道连上没有。"""
+        """整份工作台状态：有哪些程序、各自的能力、道连上没有。"""
         with urllib.request.urlopen(self.base + "/api/state", timeout=10) as r:
             return json.loads(r.read().decode("utf-8"))
 

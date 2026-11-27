@@ -64,7 +64,7 @@ import logging
 import threading
 from pathlib import Path
 
-TITLE = "我的工作区"
+TITLE = "我的工作台"
 LOAD_TIMEOUT = 12.0          # 页面 12 秒还没 loaded，就判定为白屏
 MARGIN = 40                  # 窗口离工作区边缘留一点，别贴着任务栏
 UI_WAIT = 2.0                # 投递到 UI 线程后最多等这么久（有界，绝不无限等）

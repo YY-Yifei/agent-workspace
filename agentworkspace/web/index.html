@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Agent Workspace</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%235aa2ff'/%3E%3Crect x='10' y='12' width='11' height='40' rx='5' fill='%23fff'/%3E%3Crect x='26' y='17' width='28' height='11' rx='5' fill='%23fff'/%3E%3Crect x='26' y='36' width='28' height='11' rx='5' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/aw.css">
 <script>
 /* 首帧的主题。真源在 config.json（/api/state.settings.theme），但那是异步的：
    等它回来再换色，浅色的人开机时会先闪一下深色。所以把**上一次解析出来的**
@@ -22,78 +23,42 @@
 })();
 </script>
 <style>
+  /* 令牌与滚动条**都不在这里**了：它们在 web/aw.css —— 同一个文件，插件页引的
+     也是它（docs/host-styles.md）。插件页在 iframe 里是另一份文档，自定义属性
+     不跨文档继承，所以「共用一份样式」只能靠同一个 URL，不能靠抄。
+     这里留下的是宿主**内部**的旧名（一条条映射过去）和自己独用的几个变量：
+     CSS 里那两百多处 var(--bg) 因此不用动，而「什么是契约」只剩 aw.css 一处。
+     插件只用 --aw-* 那一套；这一套随时会变。 */
   :root{
-    --bg:#0e1013; --panel:#14171b; --line:#22272e; --ink:#e6eaef; --dim:#8b949e;
-    --bubble:#1c2128; --accent:#5aa2ff; --ok:#4bbd7a; --bad:#e0645b;
+    --bg:var(--aw-bg); --panel:var(--aw-panel); --line:var(--aw-line);
+    --ink:var(--aw-ink); --dim:var(--aw-dim); --bubble:var(--aw-bubble);
+    --accent:var(--aw-accent); --ok:var(--aw-ok); --bad:var(--aw-bad);
     /* 停止键的底与边：与 --bad 同色系的低透明度两档。写死 rgba 的话，
        浅色主题上会拿到一个"深色主题的红"，与同一行字的 color 不是一家。 */
     --stop-bg:rgba(224,100,91,.12); --stop-line:rgba(224,100,91,.42);
     /* 开发者开关「开」的轨道：accent 的半透明底色。**不能**用 opacity 做淡 ——
        滑块是轨道的 ::after，透明度作用在整棵子树上，滑块会跟着一起被削掉。 */
     --dev-on-bg:rgba(90,162,255,.34);
-    /* 滚动条三档：--sb 是**热区**（能抓住的宽度），视觉粗细由 thumb 的透明
-       边框削掉；两档可见度 —— 静止时只是边界，鼠标压上去才是控件。 */
-    /* 两档刻度按 WCAG 1.4.11 的非文本对比 3:1 定，而且是**算过**的：
-         暗 静止 .62 → 3.08:1    悬停 .8  → 4.36:1
-         浅 静止 .80 → 3.13:1    悬停 .95 → 4.10:1
-       上一版写 .55，实测只有 2.67:1 —— 注释里写着 3:1，其实是空话，而没人会去手算。
-       滚动条是"这个容器还能滚"的唯一提示，太淡就等于没有。细（视觉 4px）+
-       半透明仍然安静，但不该隐形。 */
-    --sb:10px; --sb-thumb:rgba(139,148,158,.62); --sb-thumb-hi:rgba(139,148,158,.8);
-    /* 这一行是"治本"：默认滚动条不受页面 CSS 影响，但受 color-scheme 影响。
-       没有它，即使写了下面的伪元素，未覆盖的地方（以及 iframe 里的原生控件）
-       仍会被画成浅色。 */
-    color-scheme:dark;
   }
-  /* 浅色：**只此一处**。旧版靠 @media 跟随系统 —— 那等于「关不掉」，而设置里
-     既然有了三档，深浅就只认一个判据：<html data-theme="dark|light">。
-     谁写上去？头顶那段开机脚本负责首帧，之后由 applyTheme() 维护；CSS 自己
-     **不再看 @media** —— 两条判据并存时，「设成深色的人被系统切浅」这种事故
-     迟早会在某个边角上重演。 */
+  /* 浅色那条判据（:root[data-theme="light"] + 两处必须逐字相同的那段 @media 兜底）
+     整块在 aw.css 里 —— 深浅只有一个真源，宿主与插件页看到的是同一份。
+     这里只剩宿主私有的三个变量。 */
+  /* 浅色：宿主只补自己私有的那三个。颜色令牌在 aw.css，判据也只有那一份
+     —— 两处都写，就等于两份浅色，必然有一份忘了跟着改。 */
   :root[data-theme="light"]{
-    --bg:#f6f7f9; --panel:#fff; --line:#e5e7eb; --ink:#171a1f; --dim:#6b7280;
-    --bubble:#eef0f3; --accent:#2563eb; --ok:#1f9d55; --bad:#d13b30;
     --stop-bg:rgba(209,59,48,.08); --stop-line:rgba(209,59,48,.38);
     --dev-on-bg:rgba(37,99,235,.24);
-    --sb-thumb:rgba(107,114,128,.8); --sb-thumb-hi:rgba(107,114,128,.95);
-    color-scheme:light;
   }
-  *{box-sizing:border-box}
-  /* 滚动条。系统默认那一条是画给"文档"的：17px 宽、浅灰凹槽、两头各一个
-     箭头按钮 —— 放在 #0e1013 上，它比任何内容都亮，这就是违和的来源。
-     四处处置：
-       1) 箭头按钮归零、corner 透明（默认样式里最扎眼的两处）；
-       2) 滑块用 3px 透明边框把 10px 热区削成 4px 视觉：细，但仍抓得住；
-       3) 静止 .62 / 悬停拖动 .8 —— 不滚动时它只是容器边缘的一道影子；
-       4) Firefox 兜底用 `@supports (-moz-appearance:none)` 当门。
-          反过来拿 `@supports not selector(::-webkit-scrollbar)` 当门有风险：
-          碰上"声称支持该伪元素却又不画它"的引擎会两头落空，而 Gecko 正好
-          在这条线上模糊。`-moz-` 属性只有 Gecko 认，零误伤。
-     ⚠ 这里**不能**出现裸的 scrollbar-width/scrollbar-color：Chromium 121+ 一旦
-       看到它们就整段忽略 ::-webkit-scrollbar，圆角与"悬停才亮"会当场全丢。
-     ⚠ 悬停档用 background-color 而不是 background：简写会把 background-clip
-       重置回 border-box，滑块会在悬停那一瞬间由 4px 胖成 10px。 */
-  ::-webkit-scrollbar{width:var(--sb);height:var(--sb);background:transparent}
-  ::-webkit-scrollbar-track{background:transparent}
-  ::-webkit-scrollbar-thumb{background-color:var(--sb-thumb);border-radius:99px;
-    border:3px solid transparent;background-clip:padding-box}
-  ::-webkit-scrollbar-thumb:hover{background-color:var(--sb-thumb-hi)}
-  ::-webkit-scrollbar-thumb:active{background-color:var(--sb-thumb-hi)}
-  ::-webkit-scrollbar-button{display:none;width:0;height:0}
-  ::-webkit-scrollbar-corner{background:transparent}
+  /* 滚动条样式（含那两条 ⚠ 陷阱）整段搬进 aw.css —— 它是插件也需要的**契约**，
+     不是宿主页的私事。这里只剩下窄栏自己的例外：56px 的栏里塞不下 Gecko 的
+     thin（8–11px），图标会被挤歪，而 Gecko 又没有 2px 这一档。取舍：这里不要
+     可见的栏 —— scrollbar-width:none 只隐藏 UI，滚轮与键盘照样滚。 */
   @supports (-moz-appearance:none){
-    /* Gecko 的 thumb 没有 :hover/:active —— 上面那套"静止一档、压上去一档"
-       在这里会塌成永久静止档，于是所有容器的滚动条都停在最淡的那一档。
-       没有第二档可升，就只能让第一档就是亮的：直接给 --sb-thumb-hi。 */
-    *{scrollbar-width:thin;scrollbar-color:var(--sb-thumb-hi) transparent}
-    /* 56px 的栏里塞不下 Gecko 的 thin（8–11px），图标会被挤歪；而 Gecko 又没有
-       2px 这一档。取舍：这里不要可见的栏 —— scrollbar-width:none 只隐藏 UI，
-       滚轮与键盘照样滚，代价是「栏还能往下滚」在 Gecko 上没有视觉提示。
-       （桌面壳走 WebView2/Chromium，那一路是 8px 热区 + 2px 视觉，有提示。） */
     #rail{scrollbar-width:none}
   }
-  html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);
-    font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  /* 底色、字色、字体都在 aw.css 的底座里 —— 插件页与宿主页拿到的是同一条声明。
+     这里只留布局需要的两条。 */
+  html,body{height:100%;margin:0}
   #app{display:flex;height:100%}
 
   /* 左：一条窄栏。只有图标 —— 程序的名字在悬停里，不在界面上 */
@@ -325,10 +290,10 @@
   /* 拖进来的那一刻得有个落点：不然「拖了没反应」和「拖了但不收」长得一模一样。 */
   .composer.drag{background:var(--bubble);box-shadow:inset 0 0 0 2px var(--accent)}
 
-  /* 设置入口在左下角：它管的是「整个工作区连哪个道」，不是某一个程序的事。
+  /* 设置入口在左下角：它管的是「整个工作台连哪个道」，不是某一个程序的事。
      所以它不和程序挤在同一列里 —— 中间用一道分隔线分开。 */
   #rail .sep{width:26px;height:1px;background:var(--line);margin:6px 0 2px;flex:0 0 1px}
-  /* 设置面板：整个工作区只有一页，眼下只有一项。不做「设置中心」。 */
+  /* 设置面板：整个工作台只有一页，眼下只有一项。不做「设置中心」。 */
   #mask{position:fixed;inset:0;background:rgba(0,0,0,.42);display:none;
     place-items:center;z-index:40}
   #mask.on{display:grid}
@@ -599,6 +564,49 @@ function paintConn() {
 }
 
 /* ------------------------------------------------------------------ 舞台 */
+/* 插件页是**另一份文档**：自定义属性不跨文档继承，滚动条伪元素也只在它自己那份
+   文档里生效 —— 所以「宿主有滚动条样式，插件自然就有」这句话是假的（第十轮那次
+   改完，宿主自己好看了，插件里还是那条 17px 的系统默认）。得有人把那份样式递过去。
+
+   三条路，插件可以任选，宿主都认：
+     ① 插件自己写 <link rel="stylesheet" href="/aw.css">（推荐，docs/host-styles.md）
+     ② 插件引 /aw.js —— 它会自己把 data-theme 贴到自己那份文档上
+     ③ 宿主注入（就是这里）：同一份字节，整份在 @layer 里，所以插件自己写过的规则
+        自动赢 —— 注入改不了它的配色，只补它没写的（滚动条 / color-scheme / 盒子模型）
+   顺带把 data-theme 递过去：没有 /aw.js 的插件页没人写这个属性，它会一直画深色。
+
+   同源（都出自这道门）才拿得到 contentDocument；读别人文档必须 catch ——
+   跨源那边是 SecurityError，而这不是错误，是它的正常状态。 */
+function skinFrame(f) {
+  let d = null;
+  try { d = f.contentDocument; } catch (e) { d = null; }
+  if (!d || !d.head) return;
+  /* 判据是「这份文档里有没有指向 /aw.css 的样式表」，**不是**「有没有我留的记号」：
+     插件自己引过就别再注入 —— 同一个文件加载两次，规则一模一样，多出来的那次
+     请求与一次多余的样式重算都是白付的（实测里 sheets 里就出现了两条 /aw.css，
+     而界面上完全看不出来）。记号只用来认「哪条是宿主注入的」。 */
+  const have = Array.prototype.some.call(
+    d.querySelectorAll('link[rel~="stylesheet"]'),
+    (l) => (l.getAttribute('href') || '').split('?')[0] === '/aw.css');
+  if (!have) {
+    const l = d.createElement('link');
+    l.rel = 'stylesheet';
+    l.href = '/aw.css';
+    l.setAttribute('data-aw-skin', '1');
+    d.head.appendChild(l);
+  }
+  const t = document.documentElement.dataset.theme;
+  if (t) d.documentElement.dataset.theme = t;
+}
+/* 每次刷新都重新挂：插件页每次都是**新的** iframe（innerHTML 重画），
+   旧监听跟着旧节点一起没了。另外主动调一次 —— 有的引擎上 load 可能已经过去了。 */
+function wireSkin() {
+  const f = $('#appframe');
+  if (!f) return;
+  f.addEventListener('load', () => skinFrame(f));
+  skinFrame(f);
+}
+
 function paintStage(force) {
   const p = prog(S.pid);
   const nat = S.native[S.pid] || {};
@@ -635,7 +643,7 @@ function paintStage(force) {
         <button type="button" class="vbtn" id="newbtn"
                 title="新建会话（直接开，不用先打开会话面板）" aria-label="新建会话">＋</button>
         <button type="button" class="vbtn" id="sessbtn" title="会话：新建 / 切换 / 改名 / 删除">会话</button>
-        ${p.id === 'assistant' ? '' : `<label class="dev${p.dev ? ' on' : ''}" title="打开后它能读写工作区里的文件、改自己的代码（碰不到别的程序）"><input type="checkbox" id="devsw"${p.dev ? ' checked' : ''}><i></i>开发者</label><button type="button" class="vbtn" id="verbtn" title="看这个程序的版本历史 / 退回去">版本</button>`}
+        ${p.id === 'assistant' ? '' : `<label class="dev${p.dev ? ' on' : ''}" title="打开后它能读写工作台里的文件、改自己的代码（碰不到别的程序）"><input type="checkbox" id="devsw"${p.dev ? ' checked' : ''}><i></i>开发者</label><button type="button" class="vbtn" id="verbtn" title="看这个程序的版本历史 / 退回去">版本</button>`}
       </header>
       <div id="thread"></div>
       <form class="composer" id="composer">
@@ -653,6 +661,7 @@ function paintStage(force) {
   wireVersions();
   wireSessions();
   wireGutter();
+  if (p.uiKind === 'web') wireSkin();
   if (p.uiKind === 'native') {
     $('#natbtn').onclick = () => toggleNative(p.id, (S.native[p.id] || {}).status === 'running');
   }
@@ -1703,7 +1712,7 @@ async function toggleDev(pid, on) {
   const p = prog(pid); if (p) p.dev = r.dev;
   paintDev(pid, r.dev);
   push(pid, { role: 'it', note: true, tools: [], text: r.dev
-    ? '🔧 开发者模式已打开 —— 它现在能读写工作区、跑命令，也能改自己的代码了。'
+    ? '🔧 开发者模式已打开 —— 它现在能读写工作台、跑命令，也能改自己的代码了。'
     : '开发者模式已关闭 —— 它回到只能动自己这个程序的状态。' });
 }
 
@@ -1918,7 +1927,7 @@ async function syncAgents() {
 
 /* ------------------------------------------------------------------ 设置 */
 /* 设置有两项：**连哪个道**（aaas-service 地址）与**什么外观**（深/浅）。
-   两项都属于整个工作区 —— 所以放在左下角，不混进程序那一列。 */
+   两项都属于整个工作台 —— 所以放在左下角，不混进程序那一列。 */
 
 /* ------------------------------------------------------------ 外观（深/浅） */
 /* 三档：auto / dark / light。**解析只有一处**（resolveTheme）：CSS 里只认
@@ -1941,6 +1950,10 @@ function applyTheme(pref) {
   if (S.settings) S.settings.theme = p;
   const t = resolveTheme(p);
   document.documentElement.dataset.theme = t;
+  /* 已经在看的那一页要立刻跟着翻：它不会重新 load，也就不会再走 wireSkin。
+     没开页面时 appframe 不存在，skinFrame(null) 会炸 —— 所以先问一句。 */
+  const fr = document.getElementById('appframe');
+  if (fr) skinFrame(fr);
   try { localStorage.setItem(THEME_KEY, t); } catch (e) { /* 存不上就算了，不影响画 */ }
   paintThemeSeg();
   reportTheme(p, t);

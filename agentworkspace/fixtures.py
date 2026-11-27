@@ -1,11 +1,11 @@
 """selftest 用的两个 fixture 程序（pomodoro / memo）—— 随包发行，不进 workspace。
 
 为什么它们在包里：``python -m agentworkspace.selftest`` 默认在一个**自带 fixture
-的临时工作区**里跑，才能对任何一台机器给出同一份答案。这两个程序原来是工作区
+的临时工作台**里跑，才能对任何一台机器给出同一份答案。这两个程序原来是工作台
 数据（放在 ``workspace/plugins/``），谁把它们删了（``.trash-*-data`` 就是删除残留），
 「内核 × 真实程序」那 16 条断言就红着 —— 而红着不解释的质量门等于没有门。
 
-只读复制源工作区：``.backup`` / ``.trash-*`` / ``__pycache__`` 一律不拷（历史归档与
+只读复制源工作台：``.backup`` / ``.trash-*`` / ``__pycache__`` 一律不拷（历史归档与
 删除残留会把临时目录撑大，还可能把「程序已删」的旧状态混进来）。
 """
 
@@ -99,14 +99,14 @@ root.mainloop()
 
 
 def build(tmp: Path, src: Path | None = None) -> Path:
-    """把 ``workspace/`` **只读复制**到 ``tmp``，补上两个 fixture，返回新工作区路径。
+    """把 ``workspace/`` **只读复制**到 ``tmp``，补上两个 fixture，返回新工作台路径。
 
     Args:
         tmp: 临时目录（不存在会建）。
-        src: 源工作区；默认是本包旁边的 ``workspace/``。
+        src: 源工作台；默认是本包旁边的 ``workspace/``。
 
     Returns:
-        新工作区 ``tmp / "workspace"``。
+        新工作台 ``tmp / "workspace"``。
     """
     tmp = Path(tmp)
     if src is None:
@@ -116,7 +116,7 @@ def build(tmp: Path, src: Path | None = None) -> Path:
         shutil.copytree(src, dst,
                         ignore=shutil.ignore_patterns(".backup", ".trash-*",
                                                       "__pycache__", "*.pyc"))
-    else:                                   # 源都没有：从空工作区起步，也别炸
+    else:                                   # 源都没有：从空工作台起步，也别炸
         dst.mkdir(parents=True, exist_ok=True)
     (dst / "prompts").mkdir(parents=True, exist_ok=True)
     if not (dst / "prompts" / "assistant.md").is_file():
