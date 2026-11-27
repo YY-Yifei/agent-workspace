@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "open-agent-workspace"
-version = "0.4.7"
+version = "0.4.8"
 description = "桌面 Agent 工作区内核：一个目录约定、一条 dispatch、一条事件流、一份能力面"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,17 +26,24 @@ classifiers = [
 # 桌面窗口（pywebview）是**默认**形态，所以它是必需依赖，不再是 extra：
 # 装完就有窗口，不该再让人去补一条 `pip install ...[gui]` 才能看见界面。
 # 它缺失时的退化（--browser / --cli）仍然保留 —— 那防的是"装了但坏了"，不是"没装"。
-dependencies = ["aaas>=0.3.0", "pywebview>=5.0"]
+dependencies = [
+  "aaas>=0.3.0",
+  "pywebview>=5.0",
+  # 插件程序的版本化（docs/plugin-versioning.md）同样是**默认**能力：每个插件目录就地
+  # 长成一个 git 仓，装完就能回看/回退，不该再让人补 `...[vcs]` 才有历史。
+  # 它够格当默认依赖：纯 Python、零运行时依赖、不碰系统 git（不装 `[git]` shim）、几十 KB。
+  # 降级逻辑仍然保留 —— 它防的也是"装了但坏了"（版本漂移 / 被别的包拽走 / 半装）：
+  # 自检不过就整体关掉版本化，写路径一行都不改。
+  # 上界卡 <2：pythongit 与真 git 的标志位差异是 behaviour 层面的（§6 全是实跑结论），
+  # 光靠"它说它是 1.x"挡不住下一个小版本改语义。
+  "pure-python-git>=1.0.2,<2",
+]
 
 [project.optional-dependencies]
-# 空 extra：老命令 `pip install open-agent-workspace[gui]` 仍然成立（不报未知 extra）。
-# 它现在等于空气，因为没有额外的东西可装。
+# 两个空 extra：老命令 `pip install open-agent-workspace[gui]` / `...[vcs]` 仍然成立
+# （不报未知 extra）。它们现在等于空气，因为没有额外的东西可装。
 gui = []
-# 插件程序的版本化（docs/plugin-versioning.md）。**故意不在 dependencies 里**：
-# 主机上没有它也得能跑 —— 版本化是旁路，缺了就把历史关掉，写入照旧。
-# 上界卡 <2：pythongit 与真 git 的标志位差异是 behavior 层面的（§6 全是实跑结论），
-# 光靠"它说它是 1.x"挡不住下一个小版本改语义。
-vcs = ["pure-python-git>=1.0.2,<2"]
+vcs = []
 
 [project.scripts]
 # 只留这一个入口名：PyPI 上另有一个 agent-workspace（dropxhq 的 Rust 内核），

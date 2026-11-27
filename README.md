@@ -42,14 +42,12 @@ pip install open-agent-workspace
 一条命令就够：**pywebview 是默认依赖**，装完就有桌面窗口，不需要再补一个 `[gui]`。
 需要 Python 3.10+，以及一个能连上的 `aaas-service`（地址在设置里改，默认 `ws://localhost:8888`）。
 
-想让每个程序的改动留下历史、并且能退回去，再装一个 extra：
+**版本化也在默认依赖里**：`pure-python-git`（纯 Python，零运行时依赖，**不需要系统里有 git**）
+随包装上，所以每个程序的每次改动都有历史、都能退回去，不需要额外的 extra。
+老命令 `pip install "open-agent-workspace[vcs]"` 仍然成立（`vcs` 现在是空 extra）。
 
-```bash
-pip install "open-agent-workspace[vcs]"
-```
-
-`[vcs]` 带来 `pure-python-git`（**纯 Python，不需要系统里有 git**）。它**故意不在默认依赖里**：
-版本化是旁路 —— 没装它，写入照旧，只是不记历史、版本面板显示「未启用」。
+版本化本身仍然是旁路：它自己坏掉（版本漂移 / 启动自检不过 / 被卸载）就把历史关掉、
+版本面板显示「未启用」，**写入照旧** —— 详见 `docs/plugin-versioning.md`。
 
 > 这个内核曾以 `agent-workspace-desktop` 0.1.0 发布过一版，是同一份东西。现在叫
 > `open-agent-workspace`。两个包提供同一个顶层模块 `agentworkspace`，**装新的之前先

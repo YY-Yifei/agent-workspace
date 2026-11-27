@@ -14,6 +14,8 @@
 
 依赖：`pure-python-git`（PyPI `pure_python_git` 1.0.2，MIT，纯 Python，无运行时依赖，`requires-python>=3.9`，
 装一个 `pygit` 脚本；`[git]` extra 才会额外装 `git` 同名 shim —— 我们**不要**那个 shim）。
+**它在默认依赖里**（`dependencies`，不是 extra）：钢性成本只有"多装一个纯 Python 轮子"，
+换来的却是"装完就有历史"—— 让用户为了回退去补一条 `pip install ...[vcs]`，等于这个能力默认不存在。
 
 ---
 
@@ -326,8 +328,11 @@ Windows 上 `write_text` 现在写的就是 CRLF，既有插件的 blob 全是 C
 - **启动自检**（结果缓存进进程内变量，一次就够）：在 `tempfile.mkdtemp()` 里跑一遍
   `init → add(1 个文件) → commit → log --oneline → ls-tree -r HEAD`，全绿才启用。
   为什么值得多花 ~200 ms：上面那张表证明了「同名命令的标志位随时会变」，靠 pin 版本号挡不住。
-- 依赖声明：`extras_require["vcs"] = ["pure-python-git>=1.0.2,<2"]`，**不放进 `dependencies`**——
-  主机上没它也得能跑。pin 上界是因为 §6 那些标志位差异都是 behaviour，不是 bug。
+- 依赖声明：`dependencies` 里带 `pure-python-git>=1.0.2,<2`（**默认装** —— 版本化是核心能力，
+  不该让人补 extra 才有），`vcs = []` 留作空 extra 让老命令 `pip install ...[vcs]` 仍成立。
+  pin 上界是因为 §6 那些标志位差异都是 behaviour，不是 bug。
+- **降级逻辑不因为"默认装了"而删**：上面那条自检防的是"装了但坏了"（版本漂移 / 半装 /
+  被别的包拽走），不是"没装"。少了这层，一次坏的 pythongit 就会变成写不进去。
 - 每次提交失败都 `log` 一句 `[vcs] pid=<pid> commit failed: <的原因>`，不弹窗、不打扰用户。
 
 ---
