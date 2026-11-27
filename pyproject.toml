@@ -1,10 +1,11 @@
+# D:\projects\claw\open-agents\openagent-workspace\pyproject.toml
 [build-system]
 requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "open-agent-workspace"
-version = "0.4.9"
+version = "0.5.0"
 description = "桌面 Agent 工作台内核：一个目录约定、一条 dispatch、一条事件流、一份能力面"
 readme = "README.md"
 requires-python = ">=3.10"
