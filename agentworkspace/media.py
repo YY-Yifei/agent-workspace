@@ -153,6 +153,62 @@ def _renamed(name: str, ext: str) -> str:
     return f"{head}.{ext}" if dot and head else f"{name}.{ext}"
 
 
+def _where(item: dict) -> str:
+    """这一项自报的落盘路径（有就缀在话后面）。
+
+    为什么失败文案里必须有它：截图那条路上**名字与文件是两件事** ——
+    文件名带时间戳（``shots/20261127-090650.png``），名字是给人看的标签。
+    只报名字，排查就会去找一个从未存在过的文件；那比不报更坏。
+    """
+    path = item.get("path") or item.get("file") or ""
+    return f"（文件：{path}）" if path else ""
+
+
+def _bytes_at(item: dict, name: str) -> tuple[bytes, str]:
+    """从一项里取出**字节**：``（字节, 一句人话）``，成功时那句话是空串。
+
+    两个入口，**同一份规格**：
+      * ``data``：界面递来的 base64 字符串（已经是 bytes 也认）
+      * ``raw``：内核进程内递来的原样字节（``Result.images`` 的形态）
+
+    为什么必须同时认：``Result.images`` 属于内核，它不该知道 base64 长什么样；
+    base64 只在跨进程 / 跨网络时才存在。闸门也只该有一道 —— 两道闸要么
+    「界面那张判了、内核那张没判」，要么就像上一版：内核那张因为**键名不同**
+    被当成空文件丢掉，而文案还理直气壮（``dev_page_shot`` 报「是空文件」，
+    盘上那张 150KB）。假报错的根因从来不在文案，在于「没拿到字节」和
+    「拿到 0 字节」被写成了同一句话。
+    """
+    data = item.get("data", item.get("raw"))
+    if data is None:
+        return b"", (f"「{name}」没带图片数据（要 data（base64 / bytes）或 raw（bytes））"
+                     f"{_where(item)}")
+    if isinstance(data, (bytes, bytearray)):
+        raw = bytes(data)
+        if not raw:
+            return b"", f"「{name}」是 0 字节（真的读了，不是猜的）{_where(item)}"
+        return raw, ""
+    if not isinstance(data, str):
+        return b"", (f"「{name}」的数据类型不对（{type(data).__name__}，要 str 或 bytes）"
+                     f"{_where(item)}")
+    text = data.strip()
+    if not text:
+        return b"", f"「{name}」的数据是空字符串{_where(item)}"
+    if text.startswith("data:"):
+        # 界面给了整段 data URL：base64 在逗号之后。静默切掉那一半比留一条
+        # 「不是合法 base64」更好 —— 那句话会让人去查编码，而问题在分隔符。
+        text = text.split(",", 1)[1] if "," in text else ""
+    text = text.replace("\n", "").replace("\r", "")
+    try:
+        # validate=True：非规范 base64 当场拒。服务端对「长度与内容不自洽」的帧
+        # 回 -32602，而那同样是轮级失败。
+        raw = base64.b64decode(text, validate=True)
+    except (ValueError, TypeError):
+        return b"", f"「{name}」的图片数据不是合法 base64{_where(item)}"
+    if not raw:
+        return b"", f"「{name}」解出来是 0 字节{_where(item)}"
+    return raw, ""
+
+
 def _one(index: int, item: dict, *, max_bytes: int) -> Image | str:
     """验一张。通过返回 :class:`Image`，不通过返回一句人话。
 
@@ -163,22 +219,9 @@ def _one(index: int, item: dict, *, max_bytes: int) -> Image | str:
     if not isinstance(item, dict):
         return f"{label}的格式不对（要 {{name, mime, data}}）"
     name = str(item.get("name") or "").strip()[:120] or f"图{index + 1}.png"
-    data = item.get("data")
-    if not isinstance(data, str) or not data.strip():
-        return f"「{name}」是空文件"
-    if data.startswith("data:"):
-        # 界面给了整段 data URL：base64 在逗号之后。静默切掉那一半比留一条
-        # 「不是合法 base64」更好 —— 那句话会让人去查编码，而问题在分隔符。
-        data = data.split(",", 1)[1] if "," in data else ""
-    data = data.replace("\n", "").replace("\r", "")
-    try:
-        # validate=True：非规范 base64 当场拒。服务端对「长度与内容不自洽」的帧
-        # 回 -32602，而那同样是轮级失败。
-        raw = base64.b64decode(data, validate=True)
-    except (ValueError, TypeError):
-        return f"「{name}」的图片数据不是合法 base64"
-    if not raw:
-        return f"「{name}」是空文件"
+    raw, why = _bytes_at(item, name)
+    if why:
+        return why
     if len(raw) > max_bytes:
         return (f"「{name}」有 {_mb(len(raw))}，超过这张连接的上限 {_mb(max_bytes)}"
                 " —— 先缩小或压缩再发")

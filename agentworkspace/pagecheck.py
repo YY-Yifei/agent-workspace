@@ -516,9 +516,12 @@ class Worker:
         path = d / f"{time.strftime('%Y%m%d-%H%M%S')}.png"
         path.write_bytes(png)
         facts = self._facts()
+        # ``name`` 一律是**真的那个文件名**：这张图在盘上叫 20261127-090650.png，
+        # 而 ``<pid>-page.png`` 是一个从未存在过的模板名。拿模板名去报错，人就会
+        # 去一个不存在的路径找一个其实好好的文件。
         return {"ok": True, "path": str(path), "bytes": len(png),
                 "b64": base64.b64encode(png).decode(), "mime": "image/png",
-                "name": f"{self.pid}-page.png", "sizes": facts}
+                "name": path.name, "sizes": facts}
 
     def _facts(self) -> dict:
         try:

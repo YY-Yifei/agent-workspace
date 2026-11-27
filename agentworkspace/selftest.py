@@ -2384,6 +2384,54 @@ def _run() -> int:
           "_png" not in _rep_out["report"] and len(_rep_out.get("images") or []) == 1,
           f"keys={sorted(_rep_out['report'])}")
 
+    # D10t-v：截图这条**接缝**（第47轮修的 bug）。
+    # 上一版：devtools 递 {raw: bytes}，link 那道预检读 item["data"] → 一句
+    # 「是空文件」；而盘上那张 150KB、头是 PNG。名字也是编的（<pid>-page.png），
+    # 于是排查被引向一个从未存在过的文件。
+    import base64 as _b64_47
+    import struct as _st_47
+
+    def _png47(w: int = 8, h: int = 6) -> bytes:
+        ihdr = _st_47.pack(">II", w, h) + b"\x08\x06\x00\x00\x00"
+        return (b"\x89PNG\r\n\x1a\n" + _st_47.pack(">I", 13) + b"IHDR"
+                + ihdr + b"\x00" * 96)
+
+    _shot_dir = Path(tempfile.mkdtemp(prefix="aw-shot47-"))
+    _shot_file = _shot_dir / "20261127-090650.png"
+    _shot_file.write_bytes(_png47())
+    _page_backup = dict(_dt._PAGE)
+    _cmd_backup = _dt._page_cmd
+    try:
+        _dt._PAGE["p47"] = {"log": None, "at": time.time(), "buf": b"", "sock": None}
+        # 替身给的是 pagecheck 那一侧的**真形状**（含 b64 与时间戳路径）。
+        _dt._page_cmd = lambda sid, req, timeout=0: {
+            "ok": True, "path": str(_shot_file),
+            "bytes": _shot_file.stat().st_size,
+            "b64": _b64_47.b64encode(_shot_file.read_bytes()).decode(),
+            "mime": "image/png", "name": _shot_file.name,
+            "sizes": {"inner": [1164, 761], "frame": [1000, 700]}}
+        _shot = _dt.page_shot("p47")
+    finally:
+        _dt._page_cmd = _cmd_backup
+        _dt._PAGE.clear()
+        _dt._PAGE.update(_page_backup)
+
+    from . import media as _md47          # _media 在 H 节才是局部名，这里得自带
+    _st_txt, _st_data, _st_im = kernel.Runtime._split(_shot)
+    _st_pics, _st_why = _md47.prepare(_st_im, max_bytes=4 << 20)
+    check("D10t 截图接缝：devtools → Result.images → 预检（上一版在这断，报「是空文件」）",
+          not _st_why and len(_st_pics) == 1
+          and _st_pics[0].size == _shot_file.stat().st_size,
+          _st_why or f"{len(_st_pics)} 张")
+    check("D10u 图的名字是**真文件名**（报错不许指向一个不存在的文件）",
+          bool(_st_im) and _st_im[0].get("name") == _shot_file.name
+          and _st_im[0].get("path") == str(_shot_file),
+          str(_st_im[0] if _st_im else None))
+    _miss_raw, _miss_why = _dt._shot_bytes({"path": str(_shot_dir / "nope.png")})
+    check("D10v 盘上那份读不动时**说读不动**（不拿「是空文件」顶上去）",
+          not _miss_raw and "读不动" in _miss_why and "nope.png" in _miss_why, _miss_why)
+    shutil.rmtree(_shot_dir, ignore_errors=True)
+
     _lt = Path(tempfile.mkdtemp(prefix="aw-plog-")) / "w.log"
     _lt.write_text("BOOM: 真正的原因\n", encoding="utf-8")
     _dt._PAGE_LOG["p45probe"] = _lt
@@ -2893,6 +2941,24 @@ def _run() -> int:
     got, why = _media.prepare([{"name": "a.png", "data": "data:image/png;base64," + B64}])
     check("H6 整段 data URL 也能吃（切掉前缀，不把逗号后面当坏编码）",
           bool(got) and not why, why)
+
+    # H6b-H6e：第47轮。崩点在**键名**上 —— 内核递的是 {raw: bytes}，预检读的是
+    # item["data"]，于是 150KB 的截图被说成「是空文件」。假报错的根因不是文案，
+    # 是「没拿到字节」和「拿到 0 字节」被写成了同一句话。
+    got, why = _media.prepare([{"name": "minxi_board-page.png", "mime": "image/png",
+                                "raw": PNG, "path": "C:/c/shots/20261127-090650.png"}])
+    check("H6b 内核形态（{raw: bytes}）能过预检 —— 键名不同不等于空文件",
+          bool(got) and not why and got[0].size == len(PNG), why or f"{got[0].size} 字节")
+    got, why = _media.prepare([{"name": "a.png", "path": "C:/c/shots/20261127-090650.png"}])
+    check("H6c 没带数据 ≠ 空文件：明说「没带」，并把真实路径带出来",
+          not got and "没带图片数据" in why and "空文件" not in why
+          and "20261127-090650.png" in why, why)
+    got, why = _media.prepare([{"name": "a.png", "data": ""}])
+    check("H6d 空字符串说的是它自己，不是套一句放之四海的话",
+          not got and "空字符串" in why, why)
+    got, why = _media.prepare([{"name": "a.png", "data": b""}])
+    check("H6e 真的 0 字节才说 0 字节（是读过，不是猜的）",
+          not got and "0 字节" in why, why)
 
     # H7-H10：真的走一遍 Link.send —— 这一节不连 aaas，替身 caller 只记下发了什么
     import aaas as _aaas

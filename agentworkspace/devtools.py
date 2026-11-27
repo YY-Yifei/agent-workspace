@@ -700,6 +700,51 @@ def page_eval(js: str, sid: str = "", frame: str = "page") -> dict:
             "frame": r.get("frame") or frame}
 
 
+def _shot_name(path: str, fallback: str = "page.png") -> str:
+    """图的名字 = **真的那个文件名**。
+
+    上一版这里是 ``f"{pid}-page.png"`` —— 一个从未存在过的模板名。它唯一的
+    后果是把排查引向一个不存在的文件（真那张在 ``shots/<时间戳>.png``），
+    并且让「图没送到」看起来像「文件是坏的」。
+    """
+    if path:
+        got = Path(path).name
+        if got:
+            return got
+    return fallback
+
+
+def _shot_bytes(r: dict) -> tuple[bytes, str]:
+    """这次截图的字节：``（字节, 备注）``。**优先读盘上那一份**。
+
+    为什么先读盘：发出去的字节必须就是**写下去**的那张，否则「agent 看见的」
+    与「你在硬盘上点开的那张」可以是两回事。读不动才退回返回里带的 base64，
+    并且把这件事说出来 —— 一次静默的换源就是下一次「我明明看到了」的伏笔。
+    """
+    path = str(r.get("path") or "")
+    note = ""
+    if path:
+        try:
+            raw = Path(path).read_bytes()
+            if raw:
+                return raw, ""
+            note = f"{path} 是 0 字节"
+        except OSError as exc:
+            note = f"{path} 读不动：{type(exc).__name__}: {exc}"
+    else:
+        note = "返回里没有落盘路径"
+    b64 = r.get("b64") or ""
+    if b64:
+        try:
+            raw = base64.b64decode(b64)
+        except (ValueError, TypeError) as exc:
+            return b"", f"{note}；base64 也解不开：{type(exc).__name__}: {exc}"
+        if raw:
+            return raw, f"{note}（改用返回值里的 base64）"
+        return b"", f"{note}；返回值里的 base64 解出来是 0 字节"
+    return b"", note
+
+
 def page_shot(sid: str = "", full: bool = False) -> dict:
     """截一张页面图，图会进你的上下文（你能真的看见它）。
 
@@ -717,13 +762,24 @@ def page_shot(sid: str = "", full: bool = False) -> dict:
         return {"text": f"{type(exc).__name__}: {exc}"}
     if not r.get("ok"):
         return {"text": f"截图没成：{r.get('error')}"}
-    raw = base64.b64decode(r["b64"])
+    path = str(r.get("path") or "")
+    raw, note = _shot_bytes(r)
+    if not raw:
+        # 「拍到了但没读出来」必须是一个**独立的**结局，并且报真实路径：
+        # 它和「没拍到」是两件事，能被查的方向也完全不同。
+        return {"text": f"截图拍到了，但我没读出来：{note or '原因不明'}"
+                        f"（文件：{path or '没给路径'}）", "path": path}
     sizes = r.get("sizes") or {}
-    return {"text": f"截了一张 {r['bytes']} 字节的图（窗口实测 {sizes.get('inner')}，"
-                    f"页面区 {sizes.get('frame')}）；文件：{r.get('path')}",
+    text = (f"截了一张 {len(raw)} 字节的图（窗口实测 {sizes.get('inner')}，"
+            f"页面区 {sizes.get('frame')}）；文件：{path or '（没落盘）'}")
+    if r.get("bytes") and int(r["bytes"]) != len(raw):
+        text += f"（注意：报告说 {r['bytes']} 字节，实际发的是 {len(raw)}）"
+    if note:
+        text += f"\n（{note}）"
+    return {"text": text,
             "images": [{"raw": raw, "mime": "image/png",
-                        "name": r.get("name") or "page.png"}],
-            "path": r.get("path"), "bytes": r["bytes"]}
+                        "name": _shot_name(path), "path": path}],
+            "path": path, "bytes": len(raw)}
 
 
 def page_check(sid: str = "", areas: str = "", shot: bool = False) -> dict:
@@ -762,6 +818,7 @@ def _page_report(r: dict) -> dict:
     而界面收到的那坨字符串它一个字节都不会用。
     """
     png = r.pop("_png", "")
+    shot_path = str(r.get("shot") or "")
     eng = r.get("engine") or {}
     sizes = r.get("sizes") or {}
     plugin = r.get("plugin") or {}
@@ -796,8 +853,17 @@ def _page_report(r: dict) -> dict:
     out = {"text": "\n".join(lines), "report": r,
            "ok": all(a.get("ok") for a in rows) if rows else False}
     if png:
-        out["images"] = [{"raw": base64.b64decode(png), "mime": "image/png",
-                          "name": f"{r.get('pid')}-page.png"}]
+        raw, note = _shot_bytes({"path": shot_path, "b64": png})
+        if raw:
+            out["images"] = [{"raw": raw, "mime": "image/png",
+                              "name": _shot_name(shot_path, f"{r.get('pid')}-page.png"),
+                              "path": shot_path}]
+            if note:
+                out["text"] = f"{out['text']}\n（{note}）"
+        else:
+            # 报告照发，但**明说**图没带上 —— 静默少一张，agent 会以为自己看过了。
+            out["text"] = f"{out['text']}\n（图没能带上：{note or '原因不明'}；" \
+                          f"文件：{shot_path or '没给路径'}）"
     return out
 
 
