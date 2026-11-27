@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import os
 import socket
 import subprocess
@@ -184,16 +185,87 @@ def host_services() -> dict:
         "  ctx.call('别的程序', '它的函数', {'x': 1})   # 走同一个 dispatch",
         "",
         "网页里（样式**借**宿主的，别抄一份 —— 插件页在 iframe 里是另一份文档，",
-        "自定义属性不跨文档继承，抄了必然漂移。见 docs/host-styles.md）：",
+        "宿主的样式一个字节都传不进来。而宿主**不会**替你注入，引不引在你）：",
         "  <link rel=\"stylesheet\" href=\"/aw.css\">   # 令牌 / 底座 / 滚动条",
         "  <script src=\"/aw.js\"></script>",
         "  aw.theme()            // \"dark\" | \"light\" —— 宿主解析过的，直接能画",
-        "  aw.on_theme(t => paint(t))",
         "  aw.get('messages')    // 与后端 ctx.get 是同一份 store",
+        "",
+        "**写页面之前调一次 dev_style_guide()** —— 骨架、令牌、四条纪律都在那一份里。",
+        "这里只留形状：同一件事写在两处，两处必然漂移，然后有人照着旧的那份写。",
     ]
     return {"text": "\n".join(lines),
             "services": {n: list(f) for n, f in SERVICES.items()},
             "faces": {f: sorted(services_of(f)) for f in FACES}}
+
+
+def _aw_tokens() -> list[str]:
+    """从 aw.css 现读令牌清单（去重、保序）。读不到就返回空。
+
+    为什么不在这里写死一份：写死的清单与那份 CSS 是同一个知识的两份拷贝，
+    而拷贝之间必然漂移 —— 然后 agent 照着旧的那份写，页面上没反应，谁也不知道
+    是名字错了。与 ``host_services`` 从活代码反射是同一条判据：**一处真源**。
+    """
+    try:
+        css = (Path(__file__).resolve().parent / "web" / "aw.css").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in re.findall(r"--aw-[a-z0-9-]+", css):
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def style_guide() -> dict:
+    """第一次写插件页面、或者页面看着不像宿主时调我：怎么复用宿主的样式。
+
+    为什么是「调一下」而不是写进提示词：写页面的时候才需要它，聊天时不需要 ——
+    与 ``host_services`` 同一条判据。令牌清单**从 aw.css 现读**，不另存一份。
+    """
+    toks = _aw_tokens()
+    tok_line = ("     " + "  ".join(toks)) if toks else \
+               "     （此刻读不到 aw.css —— 以 /aw.css 里的为准）"
+    lines = [
+        "宿主与插件的关系：**借，不是抄**。",
+        "",
+        "插件页在 <iframe> 里，那是另一份文档 —— 宿主的 --var、::-webkit-scrollbar、",
+        "color-scheme 一个字节都传不进来（自定义属性沿元素树继承，iframe 里的 <html>",
+        "不在那棵树上）。于是只有两条路：抄一份（从第一处改色起开始漂移，而且你不会",
+        "记得回来改），或者引宿主那一份。",
+        "",
+        "**宿主不会替你注入。** 引了就有；不引就是系统默认（那条 17px 的滚动条）。",
+        "这不是漏了，是刻意的：悄悄改你的页面，等于替你做决定还不让你知道，",
+        "而「这个页面没借宿主样式」这件事就永远没人看得见 —— 插件也就永远停在",
+        "下限（滚动条），到不了上限（用宿主的视觉语言画自己的控件）。",
+        "",
+        "照抄这两行（放 <head> 里，排在你自己的 <style> **之前**）：",
+        "",
+        '    <link rel="stylesheet" href="/aw.css">   <!-- 令牌 + 底座 + 滚动条 -->',
+        '    <script src="/aw.js"></script>           <!-- 深浅自动跟着宿主翻 -->',
+        "",
+        "然后守住四条：",
+        "  1. 颜色只用 var(--aw-*)。清单在下面，是从 aw.css 现读的，不是抄的：",
+        tok_line,
+        "  2. 加自己的语义变量可以，但值必须来自上面： --card: var(--aw-panel)。",
+        "  3. **不写裸 hex**。写了就等于抄了一份：宿主换一次色，你停在旧色上。",
+        "  4. **不写 ::-webkit-scrollbar、不写 color-scheme**。滚动条那两档对比度",
+        "     是按 WCAG 算过的（暗 .62/悬停 .8，浅 .8/.95）；你写了就赢过 aw.css",
+        "     （未分层的规则永远赢过分层的），那两档从此归你维护 —— 而没人会去手算。",
+        "",
+        "深浅两条路：",
+        "  · 引了 /aw.js → 它自己把 data-theme 写到你这份文档上，你什么都不用做；",
+        "  · 只引样式不引桥 → aw.css 的 @media 兜底跟随**系统**，不是宿主里设的那一档。",
+        "",
+        "写完自己看一眼（比「看着像」可靠）：",
+        "  dev_page_check(shot=true)   # 报告里有一行 style：引没引、几个裸 hex",
+        "  dev_page_open()             # 真窗口里看",
+        "",
+        "完整版（为什么、@layer、边界）：docs/host-styles.md。",
+    ]
+    return {"text": "\n".join(lines), "tokens": toks, "url": "/aw.css"}
 
 
 def read(path: str, offset: int = 1, limit: int = SHOW_LIMIT) -> dict:
@@ -837,6 +909,16 @@ def _page_report(r: dict) -> dict:
         lines.append(f"{mark} {a.get('name')}")
         if a.get("detail") and not a.get("ok"):
             lines.append(f"    {a.get('detail')}")
+    # 样式那一行用 ◇ 标出来：它**不参与 ok**。没引 /aw.css 不是坏页面，只是没借 ——
+    # 但也不能不提：撤掉宿主注入之后，「这页拿到的是系统默认滚动条」这件事只有
+    # 说出来才存在，否则它就退回"看起来一切正常，作者永远学不会"。
+    sty = r.get("style") or {}
+    if sty.get("hint"):
+        lines.append("")
+        lines.append(f"◇ 样式：{sty['hint']}")
+    elif sty.get("why"):
+        lines.append("")
+        lines.append(f"◇ 样式：没查到（{sty['why']}）")
     skipped = r.get("skipped") or []
     if skipped:
         lines.append("")

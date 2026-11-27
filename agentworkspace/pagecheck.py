@@ -118,6 +118,44 @@ FRAME_JS = """(() => {
           title: d.title || ''};
 })()"""
 
+STYLE_JS = """(() => {
+  const f = document.querySelector('#appframe');
+  if (!f) return {__no_frame__: true};
+  const d = f.contentDocument;
+  if (!d) return {__no_doc__: true};
+  const isAw = (h) => (h || '').split('?')[0] === '/aw.css';
+  const links = [...d.querySelectorAll('link[rel~="stylesheet"]')];
+  const scripts = [...d.querySelectorAll('script[src]')];
+  let hex = 0, tok = 0, sb = 0, sheets = 0, unreadable = 0;
+  for (const sh of [...d.styleSheets]) {
+    const href = sh.href || '';
+    if (isAw(href)) continue;              // 契约那一份**不算抄**：它正是"借"的那份
+    let rules;
+    // 跨源表读不到 cssRules（SecurityError）。读不到就记一笔，不当成 0 ——
+    // 「查不了」与「查了是干净」是两件事，混成一个就会假绿。
+    try { rules = sh.cssRules; } catch (e) { unreadable++; continue; }
+    sheets++;
+    let text = '';
+    for (const r of rules) text += (r.cssText || '') + '\\n';
+    // 只数**声明值**里的 hex：`#id{...}` 的选择器在冒号之*前*，不该算成颜色。
+    for (const decl of (text.match(/:[^;{}]*/g) || [])) {
+      const m = decl.match(/#[0-9a-fA-F]{3,8}\\b/g);
+      if (m) hex += m.length;
+    }
+    tok += (text.match(/var\\(\\s*--aw-/g) || []).length;
+    sb += (text.match(/::-webkit-scrollbar/g) || []).length;
+  }
+  const cs = d.defaultView
+      ? d.defaultView.getComputedStyle(d.documentElement) : null;
+  return {aw_css: links.some((l) => isAw(l.getAttribute('href'))),
+          aw_js: scripts.some((s) => (s.getAttribute('src') || '').split('?')[0] === '/aw.js'),
+          sheets: sheets, unreadable: unreadable,
+          hex: hex, tok: tok, sb: sb,
+          aw_bg: cs ? cs.getPropertyValue('--aw-bg').trim() : '',
+          theme: d.documentElement.getAttribute('data-theme') || '',
+          scheme: cs ? String(cs.colorScheme || '') : ''};
+})()"""
+
 CLICK_JS = """(() => {
   const f = document.querySelector('#appframe');
   const d = f && f.contentDocument;
@@ -141,7 +179,7 @@ DESKTOP_JS = """(() => {
 })()"""
 
 DEFAULT_AREAS = ("load", "console", "network", "overflow", "contrast", "narrow")
-KNOWN_AREAS = DEFAULT_AREAS + ("interactive",)
+KNOWN_AREAS = DEFAULT_AREAS + ("interactive", "style")
 
 
 def unknown_areas(picks) -> list[str]:
@@ -571,6 +609,53 @@ class Worker:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         return {"ok": True, "sizes": self._facts()}
 
+    # -- 样式：引没引宿主那份（只读，不改页面一个字节）------------------
+    def _style_facts(self) -> dict:
+        """页面里「借没借宿主样式」的一组事实。**不判对错。**
+
+        为什么要有它：撤掉宿主注入之后，一个没引 /aw.css 的插件页什么都不会发生 ——
+        滚动条是系统默认那条 17px，颜色是浏览器给的。这件事以前被注入藏起来了，
+        作者永远看不见。现在把它摆到报告里一行，判不判是作者的事。
+
+        判据（写死在这里，免得下次又要从零想一遍）：
+          * 没引 /aw.css        → 不算错，只说明它拿的是系统默认；
+          * 引了但有裸 hex      → 点名（宿主换色它不会跟着变，那正是"抄了一份"）；
+          * 引了但自写滚动条    → 点名（未分层赢过分层，WCAG 那两档从此归它维护）；
+          * 引了且干净          → 说干净，并报用了几处令牌。
+        """
+        try:
+            f = self.page.evaluate(STYLE_JS) or {}
+        except Exception as exc:
+            return {"ok": False, "why": f"这一面自己炸了：{type(exc).__name__}: {exc}"}
+        if f.get("__no_frame__"):
+            return {"ok": False, "why": "宿主里没有 #appframe（没开页面）"}
+        if f.get("__no_doc__"):
+            return {"ok": False, "why": "iframe 里读不到文档（跨源？）"}
+        aw, tok, hexes, sb = bool(f.get("aw_css")), int(f.get("tok") or 0), \
+            int(f.get("hex") or 0), int(f.get("sb") or 0)
+        bits: list[str] = []
+        if not aw:
+            bits.append("没引 /aw.css —— 这页的滚动条、深浅、颜色都是系统默认"
+                        "（宿主**不会**替你注入）。想借宿主那份：调 dev_style_guide()")
+        else:
+            bits.append(f"已引 /aw.css（页面里用了 {tok} 处 var(--aw-*)）")
+            if hexes:
+                bits.append(f"但还有 {hexes} 处裸 hex 颜色 —— 宿主换一次色，那些不会跟着变")
+            if sb:
+                bits.append(f"并且自己写了 {sb} 处 ::-webkit-scrollbar（未分层赢过分层，"
+                            f"aw.css 那两档 WCAG 对比度就失效了）")
+            if not hexes and not sb:
+                bits.append("没有裸 hex、没有自写滚动条")
+        if f.get("unreadable"):
+            bits.append(f"另有 {f['unreadable']} 张样式表读不到规则（跨源），那些没数进去")
+        return {"ok": True, "aw_css": aw, "aw_js": bool(f.get("aw_js")),
+                "tokens_used": tok, "bare_hex": hexes, "own_scrollbar": sb,
+                "aw_bg": f.get("aw_bg") or "", "theme": f.get("theme") or "",
+                "color_scheme": f.get("scheme") or "",
+                "sheets": int(f.get("sheets") or 0),
+                "unreadable": int(f.get("unreadable") or 0),
+                "hint": "；".join(bits) + "。"}
+
     # -- 逐面看 -----------------------------------------------------
     def check(self, areas=None, want_shot: bool = False) -> dict:
         if self.page is None:
@@ -597,7 +682,7 @@ class Worker:
                     "engine": {"browser": self.engine, "engine": "webview2"},
                     "sizes": self._facts(), "areas": rows, "skipped": skipped,
                     "console": self.console, "network": self.network,
-                    "pageerrors": self.errors, "shot": None,
+                    "pageerrors": self.errors, "shot": None, "style": None,
                     "data_changed": self._data_delta()}
 
         frame_open = bool(self.plugin.get("has_ui"))
@@ -616,6 +701,16 @@ class Worker:
                     skipped.append({"name": name, "why": "这个程序没有页面"})
                 return fn
             return deco
+
+        # 样式复用是**事实**，不是分数：没引 /aw.css 不是坏页面，只是没借。
+        # 所以它不进 ok（那份报告是"能不能用"），只作为一行事实摆在那里 ——
+        # 宿主不替插件做决定，但也不替它隐瞒。算一次，面与字段共用这一份。
+        sty = self._style_facts()
+
+        @area("style")
+        def _style() -> dict:
+            return {"name": "样式：借了宿主那份，还是自己抄了一份", "ok": True,
+                    "detail": sty.get("hint") or ""}
 
         @area("load")
         def _load() -> dict:
@@ -691,7 +786,7 @@ class Worker:
                "sizes": self._facts(), "areas": rows, "skipped": skipped,
                "console": self.console, "network": self.network,
                "aborted": self.aborted,
-               "pageerrors": self.errors, "shot": None,
+               "pageerrors": self.errors, "shot": None, "style": sty,
                "data_changed": self._data_delta()}
         if want_shot:
             s = self.shot()

@@ -564,48 +564,31 @@ function paintConn() {
 }
 
 /* ------------------------------------------------------------------ 舞台 */
-/* 插件页是**另一份文档**：自定义属性不跨文档继承，滚动条伪元素也只在它自己那份
+/* 插件页是**另一份文档**：自定义属性不跨文档继承，滚动条伪元素也只在自己那份
    文档里生效 —— 所以「宿主有滚动条样式，插件自然就有」这句话是假的（第十轮那次
-   改完，宿主自己好看了，插件里还是那条 17px 的系统默认）。得有人把那份样式递过去。
+   改完，宿主自己好看了，插件页里还是那条 17px 的系统默认）。
 
-   三条路，插件可以任选，宿主都认：
-     ① 插件自己写 <link rel="stylesheet" href="/aw.css">（推荐，docs/host-styles.md）
-     ② 插件引 /aw.js —— 它会自己把 data-theme 贴到自己那份文档上
-     ③ 宿主注入（就是这里）：同一份字节，整份在 @layer 里，所以插件自己写过的规则
-        自动赢 —— 注入改不了它的配色，只补它没写的（滚动条 / color-scheme / 盒子模型）
-   顺带把 data-theme 递过去：没有 /aw.js 的插件页没人写这个属性，它会一直画深色。
+   **这里故意什么都不做。** 宿主不往插件文档里插样式、不贴 data-theme、不碰它
+   一个节点。上一版在这里做过一次「兜底注入」，后来撤掉了 —— 撤它的理由不是
+   技术上的，是这套东西该讲清楚的：
 
-   同源（都出自这道门）才拿得到 contentDocument；读别人文档必须 catch ——
-   跨源那边是 SecurityError，而这不是错误，是它的正常状态。 */
-function skinFrame(f) {
-  let d = null;
-  try { d = f.contentDocument; } catch (e) { d = null; }
-  if (!d || !d.head) return;
-  /* 判据是「这份文档里有没有指向 /aw.css 的样式表」，**不是**「有没有我留的记号」：
-     插件自己引过就别再注入 —— 同一个文件加载两次，规则一模一样，多出来的那次
-     请求与一次多余的样式重算都是白付的（实测里 sheets 里就出现了两条 /aw.css，
-     而界面上完全看不出来）。记号只用来认「哪条是宿主注入的」。 */
-  const have = Array.prototype.some.call(
-    d.querySelectorAll('link[rel~="stylesheet"]'),
-    (l) => (l.getAttribute('href') || '').split('?')[0] === '/aw.css');
-  if (!have) {
-    const l = d.createElement('link');
-    l.rel = 'stylesheet';
-    l.href = '/aw.css';
-    l.setAttribute('data-aw-skin', '1');
-    d.head.appendChild(l);
-  }
-  const t = document.documentElement.dataset.theme;
-  if (t) d.documentElement.dataset.theme = t;
-}
-/* 每次刷新都重新挂：插件页每次都是**新的** iframe（innerHTML 重画），
-   旧监听跟着旧节点一起没了。另外主动调一次 —— 有的引擎上 load 可能已经过去了。 */
-function wireSkin() {
-  const f = $('#appframe');
-  if (!f) return;
-  f.addEventListener('load', () => skinFrame(f));
-  skinFrame(f);
-}
+     · 悄悄改别人的文档，作者不知道自己的页面被改了。box-sizing 从 content-box
+       变成 border-box 这件事界面上看不出来，只在某个宽高算错的时候露头。
+     · 它把「这个插件没有借宿主样式」这个事实**藏起来**了：页面看着一切正常，
+       作者就永远学不会，插件也永远只有下限（滚动条），没有上限（控件语言）。
+     · 于是契约变得不必要：既然宿主会注入，为什么还要写 link？没人写，就没人读。
+
+   这与第47轮那条原则是同一条：**系统替你把偏差藏起来，比报错更坏**。
+
+   所以「像宿主」这件事是**插件主动做的**，宿主只出三样东西：
+     ① 同一个 URL：<link rel="stylesheet" href="/aw.css"> —— 宿主自己引的也是它
+     ② 同一座桥：  <script src="/aw.js"></script> —— 深浅自己跟着宿主翻
+     ③ 说出来：开发者模式里 dev_style_guide() 给一份能直接粘的骨架；
+        dev_page_check() 的报告里有一行 style 事实（引没引、有没有裸 hex），
+        但它**不判错** —— 没借不是坏页面，只是没借。
+
+   引不引是插件自己的选择，宿主不替它选，也不假装替它选过了。 */
+
 
 function paintStage(force) {
   const p = prog(S.pid);
@@ -661,7 +644,6 @@ function paintStage(force) {
   wireVersions();
   wireSessions();
   wireGutter();
-  if (p.uiKind === 'web') wireSkin();
   if (p.uiKind === 'native') {
     $('#natbtn').onclick = () => toggleNative(p.id, (S.native[p.id] || {}).status === 'running');
   }
@@ -1950,10 +1932,9 @@ function applyTheme(pref) {
   if (S.settings) S.settings.theme = p;
   const t = resolveTheme(p);
   document.documentElement.dataset.theme = t;
-  /* 已经在看的那一页要立刻跟着翻：它不会重新 load，也就不会再走 wireSkin。
-     没开页面时 appframe 不存在，skinFrame(null) 会炸 —— 所以先问一句。 */
-  const fr = document.getElementById('appframe');
-  if (fr) skinFrame(fr);
+  /* 已经在看的那一页**不归这里管**：宿主不碰插件文档（见「舞台」那段）。
+     插件自己引了 /aw.js 的话，它会从 ui.theme 事件里拿到这个值自己画；
+     没引的话，它一直画的是系统那一档 —— 那是它没借桥，不是这里漏了。 */
   try { localStorage.setItem(THEME_KEY, t); } catch (e) { /* 存不上就算了，不影响画 */ }
   paintThemeSeg();
   reportTheme(p, t);

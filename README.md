@@ -35,7 +35,7 @@
 | `main.py` | 入口：装配，没有第四样东西 |
 | `pluginvcs.py` | **旁路**：每个程序就地一个 git 仓（可用 `/api/p/<pid>/versions`，也可被 agent 的四动词调用） |
 | `web/index.html` | 工作台视图 + 对话 + 能力面板（单文件，无构建步骤） |
-| `web/aw.css` | 样式契约：令牌 / 底座 / 滚动条 —— 宿主与插件引的是**同一个 URL**（`docs/host-styles.md`） |
+| `web/aw.css` | 样式契约：令牌 / 底座 / 滚动条 —— 宿主与插件引的是**同一个 URL**；宿主**不注入**，插件自己引（开发者模式下 `dev_style_guide()` 有骨架）｜见 `docs/host-styles.md` |
 
 配套：`settings.py`（唯一一项设置：aaas-service 地址）、`devtools.py`（开发者模式那双手）、
 `assistant.py`（内核唯一内置的程序：小助理）、`toolbox.py`（小助理的手）、

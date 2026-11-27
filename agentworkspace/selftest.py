@@ -607,11 +607,14 @@ def _run() -> int:
           r.get("status") == "ok" and r.get("dev") is True, str(r)[:140])
     dev_caps = sorted(rt.capabilities_of(pid))
     borrowed = [w for w in dev_caps if not w.startswith(pid + "_")]
-    check("打开后借到的**恰好**是这十五项（多一项都算越界）",
+    # 第49轮加了一项 dev_style_guide（样式指南）。这份清单是**白名单**，不是计数：
+    # 多一项要在这里显式加，少一项会立刻红 —— 开发者模式的边界靠它钉着。
+    check("打开后借到的**恰好**是这十六项（多一项都算越界）",
           borrowed == ["dev_diff", "dev_host_services", "dev_page_check", "dev_page_close",
                        "dev_page_eval", "dev_page_open", "dev_page_shot",
                        "dev_plugin_write", "dev_read", "dev_revert", "dev_search",
-                       "dev_show", "dev_tree", "dev_versions", "dev_write"],
+                       "dev_show", "dev_style_guide", "dev_tree", "dev_versions",
+                       "dev_write"],
           str(borrowed))
     check("借来的手里**没有**一件能动历史的危险动作（remote/push/branch/reset…）",
           not any(k in w for w in borrowed for k in
@@ -1090,20 +1093,41 @@ def _run() -> int:
     check("窄栏不重设 thumb（只改 width，颜色与边框全部继承全局）",
           re.search(r"#rail::-webkit-scrollbar-thumb", naked) is None, "")
 
-    # ── 「只有一份样式、三种用法」（第48轮）────────────────────────────────
-    # 宿主页引它、插件自己引它、宿主给它注入它 —— 三个入口只能是**同一个 URL**。
-    # 少一条，就退回「各抄一份，第一处改动起开始漂移」。
-    check("宿主给插件页注入的是同一个 /aw.css（不是第二份副本），且带防重复注入的记号",
-          "href = '/aw.css'" in hsrc and "data-aw-skin" in hsrc
-          and hsrc.count("skinFrame") >= 3, f"skinFrame × {hsrc.count('skinFrame')}")
-    check("注入的那份整份在 @layer 里（分层才输给插件自己的规则，否则补齐 = 替它决定配色）",
+    # ── 「一份样式，插件自己引」（第49轮：宿主不再注入）─────────────────────
+    # 发布前这里有过第三种用法：宿主在 iframe 的 load 时把 aw.css 插进去、顺手把
+    # data-theme 贴过去，插件零协商。撤掉了，理由不是技术上的（docs/host-styles.md §2）：
+    # 悄悄改别人的文档等于替作者做决定，还会把「这个页面没借宿主样式」这件事藏起来 ——
+    # 于是插件永远只有下限（滚动条），永远到不了上限（控件语言）。
+    # 这几条门是专门挡「下次又有人觉得兜底更省事」的。
+    check("宿主不往插件页里注入样式（撤掉注入：不碰别人的文档一个字节）",
+          "skinFrame" not in hsrc and "data-aw-skin" not in hsrc
+          and "contentDocument" not in hsrc, "")
+    check("分层还在（引进来那份不会反客为主：未分层的规则永远赢过分层）",
           "@layer aw.tokens, aw.base;" in aw and aw.count("@layer aw.") >= 3, "")
-    check("注入时顺手把 data-theme 贴过去（没有 aw.js 的插件页没人写这个属性）",
-          "d.documentElement.dataset.theme" in hsrc, "")
-    # 实测抓到的：插件自己引了 aw.css，宿主又注入一份 —— 同一个文件在同一个文档里
-    # 加载两次，界面上完全看不出来，只在 CSSOM 里露一截。
-    check("已经有 /aw.css 就不再注入（只认自己的记号会把「插件自己引的」漏掉）",
-          "link[rel~=\"stylesheet\"]" in hsrc and "=== '/aw.css'" in hsrc, "")
+    # 指导落在开发者模式里。那份 guide 的令牌必须**从 aw.css 现读**，不许手写一份
+    # 清单 —— 两份措辞必然漂移，然后 agent 照着旧的那份写，页面上没反应，而没人
+    # 知道是名字错了。与 host_services 从活代码反射是同一条判据。
+    from . import devtools as _gdt
+    _guide = _gdt.style_guide()
+    _gtoks = set(re.findall(r"--aw-[a-z0-9-]+", _guide["text"]))
+    _ctoks = set(re.findall(r"--aw-[a-z0-9-]+", awsrc))
+    check("dev_style_guide 的令牌全部来自 aw.css（现读，不是手写清单）",
+          bool(_gtoks) and _gtoks <= _ctoks, f"{len(_gtoks)} 个 / aw.css {len(_ctoks)} 个")
+    check("dev_style_guide 给的是能直接粘的那两行（引样式 + 引桥）",
+          'href="/aw.css"' in _guide["text"] and 'src="/aw.js"' in _guide["text"], "")
+    check("dev_style_guide 明说「宿主不会替你注入」（否则读者会以为引不引都一样）",
+          "宿主不会替你注入" in _guide["text"], "")
+    check("dev_host_services 指向 guide，不自己再写一份样式细节",
+          "dev_style_guide" in _gdt.host_services()["text"], "")
+    # 「没借」必须看得见，但**不判它错**：没引 aw.css 不是坏页面，只是没借。
+    # 这条门盯的就是这个分寸 —— 谁把它改成 ok=False，就走回「替它做决定」那条路。
+    from . import pagecheck as _gpc
+    _sf = inspect.getsource(_gpc.Worker._style_facts)
+    check("page_check 有「样式事实」这一面，且恒 ok=True（没借不判错）",
+          "style" in _gpc.KNOWN_AREAS and '"ok": True' in _sf
+          and "dev_style_guide()" in _sf, "")
+    check("样式事实三项都数（引没引 / 裸 hex / 自写滚动条）",
+          all(k in _gpc.STYLE_JS for k in ("aw_css", "::-webkit-scrollbar", "--aw-")), "")
 
     # ── 对话闸门（第十二轮）。这一节守的是**四类会静默失效的错法**：
     #   (a) 忙碌判断散在多处 → 总有一处忘了改，两轮并发就从那儿进来；
